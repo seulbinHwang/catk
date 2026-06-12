@@ -4,8 +4,9 @@
 # 새 cadence 의미: fake(critic)는 매 batch 1회, generator 는 N batch 마다 1회(서로 다른
 # batch 들에서). 같은 시나리오를 여러 번 돌리지 않는다.  (estimator_updates_per_step=1)
 #
-# 기본 런치: cadence 5:1, gen lr=fake lr=1e-7, EMA off, DMD, train B=8, val 1000 batch,
-#            scorer 440 scene + val_b 16 (scene 수 자동 조정), GPU 2,3.
+# 기본 런치(best 보전): cadence 5:1, gen lr=fake lr=1e-5, EMA on, middle,
+#            DMD, train B=16, val 1000 batch, scorer 512 scene, bp8,
+#            path_step 1.0, stride 0, GPU 0,1.
 #   bash scripts/_self_forcing_update.sh
 set -e
 
@@ -22,33 +23,46 @@ export TF_CPP_MIN_LOG_LEVEL="${TF_CPP_MIN_LOG_LEVEL:-2}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export PYTHONUNBUFFERED=1
 export WANDB_MODE="${WANDB_MODE:-online}"
+if is_true "${CLEAR_WANDB_API_KEY:-true}"; then
+  unset WANDB_API_KEY
+fi
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 REPO_ROOT="$(CDPATH= cd -- "${SCRIPT_DIR}/.." && pwd)"
-CONDA_SH="${CONDA_SH:-/home2/pnc2/miniforge3/etc/profile.d/conda.sh}"
-[ -f "${CONDA_SH}" ] && . "${CONDA_SH}"
-command -v conda >/dev/null 2>&1 && conda activate "${CATK_CONDA_ENV:-catk}" || true
+CONDA_SH="${CONDA_SH:-/mnt/nuplan/miniforge/etc/profile.d/conda.sh}"
+[ -f "${CONDA_SH}" ] || CONDA_SH="/home2/pnc2/miniforge3/etc/profile.d/conda.sh"
+if [ -f "${CONDA_SH}" ]; then
+  . "${CONDA_SH}"
+  conda activate "${CATK_CONDA_ENV:-catk}" || true
+elif command -v conda >/dev/null 2>&1; then
+  conda activate "${CATK_CONDA_ENV:-catk}" >/dev/null 2>&1 || true
+fi
 cd "${REPO_ROOT}"
 
 # --- core knobs ---
 MY_EXPERIMENT="${MY_EXPERIMENT:-self_forced_npfm}"
 ACTION="${ACTION:-finetune}"
 SEED="${SEED:-817}"
-CACHE_ROOT="${CACHE_ROOT:-/home2/pnc2/repos_python/datasets/catk_cache}"
+CACHE_ROOT="${CACHE_ROOT:-/workspace/womd_v1_3/SMART_cache}"
 CKPT_PATH="${CKPT_PATH:-logs/pretrained/pretrained.ckpt}"
 
-GPU="${GPU:-2}"
+GPU="${GPU:-0,1}"
 export CUDA_VISIBLE_DEVICES="${GPU}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-$(printf %s "${GPU}" | awk -F, '{print NF}')}"
 MASTER_PORT="${MASTER_PORT:-$(get_free_port)}"
+NNODES="${NNODES:-1}"
+NODE_RANK="${NODE_RANK:-0}"
+MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 
 # self-forcing cadence / lr / ema / objective
 CADENCE="${CADENCE:-5}"                         # fake:gen = N:1
 ESTIMATOR_UPDATES_PER_STEP="${ESTIMATOR_UPDATES_PER_STEP:-1}"   # fake updates per batch (1 = distinct batches)
 ESTIMATOR_INIT_CKPT="${ESTIMATOR_INIT_CKPT:-}"   # warmup된 fake critic ckpt(F_psi override). 빈값=generator 복사본
-GEN_LR="${GEN_LR:-2e-6}"
-FAKE_LR="${FAKE_LR:-4e-7}"
-USE_EMA="${USE_EMA:-false}"
+GEN_LR="${GEN_LR:-1e-5}"
+FAKE_LR="${FAKE_LR:-1e-5}"
+USE_EMA="${USE_EMA:-true}"
+EMA_WEIGHT="${EMA_WEIGHT:-0.99}"
+EMA_START_STEP="${EMA_START_STEP:-50}"
 DM_OBJECTIVE="${DM_OBJECTIVE:-dmd}"
 # normalize on(기본): direction 이 normalizer 로 O(1) 스케일 → step≈1.0 이 원본 DMD 정합.
 # normalize off(raw) 로 쓸 땐 raw gap 이 작아 2.0 같은 큰 값 필요.
@@ -64,18 +78,18 @@ PER_CHANNEL_NORMALIZER="${PER_CHANNEL_NORMALIZER:-false}"
 NORMALIZER_EPS="${NORMALIZER_EPS:-0.05}"
 # gradient 경로 정책.
 #   all(기본)=random terminal 미생성 → 블록 간 detach 제거(전 horizon grad) + backprop_last_k
-#     경로. BACKPROP_LAST_K=16=sample_steps 면 16 ODE step 전부 grad. (full-gradient)
+#     경로. best 보전 기본값은 BACKPROP_LAST_K=8.
 #   paper_uniform=원본식 truncation(블록 detach + 마지막 1개 ODE step만 grad, τ≈1 고정).
 TERMINAL_POLICY="${TERMINAL_POLICY:-all}"
-BACKPROP_LAST_K="${BACKPROP_LAST_K:-16}"   # policy=all 일 때 grad 남길 마지막 ODE step 수
+BACKPROP_LAST_K="${BACKPROP_LAST_K:-8}"   # policy=all 일 때 grad 남길 마지막 ODE step 수
 ESTIMATOR_WARMUP_EPOCHS="${ESTIMATOR_WARMUP_EPOCHS:-0}"
 # 반복 warmup/joint zone 스케줄(step 기준). 둘 다 양수면 warmup zone(critic만)과
 # joint zone(기존 cadence DMD)을 step 기준으로 번갈아 무한 반복. 0/0 이면 비활성.
 WARMUP_ZONE_STEPS="${WARMUP_ZONE_STEPS:-0}"
 JOINT_ZONE_STEPS="${JOINT_ZONE_STEPS:-0}"
-# 학습할 파라미터 범위. except_map_encoder(기본) | middle(flow decoder + 마지막 agent
-# 문맥 블록만) | full_flow_decoder(flow decoder만). 빈값이면 config 기본값 유지.
-UNFROZEN_RANGE="${UNFROZEN_RANGE:-}"
+# 학습할 파라미터 범위. middle(기본 best: flow decoder + 마지막 agent 문맥 블록만) |
+# except_map_encoder | full_flow_decoder(flow decoder만). UNFROZEN_RANGE= 이면 config 기본값 유지.
+UNFROZEN_RANGE="${UNFROZEN_RANGE-middle}"
 # FM regularization: DMD loss 에 open-loop flow-matching loss 를 anchor_weight 로 더해
 # generator 가 teacher 의 open-loop FM 에서 drift 하는 것을 억제한다. false=기존(off).
 USE_ANCHOR_FM_LOSS="${USE_ANCHOR_FM_LOSS:-false}"
@@ -86,14 +100,14 @@ ANCHOR_WEIGHT="${ANCHOR_WEIGHT:-0.05}"
 START_ANCHOR_STRIDE="${START_ANCHOR_STRIDE:-0}"
 
 # data / trainer
-TRAIN_B="${TRAIN_B:-8}"
+TRAIN_B="${TRAIN_B:-16}"
 VAL_B="${VAL_B:-16}"
-SCORER_SCENE_NUM="${SCORER_SCENE_NUM:-440}"
+SCORER_SCENE_NUM="${SCORER_SCENE_NUM:-512}"
 VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-1000}"
 LIMIT_VAL_BATCHES="${LIMIT_VAL_BATCHES:-1}"      # scorer_scene_num 가 자동 상향
 MAX_EPOCHS="${MAX_EPOCHS:-16}"
 PRECISION="${PRECISION:-32-true}"   # fp32
-NUM_WORKERS="${NUM_WORKERS:-8}"
+NUM_WORKERS="${NUM_WORKERS:-4}"
 N_ROLLOUT_CLOSED_VAL="${N_ROLLOUT_CLOSED_VAL:-16}"
 SIM_AGENTS_METRIC_WORKERS="${SIM_AGENTS_METRIC_WORKERS:-8}"   # 0=직렬(느림). 병렬로 val scorer 단축.
 DATA_SHUFFLE="${DATA_SHUFFLE:-false}"
@@ -101,8 +115,10 @@ DATA_SHUFFLE="${DATA_SHUFFLE:-false}"
 SAVE_CKPT="${SAVE_CKPT:-true}"
 
 # wandb
-WANDB_ENTITY="${WANDB_ENTITY:-se99an}"
-WANDB_PROJECT="${WANDB_PROJECT:-clsft-catk}"
+# pod-level WANDB_* can be stale; override intentionally with *_OVERRIDE only.
+WANDB_ENTITY="${WANDB_ENTITY_OVERRIDE:-se99an}"
+WANDB_PROJECT="${WANDB_PROJECT_OVERRIDE:-clsft-catk}"
+export WANDB_ENTITY WANDB_PROJECT
 
 TS="$(date +%m%d_%H%M%S)"
 TASK_DEFAULT="sfupdate_cad${CADENCE}_gen${GEN_LR}_fake${FAKE_LR}_${DM_OBJECTIVE}_b${TRAIN_B}x${NPROC_PER_NODE}_${TS}"
@@ -155,6 +171,8 @@ set -- \
   model.model_config.self_forced.estimator_updates_per_step="${ESTIMATOR_UPDATES_PER_STEP}" \
   model.model_config.self_forced.estimator_lr="${FAKE_LR}" \
   model.model_config.self_forced.use_ema="${USE_EMA}" \
+  model.model_config.self_forced.ema_weight="${EMA_WEIGHT}" \
+  model.model_config.self_forced.ema_start_step="${EMA_START_STEP}" \
   model.model_config.self_forced.estimator_warmup_epochs="${ESTIMATOR_WARMUP_EPOCHS}" \
   model.model_config.self_forced.warmup_zone_steps="${WARMUP_ZONE_STEPS}" \
   model.model_config.self_forced.joint_zone_steps="${JOINT_ZONE_STEPS}" \
@@ -171,6 +189,10 @@ if [ -n "${UNFROZEN_RANGE}" ]; then
   set -- "$@" model.model_config.self_forced.unfrozen_range="${UNFROZEN_RANGE}"
 fi
 
+if [ "${NNODES}" != "1" ]; then
+  set -- "$@" +trainer.num_nodes="${NNODES}"
+fi
+
 # checkpoint 저장. SAVE_CKPT=true(기본): model_checkpoint(best, monitor=RMM/mode=max,
 # save_top_k=1 + save_last 링크) + epoch_last_checkpoint(epoch_last.ckpt) 유지 → best+last.
 # false: 두 콜백 제거(빠른 실험용, 디스크 미사용).
@@ -181,11 +203,12 @@ fi
 echo "============================================================"
 echo "[sf-update] task=${TASK}"
 echo "  GPU=${CUDA_VISIBLE_DEVICES} nproc=${NPROC_PER_NODE}  ckpt=${CKPT_PATH}"
+echo "  dist nnodes=${NNODES} node_rank=${NODE_RANK} master=${MASTER_ADDR}:${MASTER_PORT}"
 echo "  cadence(fake:gen)=${CADENCE}:1  est_updates/batch=${ESTIMATOR_UPDATES_PER_STEP}  gen_lr=${GEN_LR} fake_lr=${FAKE_LR}"
 echo "  estimator_init_ckpt=${ESTIMATOR_INIT_CKPT:-<none>}"
-echo "  objective=${DM_OBJECTIVE} use_ema=${USE_EMA} warmup_epochs=${ESTIMATOR_WARMUP_EPOCHS}"
+echo "  objective=${DM_OBJECTIVE} use_ema=${USE_EMA} ema_weight=${EMA_WEIGHT} ema_start_step=${EMA_START_STEP} warmup_epochs=${ESTIMATOR_WARMUP_EPOCHS}"
 echo "  normalize_dir=${NORMALIZE_DIRECTION} per_channel_norm=${PER_CHANNEL_NORMALIZER} path_step=${PATH_STEP_SIZE} normalizer_eps=${NORMALIZER_EPS}"
-echo "  grad_policy=${TERMINAL_POLICY} backprop_last_k=${BACKPROP_LAST_K} (all+16=full-gradient: 블록 detach 없음 + 16 ODE step 전부)"
+echo "  grad_policy=${TERMINAL_POLICY} backprop_last_k=${BACKPROP_LAST_K}"
 echo "  anchor_fm_loss=${USE_ANCHOR_FM_LOSS} anchor_weight=${ANCHOR_WEIGHT} start_anchor_stride=${START_ANCHOR_STRIDE}"
 echo "  zone_schedule(warmup:joint steps)=${WARMUP_ZONE_STEPS}:${JOINT_ZONE_STEPS} (0:0=off)"
 echo "  unfrozen_range=${UNFROZEN_RANGE:-<config default>}"
@@ -195,10 +218,20 @@ echo "  log=${LOG}"
 echo "============================================================"
 
 if is_true "${DRY_RUN:-false}"; then
-  printf "torchrun --standalone --nproc_per_node=%s -m src.run" "${NPROC_PER_NODE}"
+  if [ "${NNODES}" = "1" ]; then
+    printf "torchrun --standalone --nproc_per_node=%s --master_port=%s -m src.run" "${NPROC_PER_NODE}" "${MASTER_PORT}"
+  else
+    printf "torchrun --nnodes=%s --node_rank=%s --nproc_per_node=%s --master_addr=%s --master_port=%s -m src.run" "${NNODES}" "${NODE_RANK}" "${NPROC_PER_NODE}" "${MASTER_ADDR}" "${MASTER_PORT}"
+  fi
   for a in "$@"; do printf " %s" "$a"; done; printf "\n"; exit 0
 fi
 
-torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" --master_port="${MASTER_PORT}" \
-  -m src.run "$@" > "${LOG}" 2>&1
+if [ "${NNODES}" = "1" ]; then
+  torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" --master_port="${MASTER_PORT}" \
+    -m src.run "$@" > "${LOG}" 2>&1
+else
+  torchrun --nnodes="${NNODES}" --node_rank="${NODE_RANK}" --nproc_per_node="${NPROC_PER_NODE}" \
+    --master_addr="${MASTER_ADDR}" --master_port="${MASTER_PORT}" \
+    -m src.run "$@" > "${LOG}" 2>&1
+fi
 echo "[sf-update] done status=$? log=${LOG}"
