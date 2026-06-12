@@ -8,7 +8,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_cluster import radius_graph
 from torch.nn.attention import SDPBackend, sdpa_kernel
-from torch_geometric.utils import subgraph
 
 from src.smart.layers.attention_layer import AttentionLayer
 from src.smart.layers.fourier_embedding import FourierEmbedding
@@ -620,55 +619,56 @@ class SameChunkAgentAttentionBlock(nn.Module):
             )
         return interaction_group.to(device=device, dtype=torch.long)
 
-    def _build_same_chunk_edges(
+    def _build_base_edges(
         self,
         interaction_pos: torch.Tensor,
         interaction_head: torch.Tensor,
         interaction_group: torch.Tensor,
-        chunk_valid_mask: torch.Tensor | None,
-        num_chunks: int,
+        valid_anchor_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         num_anchor = interaction_pos.shape[0]
         _, inverse_group = torch.unique(interaction_group, sorted=True, return_inverse=True)
-        num_groups = int(inverse_group.max().item()) + 1
-        chunk_idx = torch.arange(num_chunks, device=interaction_pos.device)
 
-        pos_s = interaction_pos.unsqueeze(0).expand(num_chunks, num_anchor, 2).reshape(-1, 2)
-        head_s = interaction_head.unsqueeze(0).expand(num_chunks, num_anchor).reshape(-1)
-        head_vector_s = torch.stack([head_s.cos(), head_s.sin()], dim=-1)
-        batch_s = (
-            inverse_group.unsqueeze(0).expand(num_chunks, num_anchor)
-            + chunk_idx.view(num_chunks, 1) * num_groups
-        ).reshape(-1)
-        if chunk_valid_mask is None:
-            valid_mask = torch.ones(
-                num_chunks * num_anchor,
-                device=interaction_pos.device,
-                dtype=torch.bool,
+        valid_anchor_idx = torch.nonzero(valid_anchor_mask, as_tuple=False).flatten()
+        if valid_anchor_idx.numel() == 0:
+            empty_edge = torch.empty(2, 0, device=interaction_pos.device, dtype=torch.long)
+            empty_attr = self.r_a2a_emb(
+                continuous_inputs=interaction_pos.new_zeros((0, self.r_a2a_emb.input_dim)),
+                categorical_embs=None,
             )
-        else:
-            valid_mask = chunk_valid_mask.transpose(0, 1).reshape(-1).bool()
+            return empty_edge, empty_attr
 
-        sort_order = torch.argsort(batch_s, stable=True)
-        pos_s_sorted = pos_s[sort_order]
-        batch_s_sorted = batch_s[sort_order]
-
-        edge_index_sorted = radius_graph(
-            x=pos_s_sorted,
+        pos_valid = interaction_pos[valid_anchor_idx]
+        batch_valid = inverse_group[valid_anchor_idx]
+        sort_order = torch.argsort(batch_valid, stable=True)
+        pos_sorted = pos_valid[sort_order]
+        batch_sorted = batch_valid[sort_order]
+        edge_index_base_sorted = radius_graph(
+            x=pos_sorted,
             r=self.radius,
-            batch=batch_s_sorted,
+            batch=batch_sorted,
             loop=False,
             max_num_neighbors=self.max_num_neighbors,
         )
-        edge_index = sort_order[edge_index_sorted]
-        edge_index = subgraph(subset=valid_mask, edge_index=edge_index)[0]
-        rel_pos = pos_s[edge_index[0]] - pos_s[edge_index[1]]
-        rel_head = wrap_angle(head_s[edge_index[0]] - head_s[edge_index[1]])
+        if edge_index_base_sorted.numel() == 0:
+            empty_edge = torch.empty(2, 0, device=interaction_pos.device, dtype=torch.long)
+            empty_attr = self.r_a2a_emb(
+                continuous_inputs=interaction_pos.new_zeros((0, self.r_a2a_emb.input_dim)),
+                categorical_embs=None,
+            )
+            return empty_edge, empty_attr
+
+        edge_index_base = valid_anchor_idx[sort_order[edge_index_base_sorted]]
+        src_anchor = edge_index_base[0]
+        dst_anchor = edge_index_base[1]
+        head_vector = torch.stack([interaction_head.cos(), interaction_head.sin()], dim=-1)
+        rel_pos = interaction_pos[src_anchor] - interaction_pos[dst_anchor]
+        rel_head = wrap_angle(interaction_head[src_anchor] - interaction_head[dst_anchor])
         edge_attr = torch.stack(
             [
                 safe_norm_2d(rel_pos[:, :2]),
                 angle_between_2d_vectors(
-                    ctr_vector=head_vector_s[edge_index[1]],
+                    ctr_vector=head_vector[dst_anchor],
                     nbr_vector=rel_pos[:, :2],
                 ),
                 rel_head,
@@ -676,7 +676,7 @@ class SameChunkAgentAttentionBlock(nn.Module):
             dim=-1,
         )
         edge_attr = self.r_a2a_emb(continuous_inputs=edge_attr, categorical_embs=None)
-        return edge_index, edge_attr
+        return edge_index_base, edge_attr
 
     def forward(
         self,
@@ -728,16 +728,34 @@ class SameChunkAgentAttentionBlock(nn.Module):
         )
         interaction_pos = interaction_pos.to(device=chunk_tokens.device, dtype=torch.float32)
         interaction_head = interaction_head.to(device=chunk_tokens.device, dtype=torch.float32)
-        edge_index, edge_attr = self._build_same_chunk_edges(
+        if chunk_valid_mask is None:
+            valid_anchor_mask = torch.ones(num_anchor, device=chunk_tokens.device, dtype=torch.bool)
+        else:
+            valid_anchor_mask = chunk_valid_mask.bool().any(dim=1)
+        edge_index, edge_attr = self._build_base_edges(
             interaction_pos=interaction_pos,
             interaction_head=interaction_head,
             interaction_group=interaction_group,
-            chunk_valid_mask=chunk_valid_mask,
-            num_chunks=num_chunks,
+            valid_anchor_mask=valid_anchor_mask,
         )
-        chunk_tokens_s = chunk_tokens.transpose(0, 1).reshape(num_chunks * num_anchor, dim)
-        updated_tokens = self.a2a_attn(chunk_tokens_s, edge_attr, edge_index)
-        updated_tokens = updated_tokens.view(num_chunks, num_anchor, dim).transpose(0, 1)
+        updated_chunks = []
+        if chunk_valid_mask is None or edge_index.numel() == 0:
+            for chunk_idx in range(num_chunks):
+                updated_chunks.append(self.a2a_attn(chunk_tokens[:, chunk_idx], edge_attr, edge_index))
+        else:
+            edge_src = edge_index[0]
+            edge_dst = edge_index[1]
+            for chunk_idx in range(num_chunks):
+                valid_chunk = chunk_valid_mask[:, chunk_idx].bool()
+                edge_keep = valid_chunk[edge_src] & valid_chunk[edge_dst]
+                updated_chunks.append(
+                    self.a2a_attn(
+                        chunk_tokens[:, chunk_idx],
+                        edge_attr[edge_keep],
+                        edge_index[:, edge_keep],
+                    )
+                )
+        updated_tokens = torch.stack(updated_chunks, dim=1)
         if chunk_valid_mask is not None:
             updated_tokens = updated_tokens * chunk_valid_mask.to(dtype=updated_tokens.dtype).unsqueeze(-1)
         return updated_tokens
