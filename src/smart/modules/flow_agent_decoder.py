@@ -129,9 +129,13 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             flow_dim=flow_dim,
             num_future_steps=self.flow_window_steps,
             num_chunk_heads=flow_num_chunk_heads,
+            head_dim=head_dim,
+            num_freq_bands=num_freq_bands,
             num_chunk_layers=flow_num_chunk_layers,
             chunk_size=self.shift,
             flow_state_dim=self.flow_state_dim,
+            a2a_radius=a2a_radius,
+            dropout=dropout,
         )
         self.flow_ode = FlowODE(
             eps=flow_solver_eps,
@@ -408,6 +412,81 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             return anchor_hidden.new_zeros((0, anchor_hidden.shape[-1]))
         return torch.cat(packed_hidden, dim=0)
 
+    def _pack_anchor_interaction_group(
+        self,
+        agent_batch: torch.Tensor | None,
+        anchor_mask: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """유효 anchor의 scene-anchor group을 hidden/target pack 순서와 맞춥니다."""
+        if agent_batch is None:
+            return None
+        if agent_batch.shape[0] != anchor_mask.shape[0]:
+            raise ValueError(
+                "agent_batch first dimension must match anchor_mask first dimension, "
+                f"got {agent_batch.shape[0]} and {anchor_mask.shape[0]}."
+            )
+        num_anchor = int(anchor_mask.shape[1])
+        agent_batch = agent_batch.to(device=anchor_mask.device, dtype=torch.long)
+        packed_group = [
+            agent_batch[anchor_mask[:, anchor_idx]] * num_anchor + anchor_idx
+            for anchor_idx in range(num_anchor)
+            if anchor_mask[:, anchor_idx].any()
+        ]
+        if len(packed_group) == 0:
+            return agent_batch.new_zeros((0,))
+        return torch.cat(packed_group, dim=0)
+
+    def _pack_anchor_tensor(
+        self,
+        value: torch.Tensor | None,
+        anchor_mask: torch.Tensor,
+        *,
+        value_name: str,
+    ) -> torch.Tensor | None:
+        if value is None:
+            return None
+        if value.shape[:2] != anchor_mask.shape:
+            raise ValueError(
+                f"{value_name} first two dimensions must match anchor_mask, "
+                f"got {tuple(value.shape[:2])} and {tuple(anchor_mask.shape)}."
+            )
+        packed_value = [
+            value[:, anchor_idx][anchor_mask[:, anchor_idx]]
+            for anchor_idx in range(anchor_mask.shape[1])
+            if anchor_mask[:, anchor_idx].any()
+        ]
+        if len(packed_value) == 0:
+            return value.new_zeros((0,) + tuple(value.shape[2:]))
+        return torch.cat(packed_value, dim=0)
+
+    def _pack_anchor_interaction_state(
+        self,
+        tokenized_agent: Dict[str, torch.Tensor],
+        anchor_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        group = self._pack_anchor_interaction_group(
+            tokenized_agent.get("batch"),
+            anchor_mask,
+        )
+        required_context_steps = int(anchor_mask.shape[1]) + 1
+        ctx_pos = tokenized_agent.get("ctx_sampled_pos")
+        ctx_head = tokenized_agent.get("ctx_sampled_heading")
+        if ctx_pos is None or ctx_head is None:
+            return group, None, None
+        if ctx_pos.shape[1] < required_context_steps or ctx_head.shape[1] < required_context_steps:
+            raise ValueError(
+                "Flow anchor interaction state requires one leading token plus all anchor tokens: "
+                f"required={required_context_steps}, "
+                f"actual_pos={ctx_pos.shape[1]}, actual_head={ctx_head.shape[1]}."
+            )
+        anchor_pos = ctx_pos[:, 1:required_context_steps]
+        anchor_head = ctx_head[:, 1:required_context_steps]
+        return (
+            group,
+            self._pack_anchor_tensor(anchor_pos, anchor_mask, value_name="anchor_pos"),
+            self._pack_anchor_tensor(anchor_head, anchor_mask, value_name="anchor_head"),
+        )
+
     def build_anchor_context(
         self,
         tokenized_agent: Dict[str, torch.Tensor],
@@ -514,6 +593,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         sampling_scheme: DictConfig,
         sampling_seed: int | None = None,
         backprop_last_k: int | None = None,
+        interaction_group: torch.Tensor | None = None,
+        interaction_pos: torch.Tensor | None = None,
+        interaction_head: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """유효 anchor 문맥만 받아 실제 생성 경로로 2초 미래를 만듭니다.
 
@@ -560,7 +642,14 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
 
         return self.flow_ode.generate(
             x_init=x_init_norm,
-            model_fn=lambda x_t, tau: self.flow_decoder(anchor_hidden_valid, x_t, tau),
+            model_fn=lambda x_t, tau: self.flow_decoder(
+                anchor_hidden_valid,
+                x_t,
+                tau,
+                interaction_group=interaction_group,
+                interaction_pos=interaction_pos,
+                interaction_head=interaction_head,
+            ),
             steps=flow_sample_steps,
             method=flow_sample_method,
             backprop_last_k=backprop_last_k,
@@ -573,6 +662,10 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         sampling_scheme: DictConfig,
         sampling_seed: int | None = None,
         backprop_last_k: int | None = None,
+        agent_batch: torch.Tensor | None = None,
+        interaction_group: torch.Tensor | None = None,
+        interaction_pos: torch.Tensor | None = None,
+        interaction_head: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """모든 anchor 문맥에서 유효한 것만 골라 실제 생성 경로를 수행합니다.
 
@@ -591,11 +684,16 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
         """
         anchor_hidden_valid = self._pack_anchor_hidden(anchor_hidden, anchor_mask)
+        if interaction_group is None:
+            interaction_group = self._pack_anchor_interaction_group(agent_batch, anchor_mask)
         return self._sample_open_loop_future_from_hidden(
             anchor_hidden_valid=anchor_hidden_valid,
             sampling_scheme=sampling_scheme,
             sampling_seed=sampling_seed,
             backprop_last_k=backprop_last_k,
+            interaction_group=interaction_group,
+            interaction_pos=interaction_pos,
+            interaction_head=interaction_head,
         )
 
 
@@ -963,6 +1061,14 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         ctx_hidden_pack = anchor_context["ctx_hidden_pack"]
         anchor_hidden = anchor_context["anchor_hidden"]
         anchor_hidden_valid = self._pack_anchor_hidden(anchor_hidden, anchor_mask)
+        (
+            anchor_interaction_group,
+            anchor_interaction_pos,
+            anchor_interaction_head,
+        ) = self._pack_anchor_interaction_state(
+            tokenized_agent,
+            anchor_mask,
+        )
 
         if flow_clean_norm.numel() == 0:
             empty = flow_clean_norm.new_zeros((0, self.flow_window_steps, self.flow_state_dim))
@@ -974,6 +1080,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 "ctx_hidden_pack": ctx_hidden_pack,
                 "anchor_hidden": anchor_hidden,
                 "anchor_mask": anchor_mask,
+                "anchor_interaction_group": anchor_interaction_group,
+                "anchor_interaction_pos": anchor_interaction_pos,
+                "anchor_interaction_head": anchor_interaction_head,
             }
             if flow_agent_type is not None:
                 output["flow_metric_agent_type"] = flow_agent_type
@@ -1001,6 +1110,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             flow_sample.x_t,
             flow_sample.tau,
             future_valid_mask=flow_loss_mask,
+            interaction_group=anchor_interaction_group,
+            interaction_pos=anchor_interaction_pos,
+            interaction_head=anchor_interaction_head,
         )
         if (
             bool(getattr(self, "detach_train_metric_clean", False))
@@ -1027,6 +1139,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             "ctx_hidden_pack": ctx_hidden_pack,
             "anchor_hidden": anchor_hidden,
             "anchor_mask": anchor_mask,
+            "anchor_interaction_group": anchor_interaction_group,
+            "anchor_interaction_pos": anchor_interaction_pos,
+            "anchor_interaction_head": anchor_interaction_head,
         }
         if flow_agent_type is not None:
             output["flow_metric_agent_type"] = flow_agent_type
@@ -1742,6 +1857,13 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
 
             if active_mask.any():
                 active_hidden = current_hidden[active_mask]
+                active_interaction_group = (
+                    tokenized_agent["batch"][active_mask]
+                    if "batch" in tokenized_agent
+                    else None
+                )
+                active_interaction_pos = pos_window[active_mask, -1]
+                active_interaction_head = head_window[active_mask, -1]
                 noise_start = t * self.shift
                 x_init_norm = rollout_noise_tape[
                     active_mask,
@@ -1763,7 +1885,14 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     )
                     y_hat_norm = self.flow_ode.generate(
                         x_init=x_init_norm,
-                        model_fn=lambda x_t, tau: self.flow_decoder(active_hidden, x_t, tau),
+                        model_fn=lambda x_t, tau: self.flow_decoder(
+                            active_hidden,
+                            x_t,
+                            tau,
+                            interaction_group=active_interaction_group,
+                            interaction_pos=active_interaction_pos,
+                            interaction_head=active_interaction_head,
+                        ),
                         steps=flow_sample_steps,
                         method=flow_sample_method,
                         backprop_last_k=flow_sample_backprop_last_k,
@@ -1771,7 +1900,14 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 else:
                     y_hat_norm = self.flow_ode.generate(
                         x_init=x_init_norm,
-                        model_fn=lambda x_t, tau: self.flow_decoder(active_hidden, x_t, tau),
+                        model_fn=lambda x_t, tau: self.flow_decoder(
+                            active_hidden,
+                            x_t,
+                            tau,
+                            interaction_group=active_interaction_group,
+                            interaction_pos=active_interaction_pos,
+                            interaction_head=active_interaction_head,
+                        ),
                         steps=flow_sample_steps,
                         method=flow_sample_method,
                         terminal_step=terminal_step_for_rollout,
@@ -2185,7 +2321,29 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         anchor_hidden = ctx_hidden_pack[:, 1:2, :]
         single_anchor_mask = anchor_mask.bool().view(-1, 1)
         anchor_hidden_valid = self._pack_anchor_hidden(anchor_hidden, single_anchor_mask)
-        velocity = self.flow_decoder(anchor_hidden_valid, path_noisy_norm, tau)
+        interaction_group = (
+            tokenized_agent["batch"][anchor_mask.bool()]
+            if "batch" in tokenized_agent
+            else None
+        )
+        interaction_pos = (
+            tokenized_agent["ctx_sampled_pos"][:, 1][anchor_mask.bool()]
+            if "ctx_sampled_pos" in tokenized_agent
+            else None
+        )
+        interaction_head = (
+            tokenized_agent["ctx_sampled_heading"][:, 1][anchor_mask.bool()]
+            if "ctx_sampled_heading" in tokenized_agent
+            else None
+        )
+        velocity = self.flow_decoder(
+            anchor_hidden_valid,
+            path_noisy_norm,
+            tau,
+            interaction_group=interaction_group,
+            interaction_pos=interaction_pos,
+            interaction_head=interaction_head,
+        )
         clean = self.flow_ode.predict_clean_from_velocity(path_noisy_norm, velocity, tau)
         return {"velocity": velocity, "clean": clean}
 
