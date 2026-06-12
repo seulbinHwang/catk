@@ -23,8 +23,8 @@ DEFAULT_CACHE_ROOT = "/workspace/womd_v1_3/SMART_cache"
 DEFAULT_LOG_DIR = "/mnt/nuplan/projects/catk/logs"
 DEFAULT_EXPERIMENT = "pre_bc_flow_2x4_h100"
 DEFAULT_TASK_NAME = (
-    "flow_open_loop_pretrain_a343315f_context_gelu_bridge_gelu_"
-    "h100x8_fmsf3_bs20"
+    "flow_open_loop_pretrain_a343315f_gelu_head_dim16_freq32_"
+    "h100x8_fmsf3_bs18_lr6p5e-4_warm5_val8_membal"
 )
 DEFAULT_SESSION = "catk-pretrain-a343315f-gelu-h100x8-fmsf3"
 
@@ -78,6 +78,7 @@ def render_env(args: argparse.Namespace) -> str:
     ]
     optional = {
         "LEARNING_RATE": args.learning_rate,
+        "LR_WARMUP_STEPS": args.lr_warmup_steps,
         "LIMIT_TRAIN_BATCHES": args.limit_train_batches,
         "CATK_EXTRA_OVERRIDES": args.extra_hydra_overrides,
     }
@@ -215,6 +216,9 @@ while (( bs >= MIN_BS )); do
   )
   if [[ -n "${{LEARNING_RATE:-}}" ]]; then
     HYDRA_OVERRIDES+=("model.model_config.lr=${{LEARNING_RATE}}")
+  fi
+  if [[ -n "${{LR_WARMUP_STEPS:-}}" ]]; then
+    HYDRA_OVERRIDES+=("model.model_config.lr_warmup_steps=${{LR_WARMUP_STEPS}}")
   fi
   if [[ -n "${{LIMIT_TRAIN_BATCHES:-}}" ]]; then
     HYDRA_OVERRIDES+=("trainer.limit_train_batches=${{LIMIT_TRAIN_BATCHES}}")
@@ -388,17 +392,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--session", default=DEFAULT_SESSION)
     parser.add_argument("--cuda-visible-devices", default="0,1,2,3,4,5,6,7")
     parser.add_argument("--nproc-per-node", type=int, default=8)
-    parser.add_argument("--initial-bs", type=int, default=20)
+    parser.add_argument("--initial-bs", type=int, default=18)
     parser.add_argument("--oom-step", type=int, default=2)
     parser.add_argument("--min-bs", type=int, default=12)
     parser.add_argument("--val-batch-size", type=int, default=16)
     parser.add_argument("--test-batch-size", type=int, default=16)
     parser.add_argument("--max-epochs", type=int, default=64)
-    parser.add_argument("--check-val-every-n-epoch", type=int, default=32)
+    parser.add_argument("--check-val-every-n-epoch", type=int, default=8)
     parser.add_argument("--limit-val-batches", default="0.1")
     parser.add_argument("--limit-train-batches", default="")
-    parser.add_argument("--learning-rate", default="")
-    parser.add_argument("--train-memory-balanced-batches", default="false")
+    parser.add_argument("--learning-rate", default="6.5e-4")
+    parser.add_argument("--lr-warmup-steps", default="5")
+    parser.add_argument("--train-memory-balanced-batches", default="true")
     parser.add_argument("--max-non-oom-retries", type=int, default=3)
     parser.add_argument("--extra-hydra-overrides", default="")
     parser.add_argument("--monitor-interval", type=int, default=60)
