@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch the fm-sf-3 H100x8 gradually-see variant of the quarter SF-anchor run."""
+"""Launch an H100x8 gradually-see variant of the quarter SF-anchor run."""
 
 from __future__ import annotations
 
@@ -19,30 +19,37 @@ from launch_closed_loop_self_forced_h100x2x4_quarter_fmsf4_sf_anchor_static_pods
 )
 
 
-def split_wrapper_args(argv: list[str]) -> tuple[list[str], str, int, bool, int]:
+def split_wrapper_args(argv: list[str]) -> tuple[list[str], str, str, int, bool, int, float | None]:
     parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--pod", default="fm-sf-3")
     parser.add_argument("--extra-hydra-overrides", default="")
     parser.add_argument("--closed-loop-sf-global-max-step", type=int, default=4)
     parser.add_argument("--rollout-anchor-stride", type=int, default=4)
+    parser.add_argument("--self-forced-beta", type=float, default=None)
     parser.add_argument(
         "--skip-initial-stage-checkpoint",
         action=argparse.BooleanOptionalAction,
         default=True,
     )
     known, remaining = parser.parse_known_args(argv)
+    if not known.pod:
+        parser.error("--pod must not be empty")
     if known.rollout_anchor_stride < 1:
         parser.error("--rollout-anchor-stride must be >= 1")
-    if known.closed_loop_sf_global_max_step < 1:
-        parser.error("--closed-loop-sf-global-max-step must be >= 1")
+    if known.closed_loop_sf_global_max_step < 0:
+        parser.error("--closed-loop-sf-global-max-step must be >= 0")
 
-    variant_overrides = " ".join(
-        [
-            "model.model_config.self_forced.closed_loop_sf_global_max_step="
-            f"{known.closed_loop_sf_global_max_step}",
-            "model.model_config.self_forced.closed_loop_see_all=true",
-            "model.model_config.self_forced.gradually_see=true",
-        ]
-    )
+    variant_override_parts = [
+        "model.model_config.self_forced.closed_loop_sf_global_max_step="
+        f"{known.closed_loop_sf_global_max_step}",
+        "model.model_config.self_forced.closed_loop_see_all=true",
+        "model.model_config.self_forced.gradually_see=true",
+    ]
+    if known.self_forced_beta is not None:
+        variant_override_parts.append(
+            f"model.model_config.self_forced.beta={known.self_forced_beta:g}"
+        )
+    variant_overrides = " ".join(variant_override_parts)
     extra_overrides = " ".join(
         part
         for part in (
@@ -58,9 +65,11 @@ def split_wrapper_args(argv: list[str]) -> tuple[list[str], str, int, bool, int]
     return (
         remaining,
         extra_overrides,
+        known.pod,
         known.rollout_anchor_stride,
         known.skip_initial_stage_checkpoint,
         known.closed_loop_sf_global_max_step,
+        known.self_forced_beta,
     )
 
 
@@ -68,11 +77,14 @@ def main() -> int:
     (
         passthrough_args,
         extra_overrides,
+        pod,
         rollout_anchor_stride,
         skip_initial_stage_checkpoint,
         closed_loop_sf_global_max_step,
+        self_forced_beta,
     ) = split_wrapper_args(sys.argv[1:])
-    pod_label = "h100x8_fm_sf3"
+    pod_slug = pod.replace("-", "_")
+    pod_label = f"h100x8_{pod_slug}"
     lr_tag = "lr5e-5"
     if skip_initial_stage_checkpoint:
         checkpoint_artifact = INITIAL_STAGE_CHECKPOINT_ARTIFACT
@@ -99,10 +111,15 @@ def main() -> int:
         expected_epoch = ""
         expected_global_step = ""
 
+    beta_tag = ""
+    if self_forced_beta is not None:
+        beta_tag = f"_beta{str(f'{self_forced_beta:g}').replace('.', 'p')}"
+
     task_name = (
         f"flow_closed_loop_self_forced_dmd_{pod_label}_fmsf4_sfanchor_seeall_gradual_"
         f"stride{rollout_anchor_stride}_{checkpoint_tag}_activecontrol_sample16_backprop8_"
         f"{lr_tag}_bs24to4step4_frac025_ep6_warm0_global{closed_loop_sf_global_max_step}_local4"
+        f"{beta_tag}"
     )
     bank_name = f"generated-estimator-warmup-bank-pretrain-x5f9g0ce-v57-{lr_tag}"
 
@@ -114,7 +131,7 @@ def main() -> int:
         "--branch",
         "closed_loop_sf_anchor",
         "--pods",
-        "fm-sf-3",
+        pod,
         "--nproc-per-node",
         "8",
         "--experiment",
@@ -136,7 +153,7 @@ def main() -> int:
         "--task-name",
         task_name,
         "--session",
-        f"catk-closed-loop-sf-h100x8-fm-sf3-fmsf4-gradual-stride{rollout_anchor_stride}",
+        f"catk-closed-loop-sf-h100x8-{pod}-fmsf4-gradual-stride{rollout_anchor_stride}",
         "--initial-bs",
         "24",
         "--oom-step",
