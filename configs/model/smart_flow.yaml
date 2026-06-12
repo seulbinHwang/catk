@@ -136,9 +136,9 @@ model_config:
         min_executed_steps: 16
   decoder:
     hidden_dim: 128
-    num_freq_bands: 64
+    num_freq_bands: 32
     num_heads: 8
-    head_dim: 15
+    head_dim: 16
     dropout: 0.1
     hist_drop_prob: 0.1
     num_map_layers: 3
