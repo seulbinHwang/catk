@@ -103,7 +103,7 @@ def main() -> int:
     task_name = (
         f"flow_closed_loop_self_forced_dmd_{pod_label}_sfanchor_seeall_gradual_injramp_"
         f"stride{rollout_anchor_stride}_{checkpoint_tag}_activecontrol_sample16_backprop8_"
-        f"{lr_tag}_bs12to4step2_frac025_ep6_warm0_global{closed_loop_sf_global_max_step}_local4"
+        f"{lr_tag}_bs10to4step2_frac025_ep6_warm0_global{closed_loop_sf_global_max_step}_local4"
     )
     bank_name = f"generated-estimator-warmup-bank-pretrain-x5f9g0ce-v57-{lr_tag}"
 
@@ -139,7 +139,7 @@ def main() -> int:
         "--session",
         f"catk-closed-loop-sf-h100x8-fmsf5-gradual-injramp-stride{rollout_anchor_stride}",
         "--initial-bs",
-        "12",
+        "10",
         "--oom-step",
         "2",
         "--min-bs",
