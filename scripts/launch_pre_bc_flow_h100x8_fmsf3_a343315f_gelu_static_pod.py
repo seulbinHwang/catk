@@ -24,7 +24,7 @@ DEFAULT_LOG_DIR = "/mnt/nuplan/projects/catk/logs"
 DEFAULT_EXPERIMENT = "pre_bc_flow_2x4_h100"
 DEFAULT_TASK_NAME = (
     "flow_open_loop_pretrain_a343315f_context_gelu_bridge_gelu_"
-    "h100x8_fmsf3_bs26"
+    "h100x8_fmsf3_bs20"
 )
 DEFAULT_SESSION = "catk-pretrain-a343315f-gelu-h100x8-fmsf3"
 
@@ -388,9 +388,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--session", default=DEFAULT_SESSION)
     parser.add_argument("--cuda-visible-devices", default="0,1,2,3,4,5,6,7")
     parser.add_argument("--nproc-per-node", type=int, default=8)
-    parser.add_argument("--initial-bs", type=int, default=26)
+    parser.add_argument("--initial-bs", type=int, default=20)
     parser.add_argument("--oom-step", type=int, default=2)
-    parser.add_argument("--min-bs", type=int, default=16)
+    parser.add_argument("--min-bs", type=int, default=12)
     parser.add_argument("--val-batch-size", type=int, default=16)
     parser.add_argument("--test-batch-size", type=int, default=16)
     parser.add_argument("--max-epochs", type=int, default=64)
