@@ -202,6 +202,7 @@ while (( bs >= MIN_BS )); do
     "action=fit"
     "task_name=${{TASK_NAME}}"
     "$ckpt_override"
+    "paths.cache_root=${{CACHE_ROOT}}"
     "trainer.devices=${{NPROC_PER_NODE}}"
     "trainer.num_nodes=1"
     "trainer.max_epochs=${{MAX_EPOCHS}}"
