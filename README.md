@@ -1943,6 +1943,53 @@ bash scripts/h100x4_multinode_pretrain_with_oom_retry.sh
 
 retry wrapper의 로컬 attempt 로그는 `logs/_h100x4_multinode_pretrain_oom_retry/<TASK_NAME>/attempt_XXX_bsYY.log`에 저장됩니다. resume 기준 checkpoint는 pod 안의 `logs/<TASK_NAME>/runs/*/checkpoints/epoch_last.ckpt` 중 최신 파일입니다. 학습 epoch 중간에 OOM이 나면 마지막으로 저장된 `epoch_last.ckpt`, 즉 보통 마지막 완료 epoch부터 이어가고, validation 직전/중간 OOM이면 validation 직전에 저장된 pending checkpoint부터 이어갑니다.
 
+#### fm-sf-5 H100x8 Plan-first residual decoder open-loop pretrain
+
+`semi_control_decoder_gpt` 브랜치의 Plan-first Residual Hierarchical Decoder 효과를 보려면, 이미 떠 있는 `fm-sf-5` pod의 H100 8장을 그대로 사용해 아래 launcher를 실행합니다. 이 launcher는 pod를 만들거나 재시작하지 않고, pod 내부의 tmux session과 `torchrun`만 관리합니다.
+
+```bash
+python scripts/launch_pre_bc_flow_h100x8_fmsf5_plan_first_decoder_static_pod.py --replace
+```
+
+기본 실험 이름은 다음입니다.
+
+```text
+flow_open_loop_pretrain_planfirst_residual_decoder_h100x8_fmsf5_bs18_lr6p5e-4_warm5_val8_membal
+```
+
+핵심 설정은 아래와 같습니다.
+
+| 항목 | 값 |
+|---|---:|
+| branch | `semi_control_decoder_gpt` |
+| pod / GPU | `fm-sf-5`, H100 8장 |
+| experiment | `pre_bc_flow_2x4_h100` |
+| DDP shape | single node, `nproc_per_node=8`, `trainer.num_nodes=1` |
+| decoder change | 2초 plan token + 4 chunk token + frame residual velocity |
+| train batch | per-GPU `18`, effective global `144` |
+| OOM fallback | `18 -> 16 -> 14 -> 12`, 최신 `epoch_last.ckpt`/`last.ckpt`에서 resume |
+| learning rate | `6.5e-4` |
+| LR warmup | `5` steps |
+| max epochs | `64` |
+| validation cadence | every `8` epochs |
+| validation scope | `limit_val_batches=0.1`, `n_rollout_closed_val=32` |
+| train sampler | `train_memory_balanced_batches=true` |
+| cache | `/workspace/womd_v1_3/SMART_cache` |
+| log root | `/mnt/nuplan/projects/catk/logs` |
+
+attach:
+
+```bash
+kubectl exec -it -n p-sp-labs-reai-training fm-sf-5 -c main -- \
+  tmux attach -t catk-pretrain-planfirst-decoder-h100x8-fmsf5
+```
+
+중지:
+
+```bash
+python scripts/launch_pre_bc_flow_h100x8_fmsf5_plan_first_decoder_static_pod.py --stop
+```
+
 실행 후 접속:
 
 ```bash
