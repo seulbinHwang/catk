@@ -19,7 +19,7 @@ BASE_LAUNCHER = Path(__file__).with_name(
 
 DEFAULT_TASK_NAME = (
     "flow_open_loop_pretrain_decoder_agent_attention_effect_"
-    "h100x8_fmsf6_bs24_lr6e-4_warm4_val8_membal"
+    "h100x8_fmsf6_bs20to10_lr6e-4_warm4_val8_membal"
 )
 DEFAULT_SESSION = "catk-pretrain-decoder-agent-attention-h100x8-fmsf6"
 DEFAULT_WANDB_GROUP = "decoder_agent_attention_pretrain"
@@ -44,11 +44,11 @@ def main() -> None:
         "--session",
         DEFAULT_SESSION,
         "--initial-bs",
-        "24",
+        "20",
         "--oom-step",
         "2",
         "--min-bs",
-        "16",
+        "10",
         "--val-batch-size",
         "16",
         "--test-batch-size",
