@@ -2409,6 +2409,7 @@ class SMARTFlow(LightningModule):
             rollout_agent = replicate_tokenized_agent_for_anchors(
                 tokenized_agent=tokenized_agent,
                 anchor_offsets=anchor_offsets,
+                shift=int(self.token_processor.shift),
             )
             rollout_map_feature = replicate_map_feature_for_anchors(
                 map_feature=map_feature,

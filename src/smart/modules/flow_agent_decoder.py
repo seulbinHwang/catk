@@ -21,7 +21,11 @@ from src.smart.modules.kinematic_control import (
     validate_control_no_slip_ratio_config,
     validate_control_yaw_scale_config,
 )
-from src.smart.modules.dynamic_light_time import build_constant_light_time_delta_norm
+from src.smart.modules.dynamic_light_time import (
+    DEFAULT_SECONDS_PER_RAW_STEP,
+    DEFAULT_WAYMO_CURRENT_RAW_STEP,
+    normalize_light_time_delta_seconds,
+)
 from src.smart.modules.self_forced_rollout_detach import (
     detach_training_rollout_state,
 )
@@ -900,6 +904,73 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             output["flow_loss_mask"] = flow_loss_mask
         return output
 
+    def _resolve_rollout_light_time_base_seconds(
+        self,
+        value: torch.Tensor | None,
+        *,
+        num_agents: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if value is None:
+            return torch.zeros((num_agents,), device=device, dtype=dtype)
+        base_seconds = value.to(device=device, dtype=dtype)
+        if base_seconds.ndim != 1 or int(base_seconds.shape[0]) != int(num_agents):
+            raise ValueError(
+                "rollout_light_time_base_seconds must have shape [n_agent], "
+                f"got {tuple(base_seconds.shape)} and n_agent={num_agents}."
+            )
+        return base_seconds
+
+    def _get_rollout_light_time_base_seconds(
+        self,
+        tokenized_agent: Dict[str, torch.Tensor],
+        *,
+        num_agents: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        return self._resolve_rollout_light_time_base_seconds(
+            tokenized_agent.get("rollout_light_time_base_seconds"),
+            num_agents=num_agents,
+            device=device,
+            dtype=dtype,
+        )
+
+    def _build_rollout_context_light_time_delta_norm(
+        self,
+        rollout_light_time_base_seconds: torch.Tensor,
+        *,
+        num_steps: int,
+    ) -> torch.Tensor:
+        num_agents = int(rollout_light_time_base_seconds.shape[0])
+        if num_steps == 0:
+            return rollout_light_time_base_seconds.new_zeros((num_agents, 0))
+        raw_steps = torch.arange(
+            1,
+            num_steps + 1,
+            device=rollout_light_time_base_seconds.device,
+            dtype=rollout_light_time_base_seconds.dtype,
+        ) * float(self.shift)
+        context_seconds = (
+            raw_steps - float(DEFAULT_WAYMO_CURRENT_RAW_STEP)
+        ) * float(DEFAULT_SECONDS_PER_RAW_STEP)
+        delta_seconds = rollout_light_time_base_seconds.view(num_agents, 1) + context_seconds.view(
+            1,
+            num_steps,
+        )
+        return normalize_light_time_delta_seconds(delta_seconds)
+
+    def _build_rollout_step_light_time_delta_norm(
+        self,
+        rollout_light_time_base_seconds: torch.Tensor,
+        *,
+        step_index_2hz: int,
+    ) -> torch.Tensor:
+        elapsed_seconds = float(step_index_2hz * self.shift) * float(DEFAULT_SECONDS_PER_RAW_STEP)
+        delta_seconds = rollout_light_time_base_seconds.view(-1, 1) + elapsed_seconds
+        return normalize_light_time_delta_seconds(delta_seconds)
+
     def _prepare_rollout_cache_impl(
         self,
         tokenized_agent: Dict[str, torch.Tensor],
@@ -960,6 +1031,16 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         )
 
         n_step = pos_window.shape[1]
+        rollout_light_time_base_seconds = self._get_rollout_light_time_base_seconds(
+            tokenized_agent,
+            num_agents=n_agent,
+            device=pos_window.device,
+            dtype=pos_window.dtype,
+        )
+        light_time_delta_norm = self._build_rollout_context_light_time_delta_norm(
+            rollout_light_time_base_seconds,
+            num_steps=n_step,
+        )
         batch_s_a2a = self._build_step_offset_batch(
             batch=tokenized_agent["batch"],
             num_steps=n_step,
@@ -982,6 +1063,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             batch_s=batch_s_pl2a,
             batch_pl=map_feature["batch"],
             light_type=map_feature.get("light_type"),
+            light_time_delta_norm=light_time_delta_norm,
         )
         edge_index_a2a, r_a2a = self.build_interaction_edge(
             pos_a=pos_window,
@@ -1036,6 +1118,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             "categorical_embs": categorical_embs,
             "feat_a_now": feat_a_now,
             "feat_a_t_dict": feat_a_t_dict,
+            "rollout_light_time_base_seconds": rollout_light_time_base_seconds,
         }
 
     @torch.no_grad()
@@ -1384,6 +1467,12 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         categorical_embs = state["categorical_embs"]
         feat_a_now = state["feat_a_now"]
         feat_a_t_dict = state["feat_a_t_dict"]
+        rollout_light_time_base_seconds = self._resolve_rollout_light_time_base_seconds(
+            state.get("rollout_light_time_base_seconds"),
+            num_agents=n_agent,
+            device=pos_window.device,
+            dtype=pos_window.dtype,
+        )
 
         coarse_pos_list = [pos_window[:, i].clone() for i in range(pos_window.shape[1])]
         coarse_head_list = [head_window[:, i].clone() for i in range(head_window.shape[1])]
@@ -1526,12 +1615,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     batch_s=tokenized_agent["batch"],
                     batch_pl=map_feature["batch"],
                     light_type=map_feature.get("light_type"),
-                    light_time_delta_norm=build_constant_light_time_delta_norm(
-                        num_agents=n_agent,
-                        num_steps=1,
-                        delta_seconds=float(t * self.shift) * 0.1,
-                        device=pos_window.device,
-                        dtype=pos_window.dtype,
+                    light_time_delta_norm=self._build_rollout_step_light_time_delta_norm(
+                        rollout_light_time_base_seconds,
+                        step_index_2hz=t,
                     ),
                 )
                 edge_index_a2a, r_a2a = self.build_interaction_edge(

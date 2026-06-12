@@ -434,6 +434,71 @@ def test_self_forced_training_rollout_uses_geometry_only_relation_input() -> Non
     assert "motion_valid_a" not in records[0]
 
 
+def test_multi_anchor_rollout_cache_applies_anchor_light_time_base() -> None:
+    decoder = _make_flow_decoder()
+    valid = torch.ones((4, 2), dtype=torch.bool)
+    tokenized_agent = _make_rollout_tokenized_agent(valid)
+    tokenized_agent["rollout_light_time_base_seconds"] = torch.tensor(
+        [0.0, 2.0, 4.0, 6.0],
+        dtype=torch.float32,
+    )
+    records: list[torch.Tensor | None] = []
+
+    def record_build_map2agent_edge(*args, **kwargs):
+        light_time = kwargs.get("light_time_delta_norm")
+        records.append(None if light_time is None else light_time.detach().clone())
+        return torch.zeros((2, 0), dtype=torch.long), torch.zeros((0, 1))
+
+    decoder.build_map2agent_edge = record_build_map2agent_edge
+    decoder._prepare_rollout_cache_impl(
+        tokenized_agent=tokenized_agent,
+        map_feature=_empty_map_feature(),
+    )
+
+    assert len(records) == 1
+    assert records[0] is not None
+    expected = torch.tensor(
+        [
+            [-0.5, 0.0],
+            [1.5, 2.0],
+            [3.5, 4.0],
+            [5.5, 6.0],
+        ],
+        dtype=torch.float32,
+    ) / 6.0
+    torch.testing.assert_close(records[0], expected)
+
+
+def test_multi_anchor_rollout_update_applies_anchor_light_time_base() -> None:
+    decoder = _make_flow_decoder()
+    rollout_cache, tokenized_agent = _make_rollout_cache_for_update_test()
+    rollout_cache["rollout_light_time_base_seconds"] = torch.tensor(
+        [0.0, 2.0, 4.0],
+        dtype=torch.float32,
+    )
+    records: list[torch.Tensor | None] = []
+
+    def record_build_map2agent_edge(*args, **kwargs):
+        light_time = kwargs.get("light_time_delta_norm")
+        records.append(None if light_time is None else light_time.detach().clone())
+        return torch.zeros((2, 0), dtype=torch.long), torch.zeros((0, 1))
+
+    decoder.build_map2agent_edge = record_build_map2agent_edge
+    decoder._rollout_from_cache_impl(
+        rollout_cache=rollout_cache,
+        tokenized_agent=tokenized_agent,
+        map_feature=_empty_map_feature(),
+        sampling_scheme=SimpleNamespace(noise_scale=0.0, sample_steps=1, sample_method="euler"),
+        rollout_steps_2hz=2,
+        self_forced_epoch=0,
+    )
+
+    assert len(records) == 1
+    assert records[0] is not None
+    expected = torch.tensor([[0.5], [2.5], [4.5]], dtype=torch.float32) / 6.0
+    torch.testing.assert_close(records[0], expected)
+
+
 def test_old_motion_feature_checkpoint_fails_with_clear_message() -> None:
     model = SMARTFlow.__new__(SMARTFlow)
     object.__setattr__(

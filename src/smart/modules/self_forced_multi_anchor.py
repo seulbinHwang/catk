@@ -194,6 +194,9 @@ def _flatten_anchor_major(values: Tensor) -> Tensor:
 def replicate_tokenized_agent_for_anchors(
     tokenized_agent: Dict[str, Tensor],
     anchor_offsets: List[int],
+    *,
+    shift: int = 5,
+    seconds_per_raw_step: float = 0.1,
 ) -> Dict[str, Tensor]:
     """선택한 anchor마다 장면을 복제해 단일 rollout 입력을 만듭니다.
 
@@ -206,6 +209,8 @@ def replicate_tokenized_agent_for_anchors(
         tokenized_agent: 평가 모드 토큰 사전입니다. ``sf_anchor_*`` 필드가
             있어야 합니다(``FlowTokenProcessor`` eval 분기가 만듭니다).
         anchor_offsets: 사용할 anchor offset 목록입니다.
+        shift: coarse token 사이의 10Hz raw step 수입니다.
+        seconds_per_raw_step: raw step 하나가 나타내는 초 단위 시간입니다.
 
     Returns:
         Dict[str, Tensor]: anchor-major로 복제된 토큰 사전입니다.
@@ -263,6 +268,12 @@ def replicate_tokenized_agent_for_anchors(
     replicated["gt_z_raw"] = _flatten_anchor_major(
         tokenized_agent["sf_anchor_z"][:, offsets].unsqueeze(-1)
     ).squeeze(-1)
+    light_base_seconds = offsets.to(dtype=tokenized_agent["gt_pos"].dtype) * (
+        float(shift) * float(seconds_per_raw_step)
+    )
+    replicated["rollout_light_time_base_seconds"] = light_base_seconds.repeat_interleave(
+        num_agent
+    )
     return replicated
 
 

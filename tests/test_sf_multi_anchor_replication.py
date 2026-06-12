@@ -116,6 +116,13 @@ def test_replicate_tokenized_agent_multi_anchor_layout() -> None:
     assert replicated["token_bank_all_veh"] is tokenized_agent["token_bank_all_veh"]
     assert replicated["trajectory_token_veh"] is tokenized_agent["trajectory_token_veh"]
 
+    expected_light_base = torch.tensor(offsets, dtype=torch.float32) * 0.5
+    expected_light_base = expected_light_base.repeat_interleave(num_agent)
+    torch.testing.assert_close(
+        replicated["rollout_light_time_base_seconds"],
+        expected_light_base,
+    )
+
     # 토큰 window 필드는 anchor offset만큼 shift되어야 합니다.
     n_token = tokenized_agent["gt_pos"].shape[1]
     for a, offset in enumerate(offsets):
