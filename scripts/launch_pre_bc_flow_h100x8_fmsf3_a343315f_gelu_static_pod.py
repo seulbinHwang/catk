@@ -23,8 +23,8 @@ DEFAULT_CACHE_ROOT = "/workspace/womd_v1_3/SMART_cache"
 DEFAULT_LOG_DIR = "/mnt/nuplan/projects/catk/logs"
 DEFAULT_EXPERIMENT = "pre_bc_flow_2x4_h100"
 DEFAULT_TASK_NAME = (
-    "flow_open_loop_pretrain_a343315f_context_gelu_bridge_gelu_"
-    "h100x8_fmsf3_bs20"
+    "flow_open_loop_pretrain_a343315f_gelu_head_dim16_freq32_"
+    "h100x8_fmsf3_bs18_lr6p5e-4_warm5_val8_membal"
 )
 DEFAULT_SESSION = "catk-pretrain-a343315f-gelu-h100x8-fmsf3"
 
@@ -73,11 +73,13 @@ def render_env(args: argparse.Namespace) -> str:
         export_line("MAX_EPOCHS", args.max_epochs),
         export_line("CHECK_VAL_EVERY_N_EPOCH", args.check_val_every_n_epoch),
         export_line("LIMIT_VAL_BATCHES", args.limit_val_batches),
+        export_line("USE_DISTRIBUTED_SAMPLER", args.use_distributed_sampler),
         export_line("TRAIN_MEMORY_BALANCED_BATCHES", args.train_memory_balanced_batches),
         export_line("MAX_NON_OOM_RETRIES", args.max_non_oom_retries),
     ]
     optional = {
         "LEARNING_RATE": args.learning_rate,
+        "LR_WARMUP_STEPS": args.lr_warmup_steps,
         "LIMIT_TRAIN_BATCHES": args.limit_train_batches,
         "CATK_EXTRA_OVERRIDES": args.extra_hydra_overrides,
     }
@@ -92,13 +94,8 @@ def render_worker_script(project_root: str, env_file: str, branch: str, pull: bo
     if pull:
         pull_block = f"""
 git config --global --add safe.directory {shq(project_root)} || true
-git fetch origin {shq(branch)}:refs/remotes/origin/{shq(branch)}
-if git show-ref --verify --quiet refs/heads/{shq(branch)}; then
-  git checkout {shq(branch)}
-else
-  git checkout -b {shq(branch)} origin/{shq(branch)}
-fi
-git pull --ff-only origin {shq(branch)}
+git fetch origin +{shq(branch)}:refs/remotes/origin/{shq(branch)}
+git checkout -B {shq(branch)} origin/{shq(branch)}
 """
 
     return f"""#!/usr/bin/env bash
@@ -208,6 +205,7 @@ while (( bs >= MIN_BS )); do
     "trainer.max_epochs=${{MAX_EPOCHS}}"
     "trainer.check_val_every_n_epoch=${{CHECK_VAL_EVERY_N_EPOCH}}"
     "trainer.limit_val_batches=${{LIMIT_VAL_BATCHES}}"
+    "+trainer.use_distributed_sampler=${{USE_DISTRIBUTED_SAMPLER}}"
     "data.train_batch_size=${{bs}}"
     "data.val_batch_size=${{VAL_BATCH_SIZE}}"
     "data.test_batch_size=${{TEST_BATCH_SIZE}}"
@@ -215,6 +213,9 @@ while (( bs >= MIN_BS )); do
   )
   if [[ -n "${{LEARNING_RATE:-}}" ]]; then
     HYDRA_OVERRIDES+=("model.model_config.lr=${{LEARNING_RATE}}")
+  fi
+  if [[ -n "${{LR_WARMUP_STEPS:-}}" ]]; then
+    HYDRA_OVERRIDES+=("model.model_config.lr_warmup_steps=${{LR_WARMUP_STEPS}}")
   fi
   if [[ -n "${{LIMIT_TRAIN_BATCHES:-}}" ]]; then
     HYDRA_OVERRIDES+=("trainer.limit_train_batches=${{LIMIT_TRAIN_BATCHES}}")
@@ -388,17 +389,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--session", default=DEFAULT_SESSION)
     parser.add_argument("--cuda-visible-devices", default="0,1,2,3,4,5,6,7")
     parser.add_argument("--nproc-per-node", type=int, default=8)
-    parser.add_argument("--initial-bs", type=int, default=20)
+    parser.add_argument("--initial-bs", type=int, default=18)
     parser.add_argument("--oom-step", type=int, default=2)
     parser.add_argument("--min-bs", type=int, default=12)
     parser.add_argument("--val-batch-size", type=int, default=16)
     parser.add_argument("--test-batch-size", type=int, default=16)
     parser.add_argument("--max-epochs", type=int, default=64)
-    parser.add_argument("--check-val-every-n-epoch", type=int, default=32)
+    parser.add_argument("--check-val-every-n-epoch", type=int, default=8)
     parser.add_argument("--limit-val-batches", default="0.1")
     parser.add_argument("--limit-train-batches", default="")
-    parser.add_argument("--learning-rate", default="")
-    parser.add_argument("--train-memory-balanced-batches", default="false")
+    parser.add_argument("--learning-rate", default="6.5e-4")
+    parser.add_argument("--lr-warmup-steps", default="5")
+    parser.add_argument("--use-distributed-sampler", default="false")
+    parser.add_argument("--train-memory-balanced-batches", default="true")
     parser.add_argument("--max-non-oom-retries", type=int, default=3)
     parser.add_argument("--extra-hydra-overrides", default="")
     parser.add_argument("--monitor-interval", type=int, default=60)
