@@ -39,7 +39,7 @@ class AttentionLayer(MessagePassing):
         self.attn_drop = nn.Dropout(dropout)
         self.ff_mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim * 4),
-            nn.ReLU(inplace=True),
+            nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim * 4, hidden_dim),
         )
