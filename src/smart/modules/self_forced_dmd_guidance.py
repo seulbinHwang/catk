@@ -4,14 +4,44 @@ import torch
 from torch import Tensor
 
 
+def resolve_self_forced_entropy_beta(config: object | None) -> float:
+    """Resolve the ERD entropy temperature beta from self-forced config."""
+    if config is None:
+        return 1.0
+    raw_beta = getattr(config, "entropy_beta", getattr(config, "dmd_beta", 1.0))
+    beta = float(raw_beta)
+    if not 0.0 < beta <= 1.0:
+        raise ValueError(
+            "self_forced.entropy_beta must satisfy 0 < beta <= 1, "
+            f"got {beta}."
+        )
+    return beta
+
+
+def _expand_tau_for_clean_prior(tau: Tensor, reference: Tensor) -> Tensor:
+    tau_tensor = tau.to(device=reference.device, dtype=reference.dtype)
+    batch_size = int(reference.shape[0])
+    if tau_tensor.ndim == 0:
+        tau_tensor = tau_tensor.expand(batch_size)
+    elif tuple(tau_tensor.shape) != (batch_size,):
+        raise ValueError(
+            "tau must have shape [] or [n_valid_agent] when entropy_beta < 1, "
+            f"got {tuple(tau_tensor.shape)} for n_valid_agent={batch_size}."
+        )
+    return tau_tensor.view(batch_size, *([1] * (reference.dim() - 1)))
+
+
 def build_clean_dmd_direction(
     committed_path_norm: Tensor,
     target_clean_norm: Tensor,
     generated_clean_norm: Tensor,
+    noisy_path_norm: Tensor | None = None,
+    tau: Tensor | None = None,
     normalizer_eps: float = 1.0e-3,
     channel_mask: Tensor | None = None,
     per_channel_normalizer: bool = False,
     normalize_direction: bool = True,
+    entropy_beta: float = 1.0,
 ) -> Tensor:
     """teacher와 generated estimator의 clean path 차이로 DMD 방향을 만듭니다.
 
@@ -22,6 +52,11 @@ def build_clean_dmd_direction(
             shape은 ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
         generated_clean_norm: generated estimator가 같은 noisy path에서 추정한 clean path입니다.
             shape은 ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
+        noisy_path_norm: 같은 flow time에서 noised 된 path입니다. ``entropy_beta < 1``
+            에서만 필요합니다.
+        tau: ``noisy_path_norm`` 의 flow interpolation time입니다. shape은
+            ``[n_valid_agent]`` 입니다. 이 코드의 flow path에서 clean coefficient
+            ``alpha_tau`` 는 ``tau`` 입니다.
         normalizer_eps: agent별 정규화 분모의 최소값입니다.
 
     Returns:
@@ -30,10 +65,11 @@ def build_clean_dmd_direction(
 
     설명:
         이 함수는 raw velocity 차이나 시간/노이즈 계수가 섞인 값을 그대로 쓰지 않습니다.
-        먼저 ``target_clean_norm - generated_clean_norm`` 방향을 만들고, 각 agent의 전체
-        미래 path 기준으로 ``committed_path_norm``과 ``target_clean_norm`` 사이의 평균
-        거리로 나눕니다. 이렇게 하면 teacher가 보는 방향은 유지하면서도 특정 tau 구간에서
-        target path가 과하게 커지는 문제를 줄일 수 있습니다.
+        ERD beta가 1이면 기존 DMD처럼 ``target_clean_norm - generated_clean_norm``
+        방향을 씁니다. beta가 1보다 작으면 논문 식의 음수 방향인
+        ``beta * target_clean + (1 - beta) * noisy / tau - generated_clean`` 을
+        사용합니다. 이후 각 agent의 전체 미래 path 기준으로 ``committed_path_norm``과
+        ``target_clean_norm`` 사이의 평균 거리로 나눕니다.
     """
     expected_shape = tuple(committed_path_norm.shape)
     if tuple(target_clean_norm.shape) != expected_shape:
@@ -51,6 +87,19 @@ def build_clean_dmd_direction(
             "committed_path_norm must have at least agent and path dimensions, "
             f"got shape={expected_shape}."
         )
+    beta = float(entropy_beta)
+    if not 0.0 < beta <= 1.0:
+        raise ValueError(f"entropy_beta must satisfy 0 < beta <= 1, got {beta}.")
+    if beta < 1.0:
+        if noisy_path_norm is None or tau is None:
+            raise ValueError(
+                "noisy_path_norm and tau are required when entropy_beta < 1."
+            )
+        if tuple(noisy_path_norm.shape) != expected_shape:
+            raise ValueError(
+                "noisy_path_norm shape must match committed_path_norm shape: "
+                f"expected={expected_shape}, actual={tuple(noisy_path_norm.shape)}."
+            )
 
     committed = committed_path_norm.float()
     target_clean = target_clean_norm.float()
@@ -64,7 +113,16 @@ def build_clean_dmd_direction(
         else None
     )
 
-    clean_dmd_direction = target_clean - generated_clean
+    if beta < 1.0:
+        assert noisy_path_norm is not None and tau is not None
+        noisy = noisy_path_norm.to(device=committed.device, dtype=committed.dtype)
+        tau_view = _expand_tau_for_clean_prior(tau, committed)
+        clean_prior = noisy / tau_view.clamp_min(torch.finfo(committed.dtype).eps)
+        tempered_target_clean = beta * target_clean + (1.0 - beta) * clean_prior
+    else:
+        tempered_target_clean = target_clean
+
+    clean_dmd_direction = tempered_target_clean - generated_clean
     # 죽은 채널을 direction 단계에서 먼저 0으로 만들어, 아래 정규화 분모(평균)에도
     # 끼지 않게 한다.
     if mask is not None:

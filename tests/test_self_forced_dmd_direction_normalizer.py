@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import pytest
 import torch
 
-from src.smart.modules.self_forced_dmd_guidance import build_clean_dmd_direction
+from src.smart.modules.self_forced_dmd_guidance import (
+    build_clean_dmd_direction,
+    resolve_self_forced_entropy_beta,
+)
 
 
 def test_full_normalizer_uses_single_agentwise_scalar_over_time_and_channel() -> None:
@@ -78,3 +84,68 @@ def test_dead_channel_does_not_inflate_or_deflate_valid_channels() -> None:
 
     assert torch.allclose(masked[..., 0], expected_ch0, atol=1e-4)
     assert torch.all(masked[..., 1] == 0.0)
+
+
+def test_entropy_beta_one_recovers_plain_clean_dmd_without_noisy_path() -> None:
+    committed = torch.zeros(1, 1, 2)
+    target = torch.tensor([[[4.0, -2.0]]])
+    generated = torch.tensor([[[1.5, 0.5]]])
+
+    direction = build_clean_dmd_direction(
+        committed_path_norm=committed,
+        target_clean_norm=target,
+        generated_clean_norm=generated,
+        entropy_beta=1.0,
+        normalize_direction=False,
+    )
+
+    assert torch.allclose(direction, target - generated)
+
+
+def test_entropy_beta_tempers_real_clean_estimate_with_noisy_over_tau_prior() -> None:
+    committed = torch.zeros(1, 1, 1)
+    target = torch.tensor([[[10.0]]])
+    generated = torch.tensor([[[1.0]]])
+    noisy = torch.tensor([[[8.0]]])
+    tau = torch.tensor([0.5])
+
+    direction = build_clean_dmd_direction(
+        committed_path_norm=committed,
+        target_clean_norm=target,
+        generated_clean_norm=generated,
+        noisy_path_norm=noisy,
+        tau=tau,
+        entropy_beta=0.25,
+        normalize_direction=False,
+    )
+
+    expected = 0.25 * target + 0.75 * (noisy / 0.5) - generated
+    assert torch.allclose(direction, expected)
+
+
+def test_entropy_beta_requires_noisy_path_and_tau_below_one() -> None:
+    committed = torch.zeros(1, 1, 1)
+    target = torch.ones(1, 1, 1)
+    generated = torch.zeros(1, 1, 1)
+
+    with pytest.raises(ValueError, match="noisy_path_norm and tau"):
+        build_clean_dmd_direction(
+            committed_path_norm=committed,
+            target_clean_norm=target,
+            generated_clean_norm=generated,
+            entropy_beta=0.9,
+        )
+
+
+def test_resolve_self_forced_entropy_beta_reads_new_key_and_dmd_beta_alias() -> None:
+    assert resolve_self_forced_entropy_beta(None) == 1.0
+    assert resolve_self_forced_entropy_beta(SimpleNamespace(entropy_beta=0.7)) == 0.7
+    assert resolve_self_forced_entropy_beta(SimpleNamespace(dmd_beta=0.8)) == 0.8
+
+
+@pytest.mark.parametrize("beta", [0.0, -0.1, 1.01])
+def test_resolve_self_forced_entropy_beta_rejects_values_outside_open_zero_closed_one(
+    beta: float,
+) -> None:
+    with pytest.raises(ValueError, match="self_forced.entropy_beta"):
+        resolve_self_forced_entropy_beta(SimpleNamespace(entropy_beta=beta))

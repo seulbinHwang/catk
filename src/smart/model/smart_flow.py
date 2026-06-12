@@ -45,7 +45,10 @@ from src.smart.modules.self_forced_multi_anchor import (
     replicate_tokenized_agent_for_anchors,
     select_self_forced_anchor_offsets,
 )
-from src.smart.modules.self_forced_dmd_guidance import build_clean_dmd_direction
+from src.smart.modules.self_forced_dmd_guidance import (
+    build_clean_dmd_direction,
+    resolve_self_forced_entropy_beta,
+)
 from src.smart.modules.self_forced_sid_loss import compute_clean_sid_loss
 from src.smart.modules.self_forced_update_separation import (
     assert_no_module_gradients,
@@ -249,6 +252,9 @@ class SMARTFlow(LightningModule):
             float(getattr(self.self_forced_config, "path_step_size", 0.05))
             if self.self_forced_config is not None
             else 0.05
+        )
+        self.self_forced_entropy_beta = resolve_self_forced_entropy_beta(
+            self.self_forced_config,
         )
         # normalize_direction=False 면 거리-나눗셈 제거(raw teacher-fake, 수렴형 DMD).
         self.self_forced_normalize_direction = (
@@ -2687,10 +2693,13 @@ class SMARTFlow(LightningModule):
                 committed_path_norm=clean_for_guidance,
                 target_clean_norm=target_pred["clean"],
                 generated_clean_norm=generated_pred["clean"],
+                noisy_path_norm=flow_sample.x_t,
+                tau=flow_sample.tau,
                 normalizer_eps=self.self_forced_direction_normalizer_eps,
                 channel_mask=channel_mask,
                 per_channel_normalizer=self.self_forced_per_channel_normalizer,
                 normalize_direction=self.self_forced_normalize_direction,
+                entropy_beta=self.self_forced_entropy_beta,
             )
             self._log_self_forced_direction_diagnostics(
                 committed=clean_for_guidance,

@@ -71,6 +71,9 @@ model_config:
     # normalize_direction=false 면 DMD direction 의 거리-나눗셈 제거(raw teacher-fake,
     # 수렴형). path_step_size 가 고정 계수 역할(raw gap 작아 더 큰 값 필요).
     normalize_direction: true
+    # ERD entropy temperature beta. 1.0이면 기존 vanilla DMD와 동일하고,
+    # 0<beta<1이면 beta*real + (1-beta)*x_t/tau - fake 방향으로 diversity collapse를 완화한다.
+    entropy_beta: 1.0
     # clean_dmd_per_channel_normalizer=false(기본): normalizer 를 시간+채널 전체 평균
     # (agent 당 단일 스칼라)으로 — 원본 Self-Forcing(DMD) mean(dim=[1..]) 정합.  죽은
     # 채널(non-holonomic delta_n)은 direction/normalizer 양쪽에서 masking 으로 제외한다.
