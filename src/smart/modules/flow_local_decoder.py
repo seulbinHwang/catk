@@ -499,6 +499,8 @@ class NormalizedNoisyFutureEncoder(nn.Module):
 
 
 class HalfSecondChunkMixerBlock(nn.Module):
+    """2초 전체 의도 토큰과 0.5초 묶음 토큰을 함께 갱신하는 블록입니다."""
+
     def __init__(self, flow_dim: int, num_heads: int) -> None:
         super().__init__()
         self.attn_norm = nn.LayerNorm(flow_dim)
@@ -522,29 +524,75 @@ class HalfSecondChunkMixerBlock(nn.Module):
         )
 
     def _modulate(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        """장면 문맥과 잡음 제거 단계 정보를 토큰에 주입합니다.
+
+        Args:
+            x: 갱신할 토큰입니다. shape은 ``[n_path, 1 + n_chunk, flow_dim]`` 입니다.
+            cond: 문맥에서 만든 조절값입니다. shape은 ``[n_path, 3 * flow_dim]`` 입니다.
+
+        Returns:
+            torch.Tensor: 문맥 정보가 섞인 토큰입니다. shape은 ``x`` 와 같습니다.
+        """
         scale, bias, gate = cond.chunk(3, dim=-1)
+        # scale/bias/gate: [n_path, flow_dim]
         return x + torch.sigmoid(gate).unsqueeze(1) * (
             x * (1.0 + scale.unsqueeze(1)) + bias.unsqueeze(1)
         )
 
-    def _build_safe_key_padding_mask(self, chunk_valid_mask: torch.Tensor) -> torch.Tensor:
-        key_padding_mask = ~chunk_valid_mask.bool()
-        all_masked = key_padding_mask.all(dim=1)
-        key_padding_mask = key_padding_mask & ~all_masked.unsqueeze(1)
-        return key_padding_mask
+    def _build_safe_key_padding_mask(
+        self,
+        chunk_valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """전체 의도 토큰은 항상 보이도록 attention mask를 만듭니다.
+
+        Args:
+            chunk_valid_mask: 유효한 0.5초 묶음 표시입니다. shape은 ``[n_path, n_chunk]`` 입니다.
+
+        Returns:
+            torch.Tensor: attention에서 숨길 위치입니다.
+                shape은 ``[n_path, 1 + n_chunk]`` 입니다.
+        """
+        # plan_padding_mask: [n_path, 1]
+        plan_padding_mask = torch.zeros(
+            chunk_valid_mask.shape[0],
+            1,
+            dtype=torch.bool,
+            device=chunk_valid_mask.device,
+        )
+        # chunk_padding_mask: [n_path, n_chunk]
+        chunk_padding_mask = ~chunk_valid_mask.bool()
+        return torch.cat([plan_padding_mask, chunk_padding_mask], dim=1)
 
     def forward(
         self,
+        plan_token: torch.Tensor,
         chunk_tokens: torch.Tensor,
         context: torch.Tensor,
         tau_emb: torch.Tensor,
         chunk_valid_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        attn_in = self.attn_norm(chunk_tokens)
-        # Force math SDPA kernel: H100's flash/mem-efficient kernels save
-        # uninitialized memory as placeholders, which backward later reads as
-        # NaN and propagates into encoder weight gradients (silently corrupting
-        # training). ChunkStepRefiner uses the same guard for the same reason.
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """2초 전체 의도와 0.5초 묶음 정보를 한 번에 갱신합니다.
+
+        Args:
+            plan_token: 2초 전체 움직임을 대표하는 토큰입니다.
+                shape은 ``[n_path, flow_dim]`` 입니다.
+            chunk_tokens: 0.5초 묶음별 토큰입니다.
+                shape은 ``[n_path, n_chunk, flow_dim]`` 입니다.
+            context: 과거, 지도, 주변 객체 정보를 담은 문맥입니다.
+                shape은 ``[n_path, flow_dim]`` 입니다.
+            tau_emb: 현재 잡음 제거 단계 정보입니다.
+                shape은 ``[n_path, flow_dim]`` 입니다.
+            chunk_valid_mask: loss에 포함할 수 있는 묶음 표시입니다.
+                shape은 ``[n_path, n_chunk]`` 입니다.
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor]:
+                갱신된 전체 의도 토큰과 묶음 토큰입니다.
+                각 shape은 ``[n_path, flow_dim]``, ``[n_path, n_chunk, flow_dim]`` 입니다.
+        """
+        # seq_tokens: [n_path, 1 + n_chunk, flow_dim]
+        seq_tokens = torch.cat([plan_token.unsqueeze(1), chunk_tokens], dim=1)
+        attn_in = self.attn_norm(seq_tokens)
         with sdpa_kernel(_SDPA_SAFE_BACKENDS):
             if chunk_valid_mask is None:
                 attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
@@ -556,19 +604,24 @@ class HalfSecondChunkMixerBlock(nn.Module):
                     key_padding_mask=self._build_safe_key_padding_mask(chunk_valid_mask),
                     need_weights=False,
                 )
-        chunk_tokens = chunk_tokens + attn_out
-        if chunk_valid_mask is not None:
-            chunk_tokens = chunk_tokens * chunk_valid_mask.to(dtype=chunk_tokens.dtype).unsqueeze(-1)
+        seq_tokens = seq_tokens + attn_out
 
+        # cond: [n_path, 3 * flow_dim]
         cond = self.cond_mlp(torch.cat([context, tau_emb], dim=-1))
-        mlp_in = self._modulate(self.mlp_norm(chunk_tokens), cond)
-        chunk_tokens = chunk_tokens + self.mlp(mlp_in)
+        mlp_in = self._modulate(self.mlp_norm(seq_tokens), cond)
+        seq_tokens = seq_tokens + self.mlp(mlp_in)
+
+        # plan_token: [n_path, flow_dim], chunk_tokens: [n_path, n_chunk, flow_dim]
+        plan_token = seq_tokens[:, 0]
+        chunk_tokens = seq_tokens[:, 1:]
         if chunk_valid_mask is not None:
             chunk_tokens = chunk_tokens * chunk_valid_mask.to(dtype=chunk_tokens.dtype).unsqueeze(-1)
-        return chunk_tokens
+        return plan_token, chunk_tokens
 
 
 class ChunkStepRefiner(nn.Module):
+    """0.1초 단위 토큰을 자기 묶음과 양옆 묶음을 참고해 보정합니다."""
+
     def __init__(self, flow_dim: int, num_heads: int) -> None:
         super().__init__()
         self.context_proj = nn.Linear(flow_dim, flow_dim)
@@ -595,12 +648,26 @@ class ChunkStepRefiner(nn.Module):
         num_chunks: int,
         chunk_size: int,
     ) -> torch.Tensor:
+        """0.5초 묶음 내부 attention에서 무효 frame을 숨깁니다.
+
+        Args:
+            step_valid_mask: 유효한 0.1초 frame 표시입니다.
+                shape은 ``[n_path, n_chunk * chunk_size]`` 입니다.
+            batch_size: 경로 수입니다.
+            num_chunks: 0.5초 묶음 수입니다.
+            chunk_size: 묶음 하나 안의 frame 수입니다.
+
+        Returns:
+            torch.Tensor: attention에서 숨길 frame 표시입니다.
+                shape은 ``[n_path * n_chunk, chunk_size]`` 입니다.
+        """
         expected_shape = (batch_size, num_chunks * chunk_size)
         if tuple(step_valid_mask.shape) != expected_shape:
             raise ValueError(
                 "step_valid_mask shape must match flattened future steps: "
                 f"expected={expected_shape}, actual={tuple(step_valid_mask.shape)}."
             )
+        # key_padding_mask: [n_path * n_chunk, chunk_size]
         key_padding_mask = ~step_valid_mask.view(batch_size, num_chunks, chunk_size).reshape(
             batch_size * num_chunks,
             chunk_size,
@@ -609,21 +676,99 @@ class ChunkStepRefiner(nn.Module):
         key_padding_mask = key_padding_mask & ~all_masked.unsqueeze(1)
         return key_padding_mask
 
+    def _build_neighbor_chunk_summary(
+        self,
+        chunk_tokens: torch.Tensor,
+        chunk_valid_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """각 묶음이 이전/현재/다음 묶음 정보를 함께 보도록 요약합니다.
+
+        Args:
+            chunk_tokens: 0.5초 묶음 토큰입니다.
+                shape은 ``[n_path, n_chunk, flow_dim]`` 입니다.
+            chunk_valid_mask: 유효한 묶음 표시입니다.
+                shape은 ``[n_path, n_chunk]`` 입니다.
+
+        Returns:
+            torch.Tensor: 양옆 묶음까지 섞은 묶음 요약입니다.
+                shape은 ``[n_path, n_chunk, flow_dim]`` 입니다.
+        """
+        batch_size, num_chunks, _ = chunk_tokens.shape
+        # zero_token: [n_path, 1, flow_dim]
+        zero_token = chunk_tokens.new_zeros(batch_size, 1, chunk_tokens.shape[-1])
+        # prev_tokens/current_tokens/next_tokens: [n_path, n_chunk, flow_dim]
+        prev_tokens = torch.cat([zero_token, chunk_tokens[:, :-1]], dim=1)
+        next_tokens = torch.cat([chunk_tokens[:, 1:], zero_token], dim=1)
+
+        if chunk_valid_mask is None:
+            # current_valid: [n_path, n_chunk, 1]
+            current_valid = chunk_tokens.new_ones(batch_size, num_chunks, 1)
+        else:
+            if tuple(chunk_valid_mask.shape) != (batch_size, num_chunks):
+                raise ValueError(
+                    "chunk_valid_mask shape must match chunk_tokens first two dimensions: "
+                    f"expected={(batch_size, num_chunks)}, actual={tuple(chunk_valid_mask.shape)}."
+                )
+            current_valid = chunk_valid_mask.to(dtype=chunk_tokens.dtype).unsqueeze(-1)
+        # zero_valid: [n_path, 1, 1]
+        zero_valid = current_valid.new_zeros(batch_size, 1, 1)
+        # prev_valid/next_valid: [n_path, n_chunk, 1]
+        prev_valid = torch.cat([zero_valid, current_valid[:, :-1]], dim=1)
+        next_valid = torch.cat([current_valid[:, 1:], zero_valid], dim=1)
+
+        # denom: [n_path, n_chunk, 1]
+        denom = (prev_valid + current_valid + next_valid).clamp_min(1.0)
+        return (
+            prev_tokens * prev_valid
+            + chunk_tokens * current_valid
+            + next_tokens * next_valid
+        ) / denom
+
     def forward(
         self,
         step_tokens: torch.Tensor,
         chunk_tokens: torch.Tensor,
+        plan_token: torch.Tensor,
         context: torch.Tensor,
         step_valid_mask: torch.Tensor | None = None,
+        chunk_valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        batch_size, num_chunks, chunk_size, dim = step_tokens.shape
+        """20개 frame 토큰을 전체 의도와 양옆 묶음 정보를 써서 보정합니다.
 
-        step_tokens = step_tokens + chunk_tokens.unsqueeze(2)
-        step_tokens = step_tokens + self.context_proj(context).view(batch_size, 1, 1, dim)
+        Args:
+            step_tokens: 0.1초 단위 토큰입니다.
+                shape은 ``[n_path, n_chunk, chunk_size, flow_dim]`` 입니다.
+            chunk_tokens: 0.5초 묶음 토큰입니다.
+                shape은 ``[n_path, n_chunk, flow_dim]`` 입니다.
+            plan_token: 2초 전체 움직임을 대표하는 토큰입니다.
+                shape은 ``[n_path, flow_dim]`` 입니다.
+            context: 과거, 지도, 주변 객체 정보를 담은 문맥입니다.
+                shape은 ``[n_path, flow_dim]`` 입니다.
+            step_valid_mask: 유효한 frame 표시입니다.
+                shape은 ``[n_path, n_chunk * chunk_size]`` 입니다.
+            chunk_valid_mask: 유효한 묶음 표시입니다.
+                shape은 ``[n_path, n_chunk]`` 입니다.
+
+        Returns:
+            torch.Tensor: 보정된 frame 토큰입니다.
+                shape은 ``[n_path, n_chunk * chunk_size, flow_dim]`` 입니다.
+        """
+        batch_size, num_chunks, chunk_size, dim = step_tokens.shape
+        # neighbor_chunk_tokens: [n_path, n_chunk, flow_dim]
+        neighbor_chunk_tokens = self._build_neighbor_chunk_summary(
+            chunk_tokens=chunk_tokens,
+            chunk_valid_mask=chunk_valid_mask,
+        )
+        # global_context: [n_path, 1, 1, flow_dim]
+        global_context = self.context_proj(context + plan_token).view(batch_size, 1, 1, dim)
+
+        # step_tokens: [n_path, n_chunk, chunk_size, flow_dim]
+        step_tokens = step_tokens + neighbor_chunk_tokens.unsqueeze(2) + global_context
         step_tokens = self.pre_proj(step_tokens)
 
-        step_tokens = step_tokens.view(batch_size * num_chunks, chunk_size, dim)
-        attn_in = self.attn_norm(step_tokens)
+        # step_tokens_flat: [n_path * n_chunk, chunk_size, flow_dim]
+        step_tokens_flat = step_tokens.view(batch_size * num_chunks, chunk_size, dim)
+        attn_in = self.attn_norm(step_tokens_flat)
         with sdpa_kernel(_SDPA_SAFE_BACKENDS):
             if step_valid_mask is None:
                 attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
@@ -640,12 +785,14 @@ class ChunkStepRefiner(nn.Module):
                     ),
                     need_weights=False,
                 )
-        step_tokens = step_tokens + attn_out
-        step_tokens = step_tokens + self.mlp(self.mlp_norm(step_tokens))
-        step_tokens = step_tokens.view(batch_size, num_chunks * chunk_size, dim)
+        step_tokens_flat = step_tokens_flat + attn_out
+        step_tokens_flat = step_tokens_flat + self.mlp(self.mlp_norm(step_tokens_flat))
+
+        # refined_tokens: [n_path, n_chunk * chunk_size, flow_dim]
+        refined_tokens = step_tokens_flat.view(batch_size, num_chunks * chunk_size, dim)
         if step_valid_mask is not None:
-            step_tokens = step_tokens * step_valid_mask.to(dtype=step_tokens.dtype).unsqueeze(-1)
-        return step_tokens
+            refined_tokens = refined_tokens * step_valid_mask.to(dtype=refined_tokens.dtype).unsqueeze(-1)
+        return refined_tokens
 
 
 class FlowVelocityHead(nn.Module):
@@ -659,10 +806,159 @@ class FlowVelocityHead(nn.Module):
         )
 
     def forward(self, step_tokens: torch.Tensor) -> torch.Tensor:
+        """frame 토큰에서 세부 보정 속도를 예측합니다.
+
+        Args:
+            step_tokens: 0.1초 단위 토큰입니다. shape은 ``[n_path, n_step, flow_dim]`` 입니다.
+
+        Returns:
+            torch.Tensor: frame별 세부 보정 속도입니다.
+                shape은 ``[n_path, n_step, flow_state_dim]`` 입니다.
+        """
         return self.net(step_tokens)
 
 
+class PlanFirstResidualVelocityHead(nn.Module):
+    """부드러운 기본 속도에 작은 frame 단위 보정을 더해 최종 속도를 만듭니다."""
+
+    def __init__(self, flow_dim: int, flow_state_dim: int = 4) -> None:
+        super().__init__()
+        self.flow_state_dim = int(flow_state_dim)
+        self.base_head = nn.Linear(flow_dim, self.flow_state_dim)
+        self.residual_head = FlowVelocityHead(flow_dim=flow_dim, flow_state_dim=self.flow_state_dim)
+
+    def _interpolate_chunk_base(
+        self,
+        chunk_velocity: torch.Tensor,
+        num_steps: int,
+    ) -> torch.Tensor:
+        """묶음 단위 기본 속도를 0.1초 frame 단위로 부드럽게 펼칩니다.
+
+        Args:
+            chunk_velocity: 0.5초 묶음별 기본 속도입니다.
+                shape은 ``[n_path, n_chunk, flow_state_dim]`` 입니다.
+            num_steps: 펼칠 frame 수입니다.
+
+        Returns:
+            torch.Tensor: frame 단위 기본 속도입니다.
+                shape은 ``[n_path, num_steps, flow_state_dim]`` 입니다.
+        """
+        if chunk_velocity.shape[1] == 1:
+            return chunk_velocity.expand(-1, int(num_steps), -1)
+        # interpolation_input: [n_path, flow_state_dim, n_chunk]
+        interpolation_input = chunk_velocity.transpose(1, 2)
+        # base_velocity: [n_path, num_steps, flow_state_dim]
+        base_velocity = F.interpolate(
+            interpolation_input,
+            size=int(num_steps),
+            mode="linear",
+            align_corners=True,
+        ).transpose(1, 2)
+        return base_velocity
+
+    def _fill_invalid_chunk_velocity(
+        self,
+        chunk_velocity: torch.Tensor,
+        chunk_valid_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Invalid chunk가 prefix-valid 기본 경로 보간에 섞이지 않게 합니다."""
+        if chunk_valid_mask is None:
+            return chunk_velocity
+        if tuple(chunk_valid_mask.shape) != tuple(chunk_velocity.shape[:2]):
+            raise ValueError(
+                "chunk_valid_mask shape must match chunk_velocity first two dimensions: "
+                f"expected={tuple(chunk_velocity.shape[:2])}, actual={tuple(chunk_valid_mask.shape)}."
+            )
+        valid_mask = chunk_valid_mask.to(device=chunk_velocity.device, dtype=torch.bool)
+        if bool(valid_mask.all()):
+            return chunk_velocity
+
+        batch_size, num_chunks = valid_mask.shape
+        chunk_idx = torch.arange(num_chunks, device=chunk_velocity.device).view(1, num_chunks)
+        previous_idx = torch.where(valid_mask, chunk_idx, chunk_idx.new_zeros(())).cummax(dim=1).values
+        has_valid = valid_mask.any(dim=1, keepdim=True)
+
+        reverse_valid = valid_mask.flip(dims=[1])
+        reverse_idx = chunk_idx.expand(batch_size, -1)
+        reverse_previous = torch.where(
+            reverse_valid,
+            reverse_idx,
+            reverse_idx.new_zeros(()),
+        ).cummax(dim=1).values
+        next_idx = (num_chunks - 1 - reverse_previous).flip(dims=[1])
+
+        has_previous = valid_mask.cumsum(dim=1) > 0
+        fill_idx = torch.where(has_previous, previous_idx, next_idx)
+        gather_idx = fill_idx.unsqueeze(-1).expand(-1, -1, chunk_velocity.shape[-1])
+        filled = chunk_velocity.gather(dim=1, index=gather_idx)
+        filled = torch.where(has_valid.unsqueeze(-1), filled, chunk_velocity.new_zeros(chunk_velocity.shape))
+        return torch.where(valid_mask.unsqueeze(-1), chunk_velocity, filled)
+
+    def _build_residual_scale(
+        self,
+        tau: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """잡음이 큰 단계에서는 세부 보정 영향이 작게, 후반 단계에서는 크게 만듭니다.
+
+        Args:
+            tau: Flow Matching 시간입니다. shape은 ``[n_path]`` 입니다.
+            dtype: 출력 tensor 자료형입니다.
+
+        Returns:
+            torch.Tensor: frame 보정 배율입니다. shape은 ``[n_path, 1, 1]`` 입니다.
+        """
+        # tau_scale: [n_path, 1, 1]
+        tau_scale = tau.to(dtype=dtype).clamp(min=0.0, max=1.0).view(-1, 1, 1)
+        return 0.10 + 0.90 * tau_scale
+
+    def forward(
+        self,
+        step_tokens: torch.Tensor,
+        chunk_tokens: torch.Tensor,
+        tau: torch.Tensor,
+        step_valid_mask: torch.Tensor | None = None,
+        chunk_valid_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """부드러운 기본 속도와 제한된 세부 보정을 합칩니다.
+
+        Args:
+            step_tokens: 0.1초 단위 토큰입니다.
+                shape은 ``[n_path, n_step, flow_dim]`` 입니다.
+            chunk_tokens: 0.5초 묶음 토큰입니다.
+                shape은 ``[n_path, n_chunk, flow_dim]`` 입니다.
+            tau: Flow Matching 시간입니다. shape은 ``[n_path]`` 입니다.
+            step_valid_mask: 유효한 frame 표시입니다. shape은 ``[n_path, n_step]`` 입니다.
+            chunk_valid_mask: 유효한 0.5초 묶음 표시입니다. shape은 ``[n_path, n_chunk]`` 입니다.
+
+        Returns:
+            torch.Tensor: 최종 Flow Matching 속도입니다.
+                shape은 ``[n_path, n_step, flow_state_dim]`` 입니다.
+        """
+        # chunk_velocity: [n_path, n_chunk, flow_state_dim]
+        chunk_velocity = self.base_head(chunk_tokens)
+        chunk_velocity = self._fill_invalid_chunk_velocity(
+            chunk_velocity=chunk_velocity,
+            chunk_valid_mask=chunk_valid_mask,
+        )
+        # base_velocity: [n_path, n_step, flow_state_dim]
+        base_velocity = self._interpolate_chunk_base(
+            chunk_velocity=chunk_velocity,
+            num_steps=step_tokens.shape[1],
+        )
+        # residual_velocity: [n_path, n_step, flow_state_dim]
+        residual_velocity = self.residual_head(step_tokens)
+        # residual_scale: [n_path, 1, 1]
+        residual_scale = self._build_residual_scale(tau=tau, dtype=step_tokens.dtype)
+        velocity = base_velocity + residual_scale * residual_velocity
+        if step_valid_mask is not None:
+            velocity = velocity * step_valid_mask.to(dtype=velocity.dtype).unsqueeze(-1)
+        return velocity
+
+
 class HierarchicalFlowDecoder(nn.Module):
+    """2초 전체 의도를 먼저 만들고 frame별 세부 보정을 더하는 Flow decoder입니다."""
+
     def __init__(
         self,
         context_dim: int,
@@ -702,17 +998,94 @@ class HierarchicalFlowDecoder(nn.Module):
             flow_dim=flow_dim,
             num_heads=num_chunk_heads,
         )
-        self.velocity_head = FlowVelocityHead(flow_dim=flow_dim, flow_state_dim=self.flow_state_dim)
+        self.velocity_head = PlanFirstResidualVelocityHead(
+            flow_dim=flow_dim,
+            flow_state_dim=self.flow_state_dim,
+        )
 
-    def _run_chunk_mixer(
+    def _masked_chunk_mean(
         self,
-        block: HalfSecondChunkMixerBlock,
+        chunk_tokens: torch.Tensor,
+        chunk_valid_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """유효한 0.5초 묶음만 사용해 2초 전체 요약을 만듭니다.
+
+        Args:
+            chunk_tokens: 0.5초 묶음 토큰입니다.
+                shape은 ``[n_path, n_chunk, flow_dim]`` 입니다.
+            chunk_valid_mask: 유효한 묶음 표시입니다.
+                shape은 ``[n_path, n_chunk]`` 입니다.
+
+        Returns:
+            torch.Tensor: 묶음 평균 요약입니다. shape은 ``[n_path, flow_dim]`` 입니다.
+        """
+        if chunk_valid_mask is None:
+            return chunk_tokens.mean(dim=1)
+        if tuple(chunk_valid_mask.shape) != tuple(chunk_tokens.shape[:2]):
+            raise ValueError(
+                "chunk_valid_mask shape must match chunk_tokens first two dimensions: "
+                f"expected={tuple(chunk_tokens.shape[:2])}, actual={tuple(chunk_valid_mask.shape)}."
+            )
+        # valid_float: [n_path, n_chunk, 1]
+        valid_float = chunk_valid_mask.to(dtype=chunk_tokens.dtype).unsqueeze(-1)
+        # valid_count: [n_path, 1]
+        valid_count = valid_float.sum(dim=1).clamp_min(1.0)
+        return (chunk_tokens * valid_float).sum(dim=1) / valid_count
+
+    def _build_global_plan_token(
+        self,
         chunk_tokens: torch.Tensor,
         context: torch.Tensor,
         tau_emb: torch.Tensor,
         chunk_valid_mask: torch.Tensor | None,
     ) -> torch.Tensor:
+        """장면 문맥, 잡음 제거 단계, 묶음 요약을 합쳐 전체 의도 토큰을 만듭니다.
+
+        Args:
+            chunk_tokens: 0.5초 묶음 토큰입니다.
+                shape은 ``[n_path, n_chunk, flow_dim]`` 입니다.
+            context: 과거, 지도, 주변 객체 정보를 담은 문맥입니다.
+                shape은 ``[n_path, flow_dim]`` 입니다.
+            tau_emb: 현재 잡음 제거 단계 정보입니다.
+                shape은 ``[n_path, flow_dim]`` 입니다.
+            chunk_valid_mask: 유효한 묶음 표시입니다.
+                shape은 ``[n_path, n_chunk]`` 입니다.
+
+        Returns:
+            torch.Tensor: 2초 전체 움직임을 대표하는 토큰입니다.
+                shape은 ``[n_path, flow_dim]`` 입니다.
+        """
+        # chunk_summary: [n_path, flow_dim]
+        chunk_summary = self._masked_chunk_mean(
+            chunk_tokens=chunk_tokens,
+            chunk_valid_mask=chunk_valid_mask,
+        )
+        return chunk_summary + context + tau_emb
+
+    def _run_chunk_mixer(
+        self,
+        block: HalfSecondChunkMixerBlock,
+        plan_token: torch.Tensor,
+        chunk_tokens: torch.Tensor,
+        context: torch.Tensor,
+        tau_emb: torch.Tensor,
+        chunk_valid_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """전체 의도 토큰과 0.5초 묶음 토큰을 같이 갱신합니다.
+
+        Args:
+            block: 묶음 처리 블록입니다.
+            plan_token: 2초 전체 의도 토큰입니다. shape은 ``[n_path, flow_dim]`` 입니다.
+            chunk_tokens: 0.5초 묶음 토큰입니다. shape은 ``[n_path, n_chunk, flow_dim]`` 입니다.
+            context: 장면 문맥입니다. shape은 ``[n_path, flow_dim]`` 입니다.
+            tau_emb: 잡음 제거 단계 정보입니다. shape은 ``[n_path, flow_dim]`` 입니다.
+            chunk_valid_mask: 유효한 묶음 표시입니다. shape은 ``[n_path, n_chunk]`` 입니다.
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor]: 갱신된 전체 의도 토큰과 묶음 토큰입니다.
+        """
         return block(
+            plan_token=plan_token,
             chunk_tokens=chunk_tokens,
             context=context,
             tau_emb=tau_emb,
@@ -723,14 +1096,33 @@ class HierarchicalFlowDecoder(nn.Module):
         self,
         step_tokens: torch.Tensor,
         chunk_tokens: torch.Tensor,
+        plan_token: torch.Tensor,
         context: torch.Tensor,
         step_valid_mask: torch.Tensor | None,
+        chunk_valid_mask: torch.Tensor | None,
     ) -> torch.Tensor:
+        """frame 토큰을 전체 의도와 양옆 묶음 정보를 써서 보정합니다.
+
+        Args:
+            step_tokens: 0.1초 단위 토큰입니다.
+                shape은 ``[n_path, n_chunk, chunk_size, flow_dim]`` 입니다.
+            chunk_tokens: 0.5초 묶음 토큰입니다.
+                shape은 ``[n_path, n_chunk, flow_dim]`` 입니다.
+            plan_token: 2초 전체 의도 토큰입니다. shape은 ``[n_path, flow_dim]`` 입니다.
+            context: 장면 문맥입니다. shape은 ``[n_path, flow_dim]`` 입니다.
+            step_valid_mask: 유효한 frame 표시입니다. shape은 ``[n_path, n_step]`` 입니다.
+            chunk_valid_mask: 유효한 묶음 표시입니다. shape은 ``[n_path, n_chunk]`` 입니다.
+
+        Returns:
+            torch.Tensor: 보정된 frame 토큰입니다. shape은 ``[n_path, n_step, flow_dim]`` 입니다.
+        """
         return self.step_refiner(
             step_tokens=step_tokens,
             chunk_tokens=chunk_tokens,
+            plan_token=plan_token,
             context=context,
             step_valid_mask=step_valid_mask,
+            chunk_valid_mask=chunk_valid_mask,
         )
 
     def forward(
@@ -740,22 +1132,26 @@ class HierarchicalFlowDecoder(nn.Module):
         tau: torch.Tensor,
         future_valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Flow Matching 속도를 예측합니다.
+
+        Args:
+            anchor_hidden: 현재 anchor의 장면 문맥입니다.
+                shape은 ``[n_path, context_dim]`` 입니다.
+            x_t_norm: 잡음이 섞인 2초 미래입니다.
+                shape은 ``[n_path, num_future_steps, flow_state_dim]`` 입니다.
+            tau: Flow Matching 시간입니다. shape은 ``[n_path]`` 입니다.
+            future_valid_mask: loss에 사용할 수 있는 미래 frame 표시입니다.
+                shape은 ``[n_path, num_future_steps]`` 입니다.
+
+        Returns:
+            torch.Tensor: 예측한 Flow Matching 속도입니다.
+                shape은 ``[n_path, num_future_steps, flow_state_dim]`` 입니다.
         """
-        anchor_hidden : (N, H) -> context : (N, D)
-        """
+        # context: [n_path, flow_dim]
         context = self.context_projector(anchor_hidden)
-        """
-        x_t_norm : [B, 20, 4]
-        tau : [B]
-        
-        중간
-            tau_emb : (B, D) # MLP
-            step_tokens : (B, 20, 4) -> (B, 20, D)
-                - step_ids : "각 토큰에 “이게 미래 몇 번째 step인지” 정보를 step_tokens 에 더함
-            step_tokens = step_tokens + tau_emb.unsqueeze(1) : (B, 20, D)
-            step_tokens = step_tokens.view(B, 4, 5, D) [B, 20, D] -> [B, 4, 5, D]
-            chunk_tokens : [B, 4, D]
-        """
+        # step_tokens: [n_path, n_chunk, chunk_size, flow_dim]
+        # chunk_tokens: [n_path, n_chunk, flow_dim]
+        # tau_emb: [n_path, flow_dim]
         (
             step_tokens,
             chunk_tokens,
@@ -767,52 +1163,40 @@ class HierarchicalFlowDecoder(nn.Module):
             tau=tau,
             future_valid_mask=future_valid_mask,
         )
-        """
-        4개 half-second chunk ( chunk_tokens ) 끼리 서로 정보 교환
-        
-        anchor 문맥 + 현재 diffusion 시간(tau)을 조건으로 주입
-            input: context : (N, D) / tau_emb : (B, D)
-            둘이 합침 : (B, 2D) # "과거~현재 + 지도 + agent끼리 상호작용한 정보" + "미래 noising 정도"
-            (B, 2D) -> (B, 3D) -> scale, bias, gate = cond.chunk(3, dim=-1): 각각 [B, D]
-            
-            chunk_tokens 에 scale, bias, gate 적용 (각각 chunk에 균일 적용)
-            chunk_tokens : (B, 4, D)
-            
-            
-        """
+
+        # plan_token: [n_path, flow_dim]
+        plan_token = self._build_global_plan_token(
+            chunk_tokens=chunk_tokens,
+            context=context,
+            tau_emb=tau_emb,
+            chunk_valid_mask=chunk_valid_mask,
+        )
         for block in self.chunk_mixers:
-            chunk_tokens = self._run_chunk_mixer(
+            plan_token, chunk_tokens = self._run_chunk_mixer(
                 block=block,
+                plan_token=plan_token,
                 chunk_tokens=chunk_tokens,
                 context=context,
                 tau_emb=tau_emb,
                 chunk_valid_mask=chunk_valid_mask,
             )
-        """
-        input
-            step_tokens : (B, 20, D)
-            chunk_tokens : (B, 4, D)
-            context : (B, D)
-        로직
-            chunk_tokens 을 step_tokens 에 더함
-            context 을 step_tokens 에 더함
-            
-            chunk별 로컬 self-attention (각 구간에서 5개 step끼리만 보여 attention)
-        
-        output
-            step_tokens : (b, 20, D)
-        """
+
+        # step_tokens: [n_path, num_future_steps, flow_dim]
         step_tokens = self._run_step_refiner(
             step_tokens=step_tokens,
             chunk_tokens=chunk_tokens,
+            plan_token=plan_token,
             context=context,
             step_valid_mask=step_valid_mask,
+            chunk_valid_mask=chunk_valid_mask,
         )
-        """
-        output : (B, 20, 4)
-        """
-        return self.velocity_head(step_tokens)
-
+        return self.velocity_head(
+            step_tokens=step_tokens,
+            chunk_tokens=chunk_tokens,
+            tau=tau,
+            step_valid_mask=step_valid_mask,
+            chunk_valid_mask=chunk_valid_mask,
+        )
 
 class ContinuousCommitBridge:
     """Continuous FM 출력을 closed-loop 실행 상태로 바꾸는 다리입니다.
