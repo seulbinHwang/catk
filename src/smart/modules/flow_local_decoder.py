@@ -75,8 +75,9 @@ class LQRCommitBridgeConfig:
 # `nn.MultiheadAttention` can exceed their grid-dim limit on large
 # batches with many agents, causing
 # `RuntimeError: CUDA error: invalid configuration argument` even when VRAM
-# is not close to full. `ChunkStepRefiner` only attends over seq_len=5, so
-# forcing the math SDPA kernel here is cheap and avoids that failure mode.
+# is not close to full. `ChunkStepRefiner` attends over the fixed 2s
+# horizon, so forcing the math SDPA kernel here is still cheap and avoids
+# that failure mode.
 _SDPA_SAFE_BACKENDS = [SDPBackend.MATH]
 
 
@@ -592,22 +593,28 @@ class ChunkStepRefiner(nn.Module):
         self,
         step_valid_mask: torch.Tensor,
         batch_size: int,
-        num_chunks: int,
-        chunk_size: int,
+        num_steps: int,
     ) -> torch.Tensor:
-        expected_shape = (batch_size, num_chunks * chunk_size)
+        expected_shape = (batch_size, num_steps)
         if tuple(step_valid_mask.shape) != expected_shape:
             raise ValueError(
                 "step_valid_mask shape must match flattened future steps: "
                 f"expected={expected_shape}, actual={tuple(step_valid_mask.shape)}."
             )
-        key_padding_mask = ~step_valid_mask.view(batch_size, num_chunks, chunk_size).reshape(
-            batch_size * num_chunks,
-            chunk_size,
-        ).bool()
+        key_padding_mask = ~step_valid_mask.bool()
         all_masked = key_padding_mask.all(dim=1)
         key_padding_mask = key_padding_mask & ~all_masked.unsqueeze(1)
         return key_padding_mask
+
+    def _apply_step_mask(
+        self,
+        step_tokens: torch.Tensor,
+        step_valid_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if step_valid_mask is None:
+            return step_tokens
+        step_valid_mask = step_valid_mask.to(device=step_tokens.device, dtype=torch.bool)
+        return step_tokens * step_valid_mask.to(dtype=step_tokens.dtype).unsqueeze(-1)
 
     def forward(
         self,
@@ -617,12 +624,13 @@ class ChunkStepRefiner(nn.Module):
         step_valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size, num_chunks, chunk_size, dim = step_tokens.shape
+        num_steps = num_chunks * chunk_size
 
         step_tokens = step_tokens + chunk_tokens.unsqueeze(2)
         step_tokens = step_tokens + self.context_proj(context).view(batch_size, 1, 1, dim)
         step_tokens = self.pre_proj(step_tokens)
 
-        step_tokens = step_tokens.view(batch_size * num_chunks, chunk_size, dim)
+        step_tokens = step_tokens.view(batch_size, num_steps, dim)
         attn_in = self.attn_norm(step_tokens)
         with sdpa_kernel(_SDPA_SAFE_BACKENDS):
             if step_valid_mask is None:
@@ -635,17 +643,14 @@ class ChunkStepRefiner(nn.Module):
                     key_padding_mask=self._build_safe_step_key_padding_mask(
                         step_valid_mask=step_valid_mask,
                         batch_size=batch_size,
-                        num_chunks=num_chunks,
-                        chunk_size=chunk_size,
+                        num_steps=num_steps,
                     ),
                     need_weights=False,
                 )
         step_tokens = step_tokens + attn_out
+        step_tokens = self._apply_step_mask(step_tokens, step_valid_mask)
         step_tokens = step_tokens + self.mlp(self.mlp_norm(step_tokens))
-        step_tokens = step_tokens.view(batch_size, num_chunks * chunk_size, dim)
-        if step_valid_mask is not None:
-            step_tokens = step_tokens * step_valid_mask.to(dtype=step_tokens.dtype).unsqueeze(-1)
-        return step_tokens
+        return self._apply_step_mask(step_tokens, step_valid_mask)
 
 
 class FlowVelocityHead(nn.Module):
@@ -797,7 +802,7 @@ class HierarchicalFlowDecoder(nn.Module):
             chunk_tokens 을 step_tokens 에 더함
             context 을 step_tokens 에 더함
             
-            chunk별 로컬 self-attention (각 구간에서 5개 step끼리만 보여 attention)
+            2초 전체 global self-attention (20개 future step 전체를 함께 정합)
         
         output
             step_tokens : (b, 20, D)
