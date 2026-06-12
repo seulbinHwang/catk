@@ -19,9 +19,10 @@ from launch_closed_loop_self_forced_h100x2x4_quarter_fmsf4_sf_anchor_static_pods
 )
 
 
-def split_wrapper_args(argv: list[str]) -> tuple[list[str], str, int, bool]:
+def split_wrapper_args(argv: list[str]) -> tuple[list[str], str, int, bool, int]:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--extra-hydra-overrides", default="")
+    parser.add_argument("--closed-loop-sf-global-max-step", type=int, default=4)
     parser.add_argument("--rollout-anchor-stride", type=int, default=4)
     parser.add_argument(
         "--skip-initial-stage-checkpoint",
@@ -31,9 +32,13 @@ def split_wrapper_args(argv: list[str]) -> tuple[list[str], str, int, bool]:
     known, remaining = parser.parse_known_args(argv)
     if known.rollout_anchor_stride < 1:
         parser.error("--rollout-anchor-stride must be >= 1")
+    if known.closed_loop_sf_global_max_step < 1:
+        parser.error("--closed-loop-sf-global-max-step must be >= 1")
 
     variant_overrides = " ".join(
         [
+            "model.model_config.self_forced.closed_loop_sf_global_max_step="
+            f"{known.closed_loop_sf_global_max_step}",
             "model.model_config.self_forced.closed_loop_see_all=true",
             "model.model_config.self_forced.gradually_see=true",
         ]
@@ -55,6 +60,7 @@ def split_wrapper_args(argv: list[str]) -> tuple[list[str], str, int, bool]:
         extra_overrides,
         known.rollout_anchor_stride,
         known.skip_initial_stage_checkpoint,
+        known.closed_loop_sf_global_max_step,
     )
 
 
@@ -64,6 +70,7 @@ def main() -> int:
         extra_overrides,
         rollout_anchor_stride,
         skip_initial_stage_checkpoint,
+        closed_loop_sf_global_max_step,
     ) = split_wrapper_args(sys.argv[1:])
     pod_label = "h100x8_fm_sf3"
     lr_tag = "lr5e-5"
@@ -95,7 +102,7 @@ def main() -> int:
     task_name = (
         f"flow_closed_loop_self_forced_dmd_{pod_label}_fmsf4_sfanchor_seeall_gradual_"
         f"stride{rollout_anchor_stride}_{checkpoint_tag}_activecontrol_sample16_backprop8_"
-        f"{lr_tag}_bs24to4step4_frac025_ep6_warm0_global2_local4"
+        f"{lr_tag}_bs24to4step4_frac025_ep6_warm0_global{closed_loop_sf_global_max_step}_local4"
     )
     bank_name = f"generated-estimator-warmup-bank-pretrain-x5f9g0ce-v57-{lr_tag}"
 
