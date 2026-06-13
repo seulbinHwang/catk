@@ -36,6 +36,18 @@ model_config:
   # targets. Keep this false unless the selected train split has been scanned
   # and every sample is known to produce at least one train target.
   skip_empty_open_loop_optimizer_guard: false
+  # Commit-aligned Flow Matching loss.
+  # Closed-loop rollout commits only the first 0.5s of each 2s preview before
+  # replanning. These weights mildly emphasize that committed segment while
+  # keeping later preview supervision close to full strength for teacher quality.
+  # boundary_steps are 10Hz future-step cut points: [5, 10] means
+  # 0.0~0.5s, 0.5~1.0s, and the remaining future window.
+  # The loss function normalizes valid future steps inside each sample so the
+  # average valid-step weight remains 1.0.
+  commit_aligned_flow_loss:
+    enabled: true
+    weights: [1.25, 1.01, 0.87]
+    boundary_steps: [5, 10]
   validation_open_seed: 0
   validation_closed_seed: 4
   token_processor:

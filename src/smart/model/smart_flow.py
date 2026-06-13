@@ -110,6 +110,66 @@ def _build_decoder_config_from_token_processor(decoder_config: Any, token_proces
     return synced_config
 
 
+def _build_commit_aligned_flow_loss_step_weights(
+    model_config: Any,
+    flow_window_steps: int,
+) -> Tensor:
+    """Commit-aligned Flow Matching의 미래 step별 원가중치를 만듭니다.
+
+    Args:
+        model_config: ``commit_aligned_flow_loss`` 설정을 포함한 모델 설정입니다.
+        flow_window_steps: Flow decoder가 예측하는 미래 10Hz step 수입니다.
+
+    Returns:
+        Tensor: shape ``[flow_window_steps]`` 의 원가중치입니다. 기능이 꺼져 있으면
+            shape ``[0]`` 인 빈 tensor를 반환합니다.
+    """
+    flow_window_steps = int(flow_window_steps)
+    if flow_window_steps <= 0:
+        raise ValueError(f"flow_window_steps must be positive, got {flow_window_steps}.")
+
+    loss_config = getattr(model_config, "commit_aligned_flow_loss", None)
+    if loss_config is None or not bool(getattr(loss_config, "enabled", False)):
+        return torch.empty(0, dtype=torch.float32)
+
+    raw_weights = getattr(loss_config, "weights", None)
+    if raw_weights is None:
+        raise ValueError("commit_aligned_flow_loss.weights must be set when enabled.")
+    weights = [float(weight) for weight in raw_weights]
+    boundary_steps = [int(step) for step in getattr(loss_config, "boundary_steps", [])]
+
+    if not weights:
+        raise ValueError("commit_aligned_flow_loss.weights must not be empty.")
+    if len(weights) != len(boundary_steps) + 1:
+        raise ValueError(
+            "commit_aligned_flow_loss.weights length must equal len(boundary_steps) + 1: "
+            f"weights={len(weights)}, boundary_steps={len(boundary_steps)}."
+        )
+    if any((not math.isfinite(weight)) or weight <= 0.0 for weight in weights):
+        raise ValueError(f"commit_aligned_flow_loss.weights must be finite positive values: {weights}.")
+    if any(step <= 0 for step in boundary_steps):
+        raise ValueError(f"commit_aligned_flow_loss.boundary_steps must be positive: {boundary_steps}.")
+    if any(left >= right for left, right in zip(boundary_steps, boundary_steps[1:])):
+        raise ValueError(
+            "commit_aligned_flow_loss.boundary_steps must be strictly increasing: "
+            f"{boundary_steps}."
+        )
+
+    step_weights = torch.empty(flow_window_steps, dtype=torch.float32)
+    start_step = 0
+    for block_idx, weight in enumerate(weights):
+        end_step = boundary_steps[block_idx] if block_idx < len(boundary_steps) else flow_window_steps
+        end_step = min(max(int(end_step), start_step), flow_window_steps)
+        if end_step > start_step:
+            step_weights[start_step:end_step] = float(weight)
+        start_step = end_step
+        if start_step >= flow_window_steps:
+            break
+    if start_step < flow_window_steps:
+        step_weights[start_step:] = float(weights[-1])
+    return step_weights
+
+
 class SMARTFlow(LightningModule):
 
     def __init__(self, model_config) -> None:
@@ -130,6 +190,14 @@ class SMARTFlow(LightningModule):
         )
         self.skip_empty_open_loop_optimizer_guard = bool(
             getattr(model_config, "skip_empty_open_loop_optimizer_guard", False)
+        )
+        self.register_buffer(
+            "flow_loss_future_step_weights",
+            _build_commit_aligned_flow_loss_step_weights(
+                model_config=model_config,
+                flow_window_steps=self.flow_window_steps,
+            ),
+            persistent=False,
         )
         self.token_processor = FlowTokenProcessor(**model_config.token_processor)
         self.use_kinematic_control_flow = bool(self.token_processor.use_kinematic_control_flow)
@@ -1068,10 +1136,14 @@ class SMARTFlow(LightningModule):
         loss_mask = pred_dict.get("flow_loss_mask")
         has_loss_targets = self._has_open_loop_loss_targets(pred_dict)
         if has_loss_targets:
+            future_step_weights = self.flow_loss_future_step_weights
+            if future_step_weights.numel() == 0:
+                future_step_weights = None
             loss = flow_matching_loss(
                 pred_dict["flow_pred_norm"],
                 pred_dict["flow_target_norm"],
                 valid_mask=loss_mask,
+                future_step_weights=future_step_weights,
             )
         else:
             loss = self._build_trainable_connected_zero_loss(zero_loss_module or self.encoder)
