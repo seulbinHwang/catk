@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch an H100x8 open-loop Flow pretrain on the existing fm-sf-5 pod for the Plan-first residual decoder.
+"""Launch an H100x8 open-loop Flow pretrain on the existing fm-sf-5 pod.
 
 The launcher never creates, deletes, or restarts pods. It only starts/stops a
 tmux session inside the already-running pod. The remote worker retries CUDA OOM
@@ -24,10 +24,10 @@ DEFAULT_CACHE_ROOT = "/workspace/womd_v1_3/SMART_cache"
 DEFAULT_LOG_DIR = "/mnt/nuplan/projects/catk/logs"
 DEFAULT_EXPERIMENT = "pre_bc_flow_2x4_h100"
 DEFAULT_TASK_NAME = (
-    "flow_open_loop_pretrain_planfirst_residual_decoder_sidecar_metricoff_"
+    "flow_open_loop_pretrain_sidecar_metricoff_a343315f_gelu_head_dim16_freq32_"
     "h100x8_fmsf5_bs18_lr6p5e-4_warm5_val8_membal"
 )
-DEFAULT_SESSION = "catk-pretrain-planfirst-sidecar-metricoff-h100x8-fmsf5"
+DEFAULT_SESSION = "catk-pretrain-sidecar-metricoff-h100x8-fmsf5"
 
 
 def shq(value: object) -> str:
@@ -55,7 +55,7 @@ def export_line(name: str, value: object) -> str:
 
 def run_root(args: argparse.Namespace) -> str:
     safe_task = args.task_name.replace("/", "_")
-    return f"{args.log_dir.rstrip('/')}/tmux_pre_bc_flow_h100x8_fmsf5_planfirst_decoder/{safe_task}"
+    return f"{args.log_dir.rstrip('/')}/tmux_pre_bc_flow_h100x8_fmsf5/{safe_task}"
 
 
 def render_env(args: argparse.Namespace) -> str:
@@ -133,20 +133,20 @@ set -a
 source {shq(env_file)}
 set +a
 
-RUN_ROOT="${{CATK_LOG_DIR%/}}/tmux_pre_bc_flow_h100x8_fmsf5_planfirst_decoder/${{TASK_NAME//\\//_}}"
+RUN_ROOT="${{CATK_LOG_DIR%/}}/tmux_pre_bc_flow_h100x8_fmsf5/${{TASK_NAME//\\//_}}"
 mkdir -p "$RUN_ROOT"
 
-echo "[pretrain-h100x8-fmsf5-planfirst] pod=$(hostname) task=${{TASK_NAME}}"
-echo "[pretrain-h100x8-fmsf5-planfirst] started at $(date '+%F %T')"
-echo "[pretrain-h100x8-fmsf5-planfirst] git=$(git rev-parse --short HEAD 2>/dev/null || true)"
-echo "[pretrain-h100x8-fmsf5-planfirst] experiment=${{EXPERIMENT}} initial_bs=${{INITIAL_BS}} oom_step=${{OOM_STEP}} min_bs=${{MIN_BS}}"
-echo "[pretrain-h100x8-fmsf5-planfirst] nproc=${{NPROC_PER_NODE}} cache=${{CACHE_ROOT}}"
-echo "[pretrain-h100x8-fmsf5-planfirst] run_root=${{RUN_ROOT}}"
-echo "[pretrain-h100x8-fmsf5-planfirst] attach survives after exit; press Ctrl-b d to detach"
+echo "[pretrain-h100x8-fmsf5] pod=$(hostname) task=${{TASK_NAME}}"
+echo "[pretrain-h100x8-fmsf5] started at $(date '+%F %T')"
+echo "[pretrain-h100x8-fmsf5] git=$(git rev-parse --short HEAD 2>/dev/null || true)"
+echo "[pretrain-h100x8-fmsf5] experiment=${{EXPERIMENT}} initial_bs=${{INITIAL_BS}} oom_step=${{OOM_STEP}} min_bs=${{MIN_BS}}"
+echo "[pretrain-h100x8-fmsf5] nproc=${{NPROC_PER_NODE}} cache=${{CACHE_ROOT}}"
+echo "[pretrain-h100x8-fmsf5] run_root=${{RUN_ROOT}}"
+echo "[pretrain-h100x8-fmsf5] attach survives after exit; press Ctrl-b d to detach"
 echo
 
 if [[ "${{SIDECAR_PREBUILD}}" == "true" ]]; then
-  echo "[pretrain-h100x8-fmsf5-planfirst] prebuilding flow target sidecars dir=${{FLOW_TARGET_SIDECAR_DIR}} max_samples=${{SIDECAR_PREBUILD_MAX_SAMPLES}} nproc=${{NPROC_PER_NODE}}"
+  echo "[pretrain-h100x8-fmsf5] prebuilding flow target sidecars dir=${{FLOW_TARGET_SIDECAR_DIR}} max_samples=${{SIDECAR_PREBUILD_MAX_SAMPLES}} nproc=${{NPROC_PER_NODE}}"
   sidecar_log="$RUN_ROOT/$(hostname).sidecar_prebuild.log"
   torchrun --standalone --nproc_per_node="${{NPROC_PER_NODE}}" scripts/build_flow_target_sidecars.py \
     --cache-root "$CACHE_ROOT" \
@@ -158,9 +158,9 @@ if [[ "${{SIDECAR_PREBUILD}}" == "true" ]]; then
     "model.model_config.train_open_loop_metrics=${{TRAIN_OPEN_LOOP_METRICS}}" \
     2>&1 | tee "$sidecar_log"
   sidecar_status="${{PIPESTATUS[0]}}"
-  echo "[pretrain-h100x8-fmsf5-planfirst] sidecar prebuild exited with status $sidecar_status log=$sidecar_log"
+  echo "[pretrain-h100x8-fmsf5] sidecar prebuild exited with status $sidecar_status log=$sidecar_log"
   if (( sidecar_status != 0 )); then
-    echo "[pretrain-h100x8-fmsf5-planfirst] sidecar prebuild failed; aborting before training"
+    echo "[pretrain-h100x8-fmsf5] sidecar prebuild failed; aborting before training"
     exec bash
   fi
 fi
@@ -194,7 +194,7 @@ processor = FlowTokenProcessor(
 print(processor._flow_target_sidecar_root())
 PY
 )"
-  echo "[pretrain-h100x8-fmsf5-planfirst] dataloader sidecar root=${{FLOW_TARGET_SIDECAR_ROOT}}"
+  echo "[pretrain-h100x8-fmsf5] dataloader sidecar root=${{FLOW_TARGET_SIDECAR_ROOT}}"
 fi
 
 OOM_REGEX='OutOfMemoryError|CUDA out of memory|c10::OutOfMemoryError|cuda runtime error.*out of memory|torch\\.OutOfMemoryError|CUDA_ERROR_OUT_OF_MEMORY'
@@ -220,12 +220,12 @@ terminate_task_processes() {{
   if (( ${{#pids[@]}} == 0 )); then
     return 0
   fi
-  echo "[pretrain-h100x8-fmsf5-planfirst] terminating task processes for $reason: ${{pids[*]}}"
+  echo "[pretrain-h100x8-fmsf5] terminating task processes for $reason: ${{pids[*]}}"
   kill -TERM "${{pids[@]}}" 2>/dev/null || true
   sleep 15
   mapfile -t pids < <(task_process_pids || true)
   if (( ${{#pids[@]}} > 0 )); then
-    echo "[pretrain-h100x8-fmsf5-planfirst] force killing task processes for $reason: ${{pids[*]}}"
+    echo "[pretrain-h100x8-fmsf5] force killing task processes for $reason: ${{pids[*]}}"
     kill -KILL "${{pids[@]}}" 2>/dev/null || true
   fi
 }}
@@ -247,13 +247,13 @@ while (( bs >= MIN_BS )); do
 
   echo
   if [[ -n "$latest_ckpt" ]]; then
-    echo "[pretrain-h100x8-fmsf5-planfirst] attempt #${{attempt}} bs=${{bs}} resume=${{latest_ckpt}}"
+    echo "[pretrain-h100x8-fmsf5] attempt #${{attempt}} bs=${{bs}} resume=${{latest_ckpt}}"
     ckpt_override="ckpt_path=${{latest_ckpt}}"
   else
-    echo "[pretrain-h100x8-fmsf5-planfirst] attempt #${{attempt}} bs=${{bs}} fresh fit"
+    echo "[pretrain-h100x8-fmsf5] attempt #${{attempt}} bs=${{bs}} fresh fit"
     ckpt_override="ckpt_path=null"
   fi
-  echo "[pretrain-h100x8-fmsf5-planfirst] attempt log: $attempt_log"
+  echo "[pretrain-h100x8-fmsf5] attempt log: $attempt_log"
 
   terminate_task_processes "pre-attempt cleanup"
 
@@ -297,13 +297,13 @@ while (( bs >= MIN_BS )); do
     HYDRA_OVERRIDES+=("${{EXTRA_OVERRIDES[@]}}")
   fi
 
-  printf '[pretrain-h100x8-fmsf5-planfirst] torchrun command:'
+  printf '[pretrain-h100x8-fmsf5] torchrun command:'
   printf ' %q' torchrun --standalone --nproc_per_node="${{NPROC_PER_NODE}}" -m src.run "${{HYDRA_OVERRIDES[@]}}"
   printf '\\n'
 
   torchrun --standalone --nproc_per_node="${{NPROC_PER_NODE}}" -m src.run "${{HYDRA_OVERRIDES[@]}}" 2>&1 | tee "$attempt_log"
   exit_code="${{PIPESTATUS[0]}}"
-  echo "[pretrain-h100x8-fmsf5-planfirst] attempt #${{attempt}} exited with status $exit_code"
+  echo "[pretrain-h100x8-fmsf5] attempt #${{attempt}} exited with status $exit_code"
 
   if (( exit_code == 0 )); then
     final_status=0
@@ -315,9 +315,9 @@ while (( bs >= MIN_BS )); do
   if grep -Eq "$OOM_REGEX" "$attempt_log"; then
     non_oom_retry_count=0
     new_bs=$(( bs - OOM_STEP ))
-    echo "[pretrain-h100x8-fmsf5-planfirst] OOM detected at bs=${{bs}}; lowering to bs=${{new_bs}}"
+    echo "[pretrain-h100x8-fmsf5] OOM detected at bs=${{bs}}; lowering to bs=${{new_bs}}"
     if (( new_bs < MIN_BS )); then
-      echo "[pretrain-h100x8-fmsf5-planfirst] next bs=${{new_bs}} is below MIN_BS=${{MIN_BS}}; aborting"
+      echo "[pretrain-h100x8-fmsf5] next bs=${{new_bs}} is below MIN_BS=${{MIN_BS}}; aborting"
       final_status=1
       break
     fi
@@ -327,18 +327,18 @@ while (( bs >= MIN_BS )); do
 
   if is_retryable_non_oom_exit "$exit_code" && (( non_oom_retry_count < MAX_NON_OOM_RETRIES )); then
     non_oom_retry_count=$(( non_oom_retry_count + 1 ))
-    echo "[pretrain-h100x8-fmsf5-planfirst] retryable non-OOM exit=${{exit_code}}; retrying bs=${{bs}} (${{non_oom_retry_count}}/${{MAX_NON_OOM_RETRIES}})"
+    echo "[pretrain-h100x8-fmsf5] retryable non-OOM exit=${{exit_code}}; retrying bs=${{bs}} (${{non_oom_retry_count}}/${{MAX_NON_OOM_RETRIES}})"
     continue
   fi
 
-  echo "[pretrain-h100x8-fmsf5-planfirst] non-OOM failure; see $attempt_log"
+  echo "[pretrain-h100x8-fmsf5] non-OOM failure; see $attempt_log"
   final_status="$exit_code"
   break
 done
 
 echo
-echo "[pretrain-h100x8-fmsf5-planfirst] finished with status $final_status at $(date '+%F %T')"
-echo "[pretrain-h100x8-fmsf5-planfirst] leaving shell open for inspection"
+echo "[pretrain-h100x8-fmsf5] finished with status $final_status at $(date '+%F %T')"
+echo "[pretrain-h100x8-fmsf5] leaving shell open for inspection"
 exec bash
 """
 
@@ -446,7 +446,7 @@ fi
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Launch fm-sf-5 H100x8 open-loop pretrain for the Plan-first residual decoder test."
+        description="Launch fm-sf-5 H100x8 open-loop pretrain for a343315f GELU test."
     )
     parser.add_argument("--namespace", default=DEFAULT_NAMESPACE)
     parser.add_argument("--pod", default=DEFAULT_POD)

@@ -430,6 +430,109 @@ model.model_config.token_processor.use_prefix_valid_future_loss_mask=false  # fu
 
 Map/agent trajectory token matching은 항상 deterministic argmin으로 수행합니다. 이전의 `map_token_sampling.num_k/temp`, `agent_token_sampling.num_k/temp` top-k sampling 옵션은 기본값 `num_k=1`에서 쓰이지 않던 경로였으므로 제거했습니다. 따라서 학습, fine tuning, validation, closed-loop inference, WOSAC submission 모두 같은 token matching 규칙을 사용합니다.
 
+### 5.1.3 Deterministic Flow Target Sidecar
+
+open-loop Flow pretrain에서 token/flow target 생성은 입력 cache, token vocabulary, control-space target 설정이 같으면 deterministic입니다. 이 값들을 학습 step마다 다시 만들지 않고 sidecar로 미리 저장하면, model forward/backward와 loss 의미는 그대로 두면서 학습 전처리 시간을 줄일 수 있습니다.
+
+기존 SMART cache 원본은 수정하지 않습니다. sidecar는 `flow_target_sidecars/<fingerprint>/` 아래에 별도 `.pt` 파일로 저장됩니다. fingerprint에는 map token hash, agent token hash, flow window, Tail-Prefix mask, kinematic control 설정, yaw/no-slip/round-trip 설정이 들어갑니다. 설정이나 token vocab이 바뀌면 다른 fingerprint 디렉터리를 사용하므로 잘못된 sidecar를 조용히 재사용하지 않습니다.
+
+sidecar를 만들려면:
+
+```bash
+torchrun --standalone --nproc_per_node=8 scripts/build_flow_target_sidecars.py \
+  --cache-root "$CACHE_ROOT" \
+  --sidecar-dir "$CACHE_ROOT/flow_target_sidecars" \
+  --experiment pre_bc_flow_2x4_h100 \
+  --device auto
+```
+
+`torchrun`으로 실행하면 각 rank가 `WORLD_SIZE`/`RANK` 기준 shard만 처리하고
+`LOCAL_RANK`에 해당하는 GPU를 사용합니다. 단일 프로세스로 실행할 때는
+`--num-shards`/`--shard-index`를 명시해 외부 job scheduler에서 나눠 돌릴 수도 있습니다.
+
+sidecar와 online token processor 출력이 같은지 확인하려면:
+
+```bash
+python scripts/verify_flow_target_sidecar_equivalence.py \
+  --cache-root "$CACHE_ROOT" \
+  --sidecar-dir "$CACHE_ROOT/flow_target_sidecars_verify" \
+  --experiment pre_bc_flow_2x4_h100 \
+  --num-samples 16 \
+  --batch-size 4 \
+  --device cuda:0 \
+  --preload-sidecar
+```
+
+학습에서 속도 이득을 보려면 아래 두 경로를 함께 켜야 합니다.
+
+```bash
+model.model_config.token_processor.flow_target_sidecar_dir="$CACHE_ROOT/flow_target_sidecars" \
+model.model_config.token_processor.flow_target_sidecar_read=true \
+model.model_config.token_processor.flow_target_sidecar_required=true \
+data.train_flow_target_sidecar_root=auto \
+data.train_flow_target_sidecar_required=true
+```
+
+`token_processor.flow_target_sidecar_read=true`이고 `flow_target_sidecar_dir`가 설정되어 있으면
+`src.run`이 token processor의 fingerprint를 계산해
+`data.train_flow_target_sidecar_root="$CACHE_ROOT/flow_target_sidecars/<fingerprint>"`
+를 자동 주입합니다. 따라서 model-side read만 켠 느린 경로로 떨어지지 않고,
+DataLoader worker가 payload를 미리 읽는 preload fast path가 기본 동작입니다.
+
+train-only ADE/FDE/yaw ADE/yaw FDE 진단값은 기본으로 끕니다.
+
+```bash
+model.model_config.train_open_loop_metrics=false
+```
+
+이 값은 loss와 optimizer update에는 영향을 주지 않고, 학습 중 W&B에 남기던 open-loop train metric 계산만 생략합니다. validation과 closed-loop Fast WOSAC metric은 그대로 계산됩니다.
+
+fm-sf-5 H100x8에서 sidecar prebuild, DataLoader preload, train metric off, OOM fallback을 함께 쓰려면:
+
+```bash
+python scripts/launch_pre_bc_flow_h100x8_fmsf5_sidecar_static_pod.py --replace
+```
+
+중요 기본값:
+
+| 항목 | 값 |
+|---|---|
+| pod / GPU | `fm-sf-5`, H100 x 8 |
+| experiment | `pre_bc_flow_2x4_h100` |
+| per-rank train batch | `18` |
+| learning rate | `6.5e-4` |
+| train metric | `train_open_loop_metrics=false` |
+| sidecar prebuild | `true` |
+| sidecar prebuild parallelism | `torchrun --nproc_per_node=8`, rank별 shard 처리 |
+| sidecar read | `true` 기본값 |
+| DataLoader sidecar preload | `src.run`이 fingerprint root를 자동 계산해 `data.train_flow_target_sidecar_root`로 전달 |
+| empty-target optimizer guard | `skip_empty_open_loop_optimizer_guard=true` |
+| OOM fallback | `18 -> 16 -> 14 -> 12` |
+
+2026-06-13 fm-sf-5 H100x8, `bs=18`, 80 train batches, validation/checkpoint ranking off 조건의 검증 결과:
+
+| 조건 | `time/train_epoch_minutes` | 기준 대비 |
+|---|---:|---:|
+| baseline online target + train metric on | `1.38694` | - |
+| sidecar read + train metric off, preload 없음 | `1.40192` | `+1.08%` 느림 |
+| sidecar preload fast path + train metric off | `1.34530` | `-3.00%` 빠름 |
+
+따라서 sidecar는 DataLoader preload fast path까지 켠 구성을 production pretrain 경로로 사용합니다.
+
+2026-06-13 fm-sf-5에서 `scripts/verify_flow_target_coverage.py`로 target coverage를 전체 스캔했습니다.
+
+| split | 기준 | samples | targetless | 비고 |
+|---|---|---:|---:|---|
+| train | raw target fast path | `486,995` | `0` | `flow_train_loss_mask` 기준 |
+| validation | raw eval target path | `44,097` | `0` | `flow_eval_clean_norm` 기준 |
+| test | raw eval target path | `44,920` | `44,920` | WOMD testing cache는 GT future target 없음 |
+
+`on_before_optimizer_step`의 empty-target DDP guard는 train optimizer step에만 필요하므로,
+fm-sf-5 pretrain launcher는 train split 전체에 targetless sample이 없다는 위 검증을 근거로
+`model.model_config.skip_empty_open_loop_optimizer_guard=true`를 기본으로 넘깁니다.
+짧은 H100x8 sidecar probe 기준 rank0 step wall은 `754.856ms -> 737.942ms`로
+`16.914ms/batch`, `2.24%` 줄었습니다.
+
 기존 pretrained checkpoint를 prefix-valid 목표로 이어서 학습할 때는 `action=finetune`을 씁니다. 이 방식은 모델 weight만 불러오고 optimizer / scheduler는 새로 시작합니다. 모델 전체를 학습하려면 `model.model_config.finetune.enabled=false`를 유지합니다.
 
 #### H100 4GPU 단일 pod prefix-valid fine tuning
@@ -504,7 +607,7 @@ kubectl exec -it -n p-pnc testa -c main -- tmux attach -t catk-prefix-valid-a100
 kubectl exec -it -n p-pnc testaa -c main -- tmux attach -t catk-prefix-valid-a100x4x2-fw30
 ```
 
-### 5.1.3 Kinematic control-space Flow Matching
+### 5.1.4 Kinematic control-space Flow Matching
 
 기본값은 기존 pose-space Flow Matching입니다.
 
