@@ -81,6 +81,7 @@ def render_env(args: argparse.Namespace) -> str:
         "LEARNING_RATE": args.learning_rate,
         "LR_WARMUP_STEPS": args.lr_warmup_steps,
         "LIMIT_TRAIN_BATCHES": args.limit_train_batches,
+        "RESUME_CKPT_PATH": args.resume_ckpt_path,
         "CATK_EXTRA_OVERRIDES": args.extra_hydra_overrides,
     }
     for name, value in optional.items():
@@ -176,11 +177,22 @@ bs="$INITIAL_BS"
 attempt=0
 non_oom_retry_count=0
 final_status=1
+explicit_resume_ckpt="${{RESUME_CKPT_PATH:-}}"
 
 while (( bs >= MIN_BS )); do
   attempt=$(( attempt + 1 ))
   attempt_log="$RUN_ROOT/$(hostname).attempt_$(printf '%03d' "$attempt")_bs${{bs}}.log"
-  latest_ckpt="$(latest_checkpoint || true)"
+  if [[ -n "$explicit_resume_ckpt" ]]; then
+    if [[ ! -f "$explicit_resume_ckpt" ]]; then
+      echo "[pretrain-h100x8-fmsf3] explicit resume checkpoint not found: $explicit_resume_ckpt" >&2
+      final_status=2
+      break
+    fi
+    latest_ckpt="$explicit_resume_ckpt"
+    explicit_resume_ckpt=""
+  else
+    latest_ckpt="$(latest_checkpoint || true)"
+  fi
 
   echo
   if [[ -n "$latest_ckpt" ]]; then
@@ -251,12 +263,14 @@ while (( bs >= MIN_BS )); do
       break
     fi
     bs="$new_bs"
+    explicit_resume_ckpt=""
     continue
   fi
 
   if is_retryable_non_oom_exit "$exit_code" && (( non_oom_retry_count < MAX_NON_OOM_RETRIES )); then
     non_oom_retry_count=$(( non_oom_retry_count + 1 ))
     echo "[pretrain-h100x8-fmsf3] retryable non-OOM exit=${{exit_code}}; retrying bs=${{bs}} (${{non_oom_retry_count}}/${{MAX_NON_OOM_RETRIES}})"
+    explicit_resume_ckpt=""
     continue
   fi
 
@@ -398,6 +412,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--check-val-every-n-epoch", type=int, default=8)
     parser.add_argument("--limit-val-batches", default="0.1")
     parser.add_argument("--limit-train-batches", default="")
+    parser.add_argument(
+        "--resume-ckpt-path",
+        default="",
+        help=(
+            "Explicit Lightning checkpoint for the first attempt. Later retry "
+            "attempts fall back to the latest checkpoint for the task."
+        ),
+    )
     parser.add_argument("--learning-rate", default="6.5e-4")
     parser.add_argument("--lr-warmup-steps", default="5")
     parser.add_argument("--use-distributed-sampler", default="false")

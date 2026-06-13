@@ -1689,6 +1689,32 @@ torchrun \
 
 다른 PC에서 재개할 때는 그 PC에서 접근 가능한 checkpoint 경로를 `ckpt_path`로 주고, 그 PC의 캐시 위치에 맞게 `paths.cache_root`만 맞춰주면 됩니다. 새로 실행한 쪽의 output dir은 항상 새 timestamp 폴더로 생기므로 기존 run 폴더를 덮어쓰지 않습니다.
 
+#### seven global-2s refiner epoch 20 checkpoint에서 재개
+
+`semi_control_decoder_last`의 seven H100x7 global 2초 step-refiner pretrain을 epoch 20 종료 직후 checkpoint에서 재개하려면 아래 전용 wrapper를 씁니다.
+
+```bash
+python scripts/launch_pre_bc_flow_h100x7_seven_global_2s_refiner_resume_epoch20_static_pod.py --replace
+```
+
+기본 checkpoint는 아래 파일입니다.
+
+```text
+/mnt/nuplan/projects/catk/logs/flow_open_loop_pretrain_global2s_refiner_a1b277f_h100x7_seven_bs18_lr6p5e-4_warm5_val8_membal/runs/2026-06-13_02-44-30/checkpoints/epoch_last.ckpt
+```
+
+이 wrapper는 원래 seven/global2s pretrain과 같은 `experiment`, `task_name`, `train_batch_size=18`, `lr=6.5e-4`, `lr_warmup_steps=5`, `check_val_every_n_epoch=8`, `limit_val_batches=0.1`, memory-balanced sampler 설정을 유지하고, 첫 attempt의 `ckpt_path`만 위 checkpoint로 명시합니다. Lightning `fit(..., ckpt_path=...)` 경로라 optimizer, lr scheduler, epoch, global step이 같이 복원되므로 정상적으로 저장된 epoch 20 `epoch_last.ckpt` 기준 재개는 끊김 없는 학습과 같은 학습 상태에서 epoch 21로 이어집니다.
+
+짧은 smoke 검증만 하려면 새 checkpoint가 원 실험의 최신 checkpoint로 섞이지 않도록 task name을 분리합니다.
+
+```bash
+python scripts/launch_pre_bc_flow_h100x7_seven_global_2s_refiner_resume_epoch20_static_pod.py \
+  --replace \
+  --task-name flow_open_loop_pretrain_global2s_refiner_epoch20_resume_smoke \
+  --limit-train-batches 2 \
+  --no-monitor-pane
+```
+
 ### 5.5 `val_closed_loop` 비디오 저장하기
 
 - `pre_bc_flow` 기본값은 `n_vis_batch=0`, `n_vis_scenario=0`, `n_vis_rollout=0` 이라서 `val_closed_loop`가 돌아도 mp4는 저장하지 않습니다.
