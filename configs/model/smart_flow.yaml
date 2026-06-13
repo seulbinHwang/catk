@@ -32,6 +32,16 @@ model_config:
   # loss/backward/validation unchanged and skips the train-time pose metric
   # conversion cost in open-loop pretrain.
   train_open_loop_metrics: false
+  # 후반부 flow 시간에서만, 속도장으로 즉시 복원한 clean 10Hz 궤적을
+  # 정답 pose-space 궤적에 약하게 맞춥니다. raw pose loss를 unit-impact loss로
+  # 300배 환산한 뒤 weight=0.25를 적용해 FM 대비 약 25% 영향으로 해석합니다.
+  clean_path_consistency:
+    enabled: true
+    weight: 0.25
+    unit_impact_scale: 300.0
+    tau_min: 0.75
+    commit_steps: 5
+    commit_weight: 2.0
   # Safety guard for rare automatic-optimization batches with no open-loop
   # targets. Keep this false unless the selected train split has been scanned
   # and every sample is known to produce at least one train target.

@@ -124,6 +124,75 @@ def flow_matching_loss(
     return (squared_error * mask_float.unsqueeze(-1)).sum() / denom
 
 
+def clean_path_consistency_loss(
+    pred_clean_norm: torch.Tensor,
+    target_clean_norm: torch.Tensor,
+    tau: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
+    *,
+    tau_min: float = 0.75,
+    commit_steps: int = 5,
+    commit_weight: float = 2.0,
+) -> torch.Tensor:
+    """후반부 clean trajectory consistency loss를 계산합니다.
+
+    Args:
+        pred_clean_norm: 속도장 예측에서 바로 복원한 pose-space 미래입니다.
+            shape은 ``[n_anchor, n_future, 4]`` 입니다.
+        target_clean_norm: 정답 pose-space 미래입니다. shape은 ``pred_clean_norm`` 과 같습니다.
+        tau: flow 시간입니다. shape은 ``[n_anchor]`` 입니다.
+        valid_mask: loss에 포함할 미래 step입니다. shape은 ``[n_anchor, n_future]`` 입니다.
+        tau_min: 보조 손실을 적용할 최소 flow 시간입니다. 기본값은 ``0.75`` 입니다.
+        commit_steps: 첫 commit 구간에 해당하는 10Hz step 수입니다. 기본값은 ``5`` 입니다.
+        commit_weight: 첫 commit 구간 step 가중치입니다. 기본값은 ``2.0`` 입니다.
+
+    Returns:
+        torch.Tensor: 위치와 진행 방향을 함께 맞추는 평균 MSE scalar입니다.
+    """
+    if pred_clean_norm.numel() == 0:
+        return pred_clean_norm.sum() * 0.0
+    if tuple(pred_clean_norm.shape) != tuple(target_clean_norm.shape):
+        raise ValueError(
+            "pred_clean_norm and target_clean_norm must have the same shape: "
+            f"pred={tuple(pred_clean_norm.shape)}, target={tuple(target_clean_norm.shape)}."
+        )
+    if pred_clean_norm.ndim != 3 or pred_clean_norm.shape[-1] < 4:
+        raise ValueError(
+            "clean path consistency requires pose-space tensors with shape "
+            f"[n_anchor, n_future, >=4], got {tuple(pred_clean_norm.shape)}."
+        )
+    if tau.ndim != 1 or int(tau.shape[0]) != int(pred_clean_norm.shape[0]):
+        raise ValueError(
+            "tau must have shape [n_anchor], "
+            f"got {tuple(tau.shape)} for n_anchor={int(pred_clean_norm.shape[0])}."
+        )
+    if commit_steps <= 0:
+        raise ValueError(f"commit_steps must be positive, got {commit_steps}.")
+    if commit_weight <= 0.0:
+        raise ValueError(f"commit_weight must be positive, got {commit_weight}.")
+
+    tau = tau.to(device=pred_clean_norm.device, dtype=pred_clean_norm.dtype)
+    tau_mask = tau >= float(tau_min)
+    if valid_mask is None:
+        mask = tau_mask.view(-1, 1).expand(-1, pred_clean_norm.shape[1])
+    else:
+        future_mask = _validate_future_mask(value=pred_clean_norm, valid_mask=valid_mask)
+        if future_mask is None:
+            mask = tau_mask.view(-1, 1).expand(-1, pred_clean_norm.shape[1])
+        else:
+            mask = future_mask & tau_mask.view(-1, 1)
+    if not bool(mask.any().item()):
+        return pred_clean_norm.sum() * 0.0
+
+    squared_error = (pred_clean_norm[..., :4] - target_clean_norm[..., :4]).float().square()
+    step_weight = squared_error.new_ones((pred_clean_norm.shape[1],))
+    commit_len = min(int(commit_steps), int(pred_clean_norm.shape[1]))
+    step_weight[:commit_len] = float(commit_weight)
+    mask_weight = mask.to(dtype=squared_error.dtype) * step_weight.view(1, -1)
+    denom = mask_weight.sum().clamp_min(1.0) * squared_error.shape[-1]
+    return (squared_error * mask_weight.unsqueeze(-1)).sum() / denom
+
+
 def ade_future(
     pred_clean_norm: torch.Tensor,
     target_clean_norm: torch.Tensor,

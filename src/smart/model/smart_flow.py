@@ -26,6 +26,7 @@ from src.smart.metrics import (
 from src.smart.metrics.flow_metrics import (
     WeightedMeanMetric,
     ade_future,
+    clean_path_consistency_loss,
     fde_future,
     flow_matching_loss,
     yaw_ade_future,
@@ -110,6 +111,50 @@ def _build_decoder_config_from_token_processor(decoder_config: Any, token_proces
     return synced_config
 
 
+def _resolve_clean_path_consistency_config(
+    model_config: Any,
+) -> tuple[bool, float, float, int, float, float]:
+    """후반부 clean-path consistency 설정을 검증해 반환합니다."""
+    config = getattr(model_config, "clean_path_consistency", None)
+    if config is None:
+        return False, 0.0, 300.0, 0.75, 5, 2.0
+
+    enabled = bool(getattr(config, "enabled", False))
+    weight = float(getattr(config, "weight", 0.25))
+    unit_impact_scale = float(getattr(config, "unit_impact_scale", 300.0))
+    tau_min = float(getattr(config, "tau_min", 0.75))
+    commit_steps = int(getattr(config, "commit_steps", 5))
+    commit_weight = float(getattr(config, "commit_weight", 2.0))
+    if not enabled:
+        return False, 0.0, unit_impact_scale, tau_min, commit_steps, commit_weight
+    if not math.isfinite(weight) or weight <= 0.0 or weight > 0.5:
+        raise ValueError(
+            "model_config.clean_path_consistency.weight must be finite and in (0, 0.5], "
+            f"got {weight!r}."
+        )
+    if not math.isfinite(unit_impact_scale) or unit_impact_scale <= 0.0:
+        raise ValueError(
+            "model_config.clean_path_consistency.unit_impact_scale must be finite and > 0, "
+            f"got {unit_impact_scale!r}."
+        )
+    if not math.isfinite(tau_min) or tau_min < 0.75 or tau_min >= 1.0:
+        raise ValueError(
+            "model_config.clean_path_consistency.tau_min must be finite and in [0.75, 1.0), "
+            f"got {tau_min!r}."
+        )
+    if commit_steps <= 0:
+        raise ValueError(
+            "model_config.clean_path_consistency.commit_steps must be positive, "
+            f"got {commit_steps!r}."
+        )
+    if not math.isfinite(commit_weight) or commit_weight < 1.0:
+        raise ValueError(
+            "model_config.clean_path_consistency.commit_weight must be finite and >= 1.0, "
+            f"got {commit_weight!r}."
+        )
+    return True, weight, unit_impact_scale, tau_min, commit_steps, commit_weight
+
+
 class SMARTFlow(LightningModule):
 
     def __init__(self, model_config) -> None:
@@ -131,6 +176,14 @@ class SMARTFlow(LightningModule):
         self.skip_empty_open_loop_optimizer_guard = bool(
             getattr(model_config, "skip_empty_open_loop_optimizer_guard", False)
         )
+        (
+            self.clean_path_consistency_enabled,
+            self.clean_path_consistency_weight,
+            self.clean_path_consistency_unit_impact_scale,
+            self.clean_path_consistency_tau_min,
+            self.clean_path_consistency_commit_steps,
+            self.clean_path_consistency_commit_weight,
+        ) = _resolve_clean_path_consistency_config(model_config)
         self.token_processor = FlowTokenProcessor(**model_config.token_processor)
         self.use_kinematic_control_flow = bool(self.token_processor.use_kinematic_control_flow)
         decoder_config = _build_decoder_config_from_token_processor(
@@ -146,6 +199,14 @@ class SMARTFlow(LightningModule):
             raise ValueError(
                 "decoder.flow_window_steps and token_processor.flow_window_steps must match, "
                 f"got {self.flow_window_steps} and {int(self.token_processor.flow_window_steps)}."
+            )
+        if self.clean_path_consistency_enabled and bool(
+            getattr(model_config.decoder, "detach_train_metric_clean", False)
+        ):
+            raise ValueError(
+                "model_config.clean_path_consistency.enabled=true requires "
+                "model_config.decoder.detach_train_metric_clean=false because the auxiliary "
+                "loss must backpropagate through the immediately reconstructed clean path."
             )
         set_model_for_finetuning(self.encoder, model_config.finetune)
 
@@ -213,6 +274,7 @@ class SMARTFlow(LightningModule):
         self._train_open_epoch_log_names = (
             "train/loss",
             "train/loss_fm",
+            "train/loss_clean_path_consistency",
             f"train/{self.train_open_metric_names['ade']}",
             f"train/{self.train_open_metric_names['fde']}",
             f"train/{self.train_open_metric_names['yaw_ade']}",
@@ -869,6 +931,43 @@ class SMARTFlow(LightningModule):
             return True
         return bool(loss_mask.to(device=pred_norm.device, dtype=torch.bool).any().item())
 
+    def _should_compute_train_open_loop_metric_outputs(self) -> bool:
+        """train open-loop forward에서 pose-space clean 출력을 만들어야 하는지 반환합니다."""
+        return bool(self.train_open_loop_metrics or self.clean_path_consistency_enabled)
+
+    def _compute_clean_path_consistency_loss(
+        self,
+        pred_dict: Dict[str, Tensor],
+        has_loss_targets: bool,
+    ) -> Tensor:
+        """open-loop pretrain 전용 clean-path consistency 보조 loss를 계산합니다."""
+        reference = pred_dict.get("flow_pred_clean_norm", pred_dict["flow_pred_norm"])
+        if not self.clean_path_consistency_enabled or not has_loss_targets:
+            return reference.sum() * 0.0
+        if "flow_tau" not in pred_dict:
+            raise RuntimeError(
+                "clean_path_consistency requires decoder output 'flow_tau'. "
+                "Check SMARTFlowAgentDecoder.forward."
+            )
+        pred_clean_norm = pred_dict.get(
+            "flow_pred_clean_metric_norm",
+            pred_dict["flow_pred_clean_norm"],
+        )
+        target_clean_norm = pred_dict.get(
+            "flow_clean_metric_norm",
+            pred_dict["flow_clean_norm"],
+        )
+        raw_clean_path_loss = clean_path_consistency_loss(
+            pred_clean_norm,
+            target_clean_norm,
+            pred_dict["flow_tau"],
+            valid_mask=pred_dict.get("flow_loss_mask"),
+            tau_min=self.clean_path_consistency_tau_min,
+            commit_steps=self.clean_path_consistency_commit_steps,
+            commit_weight=self.clean_path_consistency_commit_weight,
+        )
+        return raw_clean_path_loss * float(self.clean_path_consistency_unit_impact_scale)
+
     def _build_trainable_connected_zero_loss(self, module: nn.Module | None = None) -> Tensor:
         """trainable parameter graph에 연결된 scalar 0 loss를 만듭니다."""
         zero_loss: Tensor | None = None
@@ -951,6 +1050,7 @@ class SMARTFlow(LightningModule):
         *,
         total_loss: Tensor,
         fm_loss: Tensor,
+        clean_path_consistency_loss_value: Tensor | None = None,
         open_metric_dict: Dict[str, Tensor],
         sample_count: int,
     ) -> None:
@@ -966,6 +1066,11 @@ class SMARTFlow(LightningModule):
         values = [
             total_loss.detach(),
             fm_loss.detach(),
+            (
+                clean_path_consistency_loss_value.detach()
+                if clean_path_consistency_loss_value is not None
+                else total_loss.detach().new_zeros(())
+            ),
         ]
         if open_metric_dict:
             values.extend(
@@ -990,7 +1095,7 @@ class SMARTFlow(LightningModule):
         )
         weight_tensor = value_tensor.new_full(value_tensor.shape, weight)
         if not open_metric_dict:
-            weight_tensor[2:] = 0.0
+            weight_tensor[3:] = 0.0
         self._train_open_epoch_metric_sums += value_tensor * weight_tensor
         self._train_open_epoch_metric_counts += weight_tensor
 
@@ -3486,16 +3591,30 @@ class SMARTFlow(LightningModule):
             tokenized_map,
             tokenized_agent,
             anchor_mask_key="flow_train_mask",
-            compute_metric_outputs=self.train_open_loop_metrics,
+            compute_metric_outputs=self._should_compute_train_open_loop_metric_outputs(),
         )
         fm_loss, open_metric_dict, sample_count, has_open_loop_targets = self._open_loop_denoise_metrics(
             pred,
             zero_loss_module=self.encoder,
         )
-        total_loss = fm_loss
+        clean_path_loss = self._compute_clean_path_consistency_loss(pred, has_open_loop_targets)
+        total_loss = fm_loss + self.clean_path_consistency_weight * clean_path_loss
+        if not torch.isfinite(fm_loss):
+            raise RuntimeError(f"Non-finite fm_loss detected: {self._summarize_nonfinite_tensor(fm_loss)}")
+        if not torch.isfinite(clean_path_loss):
+            raise RuntimeError(
+                "Non-finite clean_path_consistency_loss detected: "
+                f"{self._summarize_nonfinite_tensor(clean_path_loss)}"
+            )
+        if not torch.isfinite(total_loss):
+            raise RuntimeError(
+                "Non-finite total_loss detected: "
+                f"{self._summarize_nonfinite_tensor(total_loss)}"
+            )
         self._accumulate_open_loop_train_epoch_metrics(
             total_loss=total_loss,
             fm_loss=fm_loss,
+            clean_path_consistency_loss_value=clean_path_loss,
             open_metric_dict=open_metric_dict,
             sample_count=sample_count,
         )
@@ -3884,7 +4003,7 @@ flow_clean_norm [n_valid_anchor, 20, 4]
             tokenized_map,
             tokenized_agent,
             anchor_mask_key="flow_train_mask",
-            compute_metric_outputs=self.train_open_loop_metrics,
+            compute_metric_outputs=self._should_compute_train_open_loop_metric_outputs(),
         )
         """
 fm_loss: 
@@ -3896,9 +4015,15 @@ open_metric_dict:
             pred,
             zero_loss_module=self,
         )
-        total_loss = fm_loss
+        clean_path_loss = self._compute_clean_path_consistency_loss(pred, has_open_loop_targets)
+        total_loss = fm_loss + self.clean_path_consistency_weight * clean_path_loss
         if not torch.isfinite(fm_loss):
             raise RuntimeError(f"Non-finite fm_loss detected: {self._summarize_nonfinite_tensor(fm_loss)}")
+        if not torch.isfinite(clean_path_loss):
+            raise RuntimeError(
+                "Non-finite clean_path_consistency_loss detected: "
+                f"{self._summarize_nonfinite_tensor(clean_path_loss)}"
+            )
         if not torch.isfinite(total_loss):
             raise RuntimeError(
                 "Non-finite total_loss detected: "
@@ -3908,6 +4033,7 @@ open_metric_dict:
         self._accumulate_open_loop_train_epoch_metrics(
             total_loss=total_loss,
             fm_loss=fm_loss,
+            clean_path_consistency_loss_value=clean_path_loss,
             open_metric_dict=open_metric_dict,
             sample_count=sample_count,
         )
