@@ -17,6 +17,11 @@ def _make_minimal_model() -> SMARTFlow:
         "yaw_ade": "yaw_ADE2s",
         "yaw_fde": "yaw_FDE2s",
     }
+    model.train_open_loop_metrics = False
+    model.skip_empty_open_loop_optimizer_guard = False
+    model._automatic_open_loop_has_target_since_step = False
+    model._automatic_open_loop_has_target_pending = []
+    model._skip_next_automatic_optimizer_step = False
     model._build_open_loop_metric_dict = lambda **_: {
         "ADE2s": torch.zeros(()),
         "FDE2s": torch.zeros(()),
@@ -79,6 +84,7 @@ def test_empty_target_automatic_step_clears_zero_grads_before_adamw_decay() -> N
     before = model.encoder.weight.detach().clone()
     model._automatic_open_loop_has_target_since_step = False
     model._skip_next_automatic_optimizer_step = False
+    model.skip_empty_open_loop_optimizer_guard = False
 
     loss = model._build_trainable_connected_zero_loss(model.encoder)
     loss.backward()
@@ -96,7 +102,10 @@ def test_empty_local_target_keeps_grad_when_another_rank_has_target() -> None:
     optimizer = torch.optim.AdamW(model.encoder.parameters(), lr=1.0, weight_decay=0.1)
     model._automatic_open_loop_has_target_since_step = False
     model._skip_next_automatic_optimizer_step = False
-    model._sync_distributed_bool_any = lambda value, *, device=None: True  # type: ignore[method-assign]
+    model._automatic_open_loop_has_target_pending = [
+        (torch.ones((), dtype=torch.long), None),
+    ]
+    model.skip_empty_open_loop_optimizer_guard = False
 
     loss = model._build_trainable_connected_zero_loss(model.encoder)
     loss.backward()
@@ -123,3 +132,37 @@ def test_manual_optimizer_hook_does_not_clear_existing_gradients() -> None:
 
     assert model.encoder.weight.grad is not None
     torch.testing.assert_close(model.encoder.weight.grad, grad_before)
+
+
+def test_skip_empty_open_loop_guard_does_not_schedule_collective_for_target_batch() -> None:
+    model = _make_minimal_model()
+    model.skip_empty_open_loop_optimizer_guard = True
+    model._automatic_open_loop_has_target_pending = []
+    model._start_distributed_bool_any = lambda *_, **__: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError("skip mode must not start the distributed target guard")
+    )
+
+    loss = model.encoder(torch.ones((1, 2), dtype=torch.float32)).sum()
+    model._record_automatic_open_loop_targets(
+        has_open_loop_targets=True,
+        loss=loss,
+    )
+
+    assert model._automatic_open_loop_has_target_pending == []
+
+
+def test_skip_empty_open_loop_guard_fails_fast_for_targetless_local_batch() -> None:
+    model = _make_minimal_model()
+    model.skip_empty_open_loop_optimizer_guard = True
+    model._automatic_open_loop_has_target_pending = []
+    loss = model._build_trainable_connected_zero_loss(model.encoder)
+
+    try:
+        model._record_automatic_open_loop_targets(
+            has_open_loop_targets=False,
+            loss=loss,
+        )
+    except RuntimeError as exc:
+        assert "skip_empty_open_loop_optimizer_guard=true" in str(exc)
+    else:
+        raise AssertionError("targetless local batch should fail when guard skip is enabled")
