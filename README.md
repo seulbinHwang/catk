@@ -331,7 +331,7 @@ DRY_RUN=1 bash scripts/start_unimm_h100x3x2_pretrain_if_idle.sh --dry-run
 | positive candidates | top-M=8, 5 steps = 0.5초 matching + near-tie tail tie-break |
 | loss | front-weighted top-M mixture NLL weight 1.0 + soft anchor CE weight 0.2 |
 | inference temperature | 1.0 |
-| inference top-k | 2048 |
+| inference top-k | 768 |
 | inference top-p | 1.0 |
 | train sampler | memory-balanced distributed batch sampler |
 
@@ -379,7 +379,7 @@ running full pretrain:
 
 실행 검증은 launcher 성공 여부만 보지 않고 실제 학습 batch까지 확인했다. DDP 6개 rank가 모두 등록됐고, epoch 0에서 `220` step 이상 OOM/Traceback/NaN 없이 진행됐으며, 같은 시점 GPU memory는 rank-local H100별 약 `76~81GiB`, utilization은 `93~100%`였다. 로그에는 `scorer_scene_num=1680`이 H100 x3x2의 world size와 val batch에 맞춰 `n_batch_sim_agents_metric=24`로 조정됐고, trainable parameter 수는 `7.1M`으로 출력됐다. W&B 기준 `trainer/global_step=19 -> 219` 사이 `train/loss=7.08834 -> 1.86461`, `train/loss_mixture=6.48800 -> 1.54931`, `train/loss_aux_ce=3.00168 -> 1.57647`로 finite하게 감소했다. warm-up 이후 속도는 약 `0.81s/batch`이며, 64 epoch train-only 예상 소요는 약 39~45시간이다. 16 epoch마다 실행되는 closed-loop validation/checkpoint overhead를 포함한 전체 예상 소요는 약 43~52시간이다.
 
-아래 2026-06-04 00:28 KST 실행 기록은 top-M mixture 학습 변경 이전에 시작한 기존 run이라 hard `z*` 기반 loss와 `inference_top_k=256`을 사용했다. 최신 기본 inference setting은 위 표의 `temperature=1.0 / top_k=2048 / top_p=1.0`이다.
+아래 2026-06-04 00:28 KST 실행 기록은 top-M mixture 학습 변경 이전에 시작한 기존 run이라 hard `z*` 기반 loss와 `inference_top_k=256`을 사용했다. 최신 기본 inference setting은 위 표의 `temperature=1.0 / top_k=768 / top_p=1.0`이다.
 
 2026-06-04 00:28 KST에 최신 `UniMM@f3cd9fc` 기준 guarded launcher로 full pretrain을 실제 시작했다. 시작 전 두 pod 모두 compute process 없음, GPU memory 4MiB, utilization 0%로 idle 상태였다. launcher는 `/tmp/catk_unimm_launcher`에서 실행했고, 각 pod의 `/tmp/catk_unimm_h100x3x2` clean checkout을 `origin/UniMM@f3cd9fc`로 맞춘 뒤 `unimm-h100x3x2` tmux session을 생성했다.
 
@@ -401,7 +401,7 @@ running full pretrain:
 
 ### Inference-only Sampling Tuning
 
-UniMM closed-loop inference는 매 0.5초마다 scorer logits에서 anchor component를 sampling한다. 기본값은 `inference_temperature=1.0`, `inference_top_k=2048`, `inference_top_p=1.0`이다. 기본 `inference_top_k=2048`은 2048개 전체 anchor에서 확률 sampling한다는 뜻이며, 구현상 anchor 개수와 같아 불필요한 top-k kernel을 실행하지 않는다. `inference_top_k=0`도 backward-compatible하게 top-k truncation을 끄는 값으로 유지한다.
+UniMM closed-loop inference는 매 0.5초마다 scorer logits에서 anchor component를 sampling한다. 기본값은 `inference_temperature=1.0`, `inference_top_k=768`, `inference_top_p=1.0`이다. 기본 `inference_top_k=768`은 `lhzndj5b:v24` checkpoint fast-RMM sweep에서 가장 높은 RMM을 낸 후보 수를 따른다. `inference_top_k=0`도 backward-compatible하게 top-k truncation을 끄는 값으로 유지한다.
 
 2026-06-04에 `hsb-npc-training-1`의 6개 H100에서 `unimm_anchor_based_4s_h100x3x2_pretrain_globalbs180_tiebreak_membal_temp1_20260604_002845`의 `Epoch_last.ckpt`를 사용해 inference-only 후보를 검증했다. checkpoint는 `/tmp/unimm_infer_tune_ckpts/epoch_last_h100x3x2_20260604.ckpt`, `epoch=30`, `global_step=89676`이었고, 검증 cache는 `/workspace/womd_v1_3/SMART_cache`다. `scorer_scene_num=1680`, `world_size=6`, `val_batch_size=12`라 실제 scorer batch는 24개로 자동 조정되며, scorer에는 1728 scenarios가 들어간다.
 
@@ -415,7 +415,7 @@ UniMM closed-loop inference는 매 0.5초마다 scorer logits에서 anchor compo
 | `temp=0.75, top_k=512, top_p=1.0` | 1728 | 32 | 0.76998 | 0.46560 | **0.80120** | 0.90376 | 0.23634 |
 | `temp=0.75, top_k=128, top_p=1.0` | 1728 | 32 | 0.76945 | 0.46445 | 0.80085 | 0.90337 | 0.24018 |
 
-위 표는 inference-only sweep 기록이다. 운영 기본값은 논문 의도와 가장 가까운 `temp=1.0, top_k=2048, top_p=1.0`로 둔다. 이 값은 2048개 전체 anchor sampling이라 표의 `top_k=0` 후보와 동작상 동일하다. Sweep에서는 `temp=0.75, top_k=0`이 가장 높은 RMM을 보였지만, 이 값은 실험 후보로 README에 남겨두고 기본값으로 강제하지 않는다.
+위 표는 inference-only sweep 기록이다. 현재 운영 기본값은 이후 `lhzndj5b:v24` checkpoint fast-RMM sweep에서 가장 높은 RMM을 낸 `temp=1.0, top_k=768, top_p=1.0`이다. `top_k=0`은 2048개 전체 anchor sampling 후보로 계속 사용할 수 있지만, 기본값으로는 강제하지 않는다.
 
 2026-06-03 23:35 KST에 guarded launcher와 H100 x3x2 파이프라인을 실제 pod/cache/GPU로 재검증했다. 검증 전후 `--status`에서 두 pod 모두 compute process 없음, GPU memory 4MiB, utilization 0%로 idle 상태였고, 검증용 tmux session은 종료 후 정리했다.
 
@@ -894,7 +894,7 @@ INITIAL_BS=28 \
 OOM_STEP=2 \
 MIN_BS=16 \
 WANDB_MODE=online \
-EXTRA_HYDRA_OVERRIDES="model.model_config.inference_temperature=1.0 model.model_config.inference_top_k=2048 model.model_config.inference_top_p=1.0 model.model_config.scorer_scene_num=1680" \
+EXTRA_HYDRA_OVERRIDES="model.model_config.inference_temperature=1.0 model.model_config.inference_top_k=768 model.model_config.inference_top_p=1.0 model.model_config.scorer_scene_num=1680" \
   bash scripts/launch_unimm_h100x3x2_with_oom_retry.sh
 ```
 
@@ -952,7 +952,7 @@ python scripts/launch_unimm_h100x3x2.py \
 | soft anchor CE | top-M=8 후보 안에서 앞 0.5초 distance 기반 soft label. 후보 밖 target mass는 0 |
 | soft anchor temperature | batch 안 agent type별 median top2 distance gap / log(2), 최소 `1e-4` |
 | loss weights | `mixture=1.0`, `aux_ce=0.2` |
-| inference sampling | `temperature=1.0`, `top_k=2048`, `top_p=1.0`; 0.5초마다 2048개 전체 anchor에서 확률 sampling |
+| inference sampling | `temperature=1.0`, `top_k=768`, `top_p=1.0`; 0.5초마다 2048개 anchor bank 중 scorer 상위 768개에서 확률 sampling |
 
 이 값들은 논문이 공개한 `K=2048`, `Tpred=4s`, `tau=Tpost=Tz*=0.5s`, AdamW, weight decay와 충돌하지 않는 선에서 재현 가능성과 기존 codebase 적합성을 우선해 선택한 값이다. 현재 학습 recipe는 64 epochs이며, LR은 H100 x3x2 effective batch size 168에 맞춰 sqrt scaling을 적용한다. Scheduler는 4 epoch linear warmup 뒤 epoch index 64에서 multiplier 0.0이 되도록 계산한다. 학습 중 validation은 비용을 줄이기 위해 16 epoch마다 실행하고, `scorer_scene_num=1680`으로 world size와 validation batch size가 바뀌어도 scorer 대상 scene 수가 같은 규모가 되도록 맞춘다.
 Loss 로그에서 `loss_mixture`는 top-M 후보들의 scorer probability와 front-weighted trajectory likelihood를 합친 주 loss이고, `loss_aux_ce`는 앞 0.5초 anchor 거리 기반 soft anchor CE다. `soft_anchor_entropy`, `soft_anchor_top1_prob`, `soft_anchor_temperature`는 soft label이 hard one-hot으로 붕괴하거나 과하게 퍼지지 않는지 확인하기 위한 진단값이다. `top_m_error`와 `top_m_nll`은 후보 set 품질과 decoder 보정 품질을 확인하기 위한 진단값이다. objective가 바뀌었으므로 기존 hard `z*` 또는 candidate-set CE checkpoint에서 resume하지 말고 scratch pretrain을 사용한다.
