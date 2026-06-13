@@ -56,8 +56,10 @@ class TokenProcessor(torch.nn.Module):
         self.shift = 5
 
         module_dir = os.path.dirname(__file__)
-        self.init_agent_token(os.path.join(module_dir, agent_token_file))
-        self.init_map_token(os.path.join(module_dir, map_token_file))
+        self.agent_token_file_path = os.path.join(module_dir, agent_token_file)
+        self.map_token_file_path = os.path.join(module_dir, map_token_file)
+        self.init_agent_token(self.agent_token_file_path)
+        self.init_map_token(self.map_token_file_path)
         self.n_token_agent = self.agent_token_all_veh.shape[0]
 
     @torch.no_grad()

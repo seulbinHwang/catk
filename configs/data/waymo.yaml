@@ -24,3 +24,5 @@ train_memory_balance_current_valid_agent_weight: 1.0
 train_memory_balance_valid_agent_step_weight: 0.0
 train_memory_balance_map_weight: 0.02
 train_memory_balance_seed: 0
+train_flow_target_sidecar_root: auto
+train_flow_target_sidecar_required: true
