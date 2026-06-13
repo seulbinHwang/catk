@@ -262,6 +262,43 @@ def _configure_checkpoint_monitor(cfg: DictConfig, model: LightningModule) -> No
     )
 
 
+def _configure_flow_target_sidecar_preload(
+    cfg: DictConfig,
+    datamodule: LightningDataModule,
+    model: LightningModule,
+) -> None:
+    """Keep model-side sidecar reads paired with DataLoader-worker preload."""
+
+    token_processor = getattr(model, "token_processor", None)
+    if token_processor is None:
+        return
+    sidecar_dir = str(getattr(token_processor, "flow_target_sidecar_dir", "") or "")
+    sidecar_read = bool(getattr(token_processor, "flow_target_sidecar_read", False))
+    if not sidecar_read or not sidecar_dir:
+        return
+    if not hasattr(token_processor, "_flow_target_sidecar_root"):
+        return
+
+    sidecar_root = str(token_processor._flow_target_sidecar_root())
+    sidecar_required = bool(getattr(token_processor, "flow_target_sidecar_required", False))
+    configure_preload = getattr(datamodule, "configure_train_flow_target_sidecar", None)
+    if configure_preload is None:
+        log.warning(
+            "Flow target sidecar read is enabled, but datamodule does not support "
+            "DataLoader preload; training will fall back to model-side sidecar reads."
+        )
+        return
+
+    configure_preload(sidecar_root, required=sidecar_required)
+    with open_dict(cfg.data):
+        cfg.data.train_flow_target_sidecar_root = sidecar_root
+        cfg.data.train_flow_target_sidecar_required = sidecar_required
+    log.info(
+        "Enabled DataLoader flow target sidecar preload: "
+        f"root={sidecar_root}, required={sidecar_required}"
+    )
+
+
 def run(cfg: DictConfig) -> None:
     if cfg.get("seed"):
         L.seed_everything(cfg.seed, workers=True)
@@ -283,6 +320,7 @@ def run(cfg: DictConfig) -> None:
 
     log.info(f"Instantiating model <{cfg.model._target_}>")
     model: LightningModule = hydra.utils.instantiate(cfg.model, _recursive_=False)
+    _configure_flow_target_sidecar_preload(cfg, datamodule, model)
 
     _configure_checkpoint_monitor(cfg, model)
 

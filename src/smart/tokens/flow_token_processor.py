@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+import hashlib
+import json
+from pathlib import Path
+from typing import Any, Dict, List, Sequence, Tuple
 
 import torch
 from torch import Tensor
@@ -24,6 +27,7 @@ from src.smart.utils import transform_to_local, validate_flow_window_steps
 
 FLOW_CONTEXT_TOKEN_COUNT = 18
 FLOW_TRAIN_ANCHOR_COUNT = 16
+FLOW_TARGET_SIDECAR_ROW_ORDER_ANCHOR_MAJOR = "anchor_major_v1"
 
 
 class FlowTokenProcessor(TokenProcessor):
@@ -45,6 +49,10 @@ class FlowTokenProcessor(TokenProcessor):
         control_vehicle_no_slip_point_ratio: float = DEFAULT_CONTROL_VEHICLE_NO_SLIP_POINT_RATIO,
         control_cyclist_no_slip_point_ratio: float = DEFAULT_CONTROL_CYCLIST_NO_SLIP_POINT_RATIO,
         control_round_trip_max_position_error_m: float = DEFAULT_CONTROL_ROUND_TRIP_MAX_POSITION_ERROR_M,
+        flow_target_sidecar_dir: str | None = None,
+        flow_target_sidecar_read: bool = True,
+        flow_target_sidecar_write: bool = False,
+        flow_target_sidecar_required: bool = False,
     ) -> None:
         super().__init__(
             map_token_file=map_token_file,
@@ -88,6 +96,13 @@ class FlowTokenProcessor(TokenProcessor):
                 f"got {self.control_round_trip_max_position_error_m}."
             )
         self.flow_target_dim = CONTROL_FLOW_DIM if self.use_kinematic_control_flow else POSE_FLOW_DIM
+        self.flow_target_sidecar_dir = (
+            str(flow_target_sidecar_dir) if flow_target_sidecar_dir not in (None, "") else ""
+        )
+        self.flow_target_sidecar_read = bool(flow_target_sidecar_read)
+        self.flow_target_sidecar_write = bool(flow_target_sidecar_write)
+        self.flow_target_sidecar_required = bool(flow_target_sidecar_required)
+        self._flow_target_sidecar_fingerprint = self._build_flow_target_sidecar_fingerprint()
 
     def forward(self, data: HeteroData) -> Tuple[Dict[str, Tensor], Dict[str, Tensor]]:
         """지도 토큰과 에이전트 토큰을 만들고 flow 목표를 붙입니다.
@@ -99,6 +114,21 @@ class FlowTokenProcessor(TokenProcessor):
             Tuple[Dict[str, Tensor], Dict[str, Tensor]]:
                 지도 토큰 사전과 에이전트 토큰 사전입니다.
         """
+        if self.training and self._flow_target_sidecar_read_enabled():
+            loaded = self._load_training_sidecar_batch(data)
+            if loaded is not None:
+                return loaded
+
+        tokenized_map, tokenized_agent = self._compute_online(data)
+        if self.training and self._flow_target_sidecar_write_enabled() and self._is_single_graph_data(data):
+            self._write_training_sidecar_from_tokenized(
+                data=data,
+                tokenized_map=tokenized_map,
+                tokenized_agent=tokenized_agent,
+            )
+        return tokenized_map, tokenized_agent
+
+    def _compute_online(self, data: HeteroData) -> Tuple[Dict[str, Tensor], Dict[str, Tensor]]:
         tokenized_map = self.tokenize_map(data)
         tokenized_agent, processed_agent = self.tokenize_agent(
             data,
@@ -110,6 +140,485 @@ class FlowTokenProcessor(TokenProcessor):
             processed_agent=processed_agent,
         )
         return tokenized_map, tokenized_agent
+
+    def _flow_target_sidecar_read_enabled(self) -> bool:
+        return bool(self.flow_target_sidecar_dir and self.flow_target_sidecar_read)
+
+    def _flow_target_sidecar_write_enabled(self) -> bool:
+        return bool(self.flow_target_sidecar_dir and self.flow_target_sidecar_write)
+
+    def _file_sha1(self, path: str) -> str:
+        digest = hashlib.sha1()
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _build_flow_target_sidecar_fingerprint(self) -> str:
+        payload = {
+            "version": 1,
+            "map_token_sha1": self._file_sha1(self.map_token_file_path),
+            "agent_token_sha1": self._file_sha1(self.agent_token_file_path),
+            "shift": int(self.shift),
+            "flow_window_steps": int(self.flow_window_steps),
+            "flow_train_anchor_count": int(FLOW_TRAIN_ANCHOR_COUNT),
+            "flow_context_token_count": int(FLOW_CONTEXT_TOKEN_COUNT),
+            "use_prefix_valid_future_loss_mask": bool(self.use_prefix_valid_future_loss_mask),
+            "use_kinematic_control_flow": bool(self.use_kinematic_control_flow),
+            "use_holonomic_model_only": bool(self.use_holonomic_model_only),
+            "use_rolling_supervision": bool(self.use_rolling_supervision),
+            "control_pos_scale_m": float(self.control_pos_scale_m),
+            "control_vehicle_yaw_scale_rad": (
+                None
+                if self.control_vehicle_yaw_scale_rad is None
+                else float(self.control_vehicle_yaw_scale_rad)
+            ),
+            "control_pedestrian_yaw_scale_rad": (
+                None
+                if self.control_pedestrian_yaw_scale_rad is None
+                else float(self.control_pedestrian_yaw_scale_rad)
+            ),
+            "control_cyclist_yaw_scale_rad": (
+                None
+                if self.control_cyclist_yaw_scale_rad is None
+                else float(self.control_cyclist_yaw_scale_rad)
+            ),
+            "control_vehicle_no_slip_point_ratio": float(self.control_vehicle_no_slip_point_ratio),
+            "control_cyclist_no_slip_point_ratio": float(self.control_cyclist_no_slip_point_ratio),
+            "control_round_trip_max_position_error_m": float(
+                self.control_round_trip_max_position_error_m
+            ),
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha1(encoded).hexdigest()[:16]
+
+    def _flow_target_sidecar_root(self) -> Path:
+        return Path(self.flow_target_sidecar_dir) / self._flow_target_sidecar_fingerprint
+
+    def _scenario_ids_from_data(self, data: HeteroData) -> List[str]:
+        scenario_ids = getattr(data, "scenario_id", None)
+        if scenario_ids is None and isinstance(data, dict):
+            scenario_ids = data.get("scenario_id")
+        if scenario_ids is None:
+            raise KeyError("flow target sidecar requires data.scenario_id.")
+        if isinstance(scenario_ids, str):
+            return [scenario_ids]
+        if isinstance(scenario_ids, Sequence):
+            return [str(item) for item in scenario_ids]
+        return [str(scenario_ids)]
+
+    def _sidecar_path_for_scenario(self, scenario_id: str) -> Path:
+        safe_hash = hashlib.sha1(str(scenario_id).encode("utf-8")).hexdigest()
+        return self._flow_target_sidecar_root() / f"{safe_hash}.pt"
+
+    def _is_single_graph_data(self, data: HeteroData) -> bool:
+        try:
+            return len(self._scenario_ids_from_data(data)) == 1
+        except Exception:
+            return int(getattr(data, "num_graphs", 1) or 1) == 1
+
+    def _metadata_for_sidecar(self, scenario_id: str) -> Dict[str, Any]:
+        return {
+            "version": 1,
+            "scenario_id": str(scenario_id),
+            "fingerprint": self._flow_target_sidecar_fingerprint,
+        }
+
+    @staticmethod
+    def _cpu_detach_tree(value: Any) -> Any:
+        if isinstance(value, Tensor):
+            return value.detach().cpu().contiguous()
+        if isinstance(value, dict):
+            return {key: FlowTokenProcessor._cpu_detach_tree(item) for key, item in value.items()}
+        return value
+
+    def _training_sidecar_payload(
+        self,
+        *,
+        scenario_id: str,
+        tokenized_map: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+    ) -> Dict[str, Any]:
+        map_keys = [
+            "position",
+            "orientation",
+            "token_idx",
+            "type",
+            "pl_type",
+            "light_type",
+        ]
+        agent_keys = [
+            "type",
+            "shape",
+            "ego_mask",
+            "token_agent_shape",
+            "ctx_sampled_idx",
+            "ctx_sampled_pos",
+            "ctx_sampled_heading",
+            "ctx_valid",
+            "flow_train_mask",
+            "flow_train_clean_norm",
+            "flow_train_clean_metric_norm",
+            "flow_train_loss_mask",
+            "flow_train_agent_type",
+            "flow_train_agent_length",
+        ]
+        return {
+            "metadata": self._metadata_for_sidecar(scenario_id),
+            "map": {
+                key: self._cpu_detach_tree(tokenized_map[key])
+                for key in map_keys
+                if key in tokenized_map
+            },
+            "agent": {
+                key: self._cpu_detach_tree(tokenized_agent[key])
+                for key in agent_keys
+                if key in tokenized_agent
+            },
+        }
+
+    def _write_training_sidecar_from_tokenized(
+        self,
+        *,
+        data: HeteroData,
+        tokenized_map: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+    ) -> None:
+        scenario_ids = self._scenario_ids_from_data(data)
+        if len(scenario_ids) != 1:
+            return
+        scenario_id = scenario_ids[0]
+        path = self._sidecar_path_for_scenario(scenario_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = self._training_sidecar_payload(
+            scenario_id=scenario_id,
+            tokenized_map=tokenized_map,
+            tokenized_agent=tokenized_agent,
+        )
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        torch.save(payload, tmp_path)
+        tmp_path.replace(path)
+
+    def _load_one_training_sidecar(self, scenario_id: str) -> Dict[str, Any] | None:
+        path = self._sidecar_path_for_scenario(scenario_id)
+        if not path.exists():
+            if self.flow_target_sidecar_required:
+                raise FileNotFoundError(f"Missing flow target sidecar: {path}")
+            return None
+        try:
+            payload = torch.load(path, map_location="cpu", weights_only=True)
+        except TypeError:
+            payload = torch.load(path, map_location="cpu")
+        metadata = payload.get("metadata", {})
+        if metadata.get("fingerprint") != self._flow_target_sidecar_fingerprint:
+            if self.flow_target_sidecar_required:
+                raise ValueError(
+                    "Flow target sidecar fingerprint mismatch for "
+                    f"{scenario_id}: expected={self._flow_target_sidecar_fingerprint}, "
+                    f"actual={metadata.get('fingerprint')}"
+                )
+            return None
+        if str(metadata.get("scenario_id")) != str(scenario_id):
+            if self.flow_target_sidecar_required:
+                raise ValueError(
+                    f"Flow target sidecar scenario mismatch: expected={scenario_id}, "
+                    f"actual={metadata.get('scenario_id')}"
+                )
+            return None
+        return payload
+
+    @staticmethod
+    def _to_device(value: Tensor, device: torch.device) -> Tensor:
+        return value.to(device=device, non_blocking=True)
+
+    def _load_training_sidecar_batch(
+        self,
+        data: HeteroData,
+    ) -> Tuple[Dict[str, Tensor], Dict[str, Tensor]] | None:
+        if "train_mask" in data["agent"]:
+            if self.flow_target_sidecar_required:
+                raise RuntimeError(
+                    "Flow target sidecar is disabled when data contains train_mask, "
+                    "because random train target selection would no longer be equivalent."
+                )
+            return None
+        preloaded = self._load_preloaded_training_sidecar_batch(data)
+        if preloaded is not None:
+            return preloaded
+        scenario_ids = self._scenario_ids_from_data(data)
+        payloads: List[Dict[str, Any]] = []
+        for scenario_id in scenario_ids:
+            payload = self._load_one_training_sidecar(scenario_id)
+            if payload is None:
+                return None
+            payloads.append(payload)
+        if len(payloads) == 0:
+            return None
+        device = data["agent"]["position"].device
+        return self._collate_training_sidecars(payloads=payloads, device=device)
+
+    @staticmethod
+    def _split_tensor_by_counts(value: Tensor, counts: List[int]) -> List[Tensor]:
+        chunks: List[Tensor] = []
+        cursor = 0
+        for count in counts:
+            next_cursor = cursor + int(count)
+            chunks.append(value[cursor:next_cursor])
+            cursor = next_cursor
+        if cursor != int(value.shape[0]):
+            raise ValueError(
+                f"Sidecar split count mismatch: expected {cursor}, got {int(value.shape[0])}."
+            )
+        return chunks
+
+    @staticmethod
+    def _counts_from_batch(batch: Tensor, num_graphs: int) -> List[int]:
+        if batch.numel() == 0:
+            return [0 for _ in range(num_graphs)]
+        counts = torch.bincount(batch.detach().cpu(), minlength=num_graphs)
+        return [int(item) for item in counts.tolist()]
+
+    def _load_preloaded_training_sidecar_batch(
+        self,
+        data: HeteroData,
+    ) -> Tuple[Dict[str, Tensor], Dict[str, Tensor]] | None:
+        payload = getattr(data, "flow_target_sidecar_payload", None)
+        if payload is None:
+            return None
+        scenario_ids = self._scenario_ids_from_data(data)
+        num_graphs = len(scenario_ids)
+        if num_graphs <= 0:
+            return None
+
+        metadata = payload.get("metadata", {})
+        fingerprints = metadata.get("fingerprint")
+        if isinstance(fingerprints, str):
+            fingerprints = [fingerprints]
+        if fingerprints is not None:
+            if len(fingerprints) != num_graphs or any(
+                str(item) != self._flow_target_sidecar_fingerprint for item in fingerprints
+            ):
+                if self.flow_target_sidecar_required:
+                    raise ValueError(
+                        "Preloaded flow target sidecar fingerprint mismatch: "
+                        f"expected={self._flow_target_sidecar_fingerprint}, actual={fingerprints}"
+                    )
+                return None
+
+        metadata_scenario_ids = metadata.get("scenario_id")
+        if isinstance(metadata_scenario_ids, str):
+            metadata_scenario_ids = [metadata_scenario_ids]
+        if metadata_scenario_ids is not None:
+            if len(metadata_scenario_ids) != num_graphs or any(
+                str(actual) != str(expected)
+                for actual, expected in zip(metadata_scenario_ids, scenario_ids)
+            ):
+                if self.flow_target_sidecar_required:
+                    raise ValueError(
+                        "Preloaded flow target sidecar scenario mismatch: "
+                        f"expected={scenario_ids}, actual={metadata_scenario_ids}"
+                    )
+                return None
+
+        map_payload = payload["map"]
+        agent_payload = payload["agent"]
+        map_keys = ["position", "orientation", "token_idx", "type", "pl_type", "light_type"]
+        per_agent_keys = [
+            "type",
+            "shape",
+            "ego_mask",
+            "token_agent_shape",
+            "ctx_sampled_idx",
+            "ctx_sampled_pos",
+            "ctx_sampled_heading",
+            "ctx_valid",
+            "flow_train_mask",
+        ]
+        row_keys = [
+            "flow_train_clean_norm",
+            "flow_train_clean_metric_norm",
+            "flow_train_loss_mask",
+            "flow_train_agent_type",
+            "flow_train_agent_length",
+        ]
+
+        device = data["agent"]["position"].device
+        tokenized_map: Dict[str, Tensor] = {
+            key: self._to_device(map_payload[key], device)
+            for key in map_keys
+        }
+        tokenized_map["batch"] = data["pt_token"]["batch"]
+        tokenized_map["token_traj_src"] = self.map_token_traj_src
+
+        tokenized_agent: Dict[str, Tensor] = {
+            key: self._to_device(agent_payload[key], device)
+            for key in per_agent_keys
+        }
+        tokenized_agent["batch"] = data["agent"]["batch"]
+        tokenized_agent["num_graphs"] = num_graphs
+        for k in ["veh", "ped", "cyc"]:
+            tokenized_agent[f"trajectory_token_{k}"] = getattr(
+                self, f"agent_token_all_{k}"
+            ).flatten(1, 3)
+            tokenized_agent[f"token_bank_all_{k}"] = getattr(self, f"agent_token_all_{k}")
+
+        expected_row_count = int(tokenized_agent["flow_train_mask"].long().sum().item())
+        if metadata.get("flow_row_order") == FLOW_TARGET_SIDECAR_ROW_ORDER_ANCHOR_MAJOR:
+            for key in row_keys:
+                value = self._to_device(agent_payload[key], device)
+                if expected_row_count != int(value.shape[0]):
+                    raise ValueError(
+                        f"Preloaded flow target sidecar row count mismatch for {key}: "
+                        f"mask_count={expected_row_count}, value_rows={int(value.shape[0])}."
+                    )
+                tokenized_agent[key] = value
+            return tokenized_map, tokenized_agent
+
+        row_slices: List[List[tuple[int, int]]] = []
+        cursor = 0
+        flow_train_mask = tokenized_agent["flow_train_mask"]
+        agent_batch = tokenized_agent["batch"]
+        num_anchor = int(flow_train_mask.shape[1])
+        for sample_idx in range(num_graphs):
+            sample_counts = flow_train_mask[agent_batch == sample_idx].long().sum(dim=0)
+            sample_slices: List[tuple[int, int]] = []
+            for anchor_idx in range(num_anchor):
+                count = int(sample_counts[anchor_idx].item())
+                next_cursor = cursor + count
+                sample_slices.append((cursor, next_cursor))
+                cursor = next_cursor
+            row_slices.append(sample_slices)
+
+        for key in row_keys:
+            value = self._to_device(agent_payload[key], device)
+            if cursor != int(value.shape[0]):
+                raise ValueError(
+                    f"Preloaded flow target sidecar row count mismatch for {key}: "
+                    f"mask_count={cursor}, value_rows={int(value.shape[0])}."
+                )
+            ordered_parts: List[Tensor] = []
+            for anchor_idx in range(num_anchor):
+                for sample_idx in range(num_graphs):
+                    start, end = row_slices[sample_idx][anchor_idx]
+                    if end > start:
+                        ordered_parts.append(value[start:end])
+            if ordered_parts:
+                tokenized_agent[key] = torch.cat(ordered_parts, dim=0)
+            else:
+                tokenized_agent[key] = value.new_zeros((0,) + tuple(value.shape[1:]))
+        return tokenized_map, tokenized_agent
+
+    def _collate_training_sidecars(
+        self,
+        *,
+        payloads: List[Dict[str, Any]],
+        device: torch.device,
+    ) -> Tuple[Dict[str, Tensor], Dict[str, Tensor]]:
+        tokenized_map = self._collate_sidecar_maps(payloads=payloads, device=device)
+        tokenized_agent = self._collate_sidecar_agents(payloads=payloads, device=device)
+        return tokenized_map, tokenized_agent
+
+    def _collate_sidecar_maps(
+        self,
+        *,
+        payloads: List[Dict[str, Any]],
+        device: torch.device,
+    ) -> Dict[str, Tensor]:
+        map_payloads = [payload["map"] for payload in payloads]
+        map_keys = ["position", "orientation", "token_idx", "type", "pl_type", "light_type"]
+        tokenized_map = {
+            key: torch.cat([self._to_device(item[key], device) for item in map_payloads], dim=0)
+            for key in map_keys
+        }
+        batch_parts = []
+        for scenario_idx, item in enumerate(map_payloads):
+            count = int(item["position"].shape[0])
+            batch_parts.append(torch.full((count,), scenario_idx, device=device, dtype=torch.long))
+        tokenized_map["batch"] = torch.cat(batch_parts, dim=0)
+        tokenized_map["token_traj_src"] = self.map_token_traj_src
+        return tokenized_map
+
+    def _split_sidecar_flow_rows(self, agent_payload: Dict[str, Tensor], key: str) -> List[Tensor]:
+        flow_train_mask = agent_payload["flow_train_mask"]
+        counts = flow_train_mask.long().sum(dim=0).tolist()
+        value = agent_payload[key]
+        chunks: List[Tensor] = []
+        cursor = 0
+        for count in counts:
+            next_cursor = cursor + int(count)
+            chunks.append(value[cursor:next_cursor])
+            cursor = next_cursor
+        if cursor != int(value.shape[0]):
+            raise ValueError(
+                f"Flow target sidecar row count mismatch for {key}: "
+                f"mask_count={cursor}, value_rows={int(value.shape[0])}."
+            )
+        return chunks
+
+    def _collate_sidecar_agents(
+        self,
+        *,
+        payloads: List[Dict[str, Any]],
+        device: torch.device,
+    ) -> Dict[str, Tensor]:
+        agent_payloads = [payload["agent"] for payload in payloads]
+        per_agent_keys = [
+            "type",
+            "shape",
+            "ego_mask",
+            "token_agent_shape",
+            "ctx_sampled_idx",
+            "ctx_sampled_pos",
+            "ctx_sampled_heading",
+            "ctx_valid",
+            "flow_train_mask",
+        ]
+        tokenized_agent: Dict[str, Tensor] = {
+            key: torch.cat([self._to_device(item[key], device) for item in agent_payloads], dim=0)
+            for key in per_agent_keys
+        }
+        batch_parts = []
+        for scenario_idx, item in enumerate(agent_payloads):
+            count = int(item["type"].shape[0])
+            batch_parts.append(torch.full((count,), scenario_idx, device=device, dtype=torch.long))
+        tokenized_agent["batch"] = torch.cat(batch_parts, dim=0)
+        tokenized_agent["num_graphs"] = len(payloads)
+        for k in ["veh", "ped", "cyc"]:
+            tokenized_agent[f"trajectory_token_{k}"] = getattr(
+                self, f"agent_token_all_{k}"
+            ).flatten(1, 3)
+            tokenized_agent[f"token_bank_all_{k}"] = getattr(self, f"agent_token_all_{k}")
+
+        row_keys = [
+            "flow_train_clean_norm",
+            "flow_train_clean_metric_norm",
+            "flow_train_loss_mask",
+            "flow_train_agent_type",
+            "flow_train_agent_length",
+        ]
+        split_rows = {
+            key: [self._split_sidecar_flow_rows(item, key) for item in agent_payloads]
+            for key in row_keys
+        }
+        num_anchor = int(tokenized_agent["flow_train_mask"].shape[1])
+        for key in row_keys:
+            ordered_parts: List[Tensor] = []
+            for anchor_idx in range(num_anchor):
+                for sample_idx in range(len(agent_payloads)):
+                    part = split_rows[key][sample_idx][anchor_idx]
+                    if int(part.shape[0]) > 0:
+                        ordered_parts.append(self._to_device(part, device))
+            if ordered_parts:
+                tokenized_agent[key] = torch.cat(ordered_parts, dim=0)
+            else:
+                example = agent_payloads[0][key]
+                shape = (0,) + tuple(example.shape[1:])
+                tokenized_agent[key] = torch.zeros(
+                    shape,
+                    device=device,
+                    dtype=example.dtype,
+                )
+        return tokenized_agent
 
     def _build_flow_targets(
         self,

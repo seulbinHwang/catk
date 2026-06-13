@@ -125,6 +125,12 @@ class SMARTFlow(LightningModule):
         self.log_epoch = -1
         self.val_open_loop = model_config.val_open_loop
         self.val_closed_loop = model_config.val_closed_loop
+        self.train_open_loop_metrics = bool(
+            getattr(model_config, "train_open_loop_metrics", True)
+        )
+        self.skip_empty_open_loop_optimizer_guard = bool(
+            getattr(model_config, "skip_empty_open_loop_optimizer_guard", False)
+        )
         self.token_processor = FlowTokenProcessor(**model_config.token_processor)
         self.use_kinematic_control_flow = bool(self.token_processor.use_kinematic_control_flow)
         decoder_config = _build_decoder_config_from_token_processor(
@@ -960,11 +966,19 @@ class SMARTFlow(LightningModule):
         values = [
             total_loss.detach(),
             fm_loss.detach(),
-            open_metric_dict[self.open_metric_names["ade"]].detach(),
-            open_metric_dict[self.open_metric_names["fde"]].detach(),
-            open_metric_dict[self.open_metric_names["yaw_ade"]].detach(),
-            open_metric_dict[self.open_metric_names["yaw_fde"]].detach(),
         ]
+        if open_metric_dict:
+            values.extend(
+                [
+                    open_metric_dict[self.open_metric_names["ade"]].detach(),
+                    open_metric_dict[self.open_metric_names["fde"]].detach(),
+                    open_metric_dict[self.open_metric_names["yaw_ade"]].detach(),
+                    open_metric_dict[self.open_metric_names["yaw_fde"]].detach(),
+                ]
+            )
+        else:
+            zero = total_loss.detach().new_zeros(())
+            values.extend([zero, zero, zero, zero])
         value_tensor = torch.stack(
             [
                 value.to(
@@ -975,6 +989,8 @@ class SMARTFlow(LightningModule):
             ]
         )
         weight_tensor = value_tensor.new_full(value_tensor.shape, weight)
+        if not open_metric_dict:
+            weight_tensor[2:] = 0.0
         self._train_open_epoch_metric_sums += value_tensor * weight_tensor
         self._train_open_epoch_metric_counts += weight_tensor
 
@@ -1059,6 +1075,9 @@ class SMARTFlow(LightningModule):
             )
         else:
             loss = self._build_trainable_connected_zero_loss(zero_loss_module or self.encoder)
+        if not self.train_open_loop_metrics and self.training:
+            sample_count = int(pred_dict["flow_clean_norm"].shape[0])
+            return loss, {}, sample_count, has_loss_targets
         metric_pred_clean_norm = pred_dict.get(
             "flow_pred_clean_metric_norm",
             pred_dict["flow_pred_clean_norm"],
@@ -3467,6 +3486,7 @@ class SMARTFlow(LightningModule):
             tokenized_map,
             tokenized_agent,
             anchor_mask_key="flow_train_mask",
+            compute_metric_outputs=self.train_open_loop_metrics,
         )
         fm_loss, open_metric_dict, sample_count, has_open_loop_targets = self._open_loop_denoise_metrics(
             pred,
@@ -3561,7 +3581,7 @@ class SMARTFlow(LightningModule):
         self.log("train/sf_anchor_weight", float(self.self_forced_anchor_weight), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/sf_distribution_matching_enabled", 0.0, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/sf_pose_projected_dmd", 0.0, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
-        if open_metric_dict is not None:
+        if open_metric_dict:
             self.log(
                 f"train/{self.train_open_metric_names['ade']}",
                 open_metric_dict[self.open_metric_names["ade"]].detach(),
@@ -3619,6 +3639,7 @@ class SMARTFlow(LightningModule):
                 tokenized_map_train,
                 tokenized_agent_train,
                 anchor_mask_key="flow_train_mask",
+                compute_metric_outputs=self.train_open_loop_metrics,
             )
             fm_loss, open_metric_dict, _, has_anchor_fm_targets = self._open_loop_denoise_metrics(
                 pred,
@@ -3801,7 +3822,7 @@ class SMARTFlow(LightningModule):
                 sync_dist=True,
                 batch_size=1,
             )
-        if open_metric_dict is not None:
+        if open_metric_dict:
             self.log(
                 f"train/{self.train_open_metric_names['ade']}",
                 open_metric_dict[self.open_metric_names["ade"]].detach(),
@@ -3863,6 +3884,7 @@ flow_clean_norm [n_valid_anchor, 20, 4]
             tokenized_map,
             tokenized_agent,
             anchor_mask_key="flow_train_mask",
+            compute_metric_outputs=self.train_open_loop_metrics,
         )
         """
 fm_loss: 
@@ -3889,16 +3911,43 @@ open_metric_dict:
             open_metric_dict=open_metric_dict,
             sample_count=sample_count,
         )
+        self._record_automatic_open_loop_targets(
+            has_open_loop_targets=has_open_loop_targets,
+            loss=total_loss,
+        )
+        return total_loss
+
+    def _record_automatic_open_loop_targets(
+        self,
+        *,
+        has_open_loop_targets: bool,
+        loss: Tensor,
+    ) -> None:
+        """Record automatic-optimization target coverage, unless pre-verified."""
+
+        if self.skip_empty_open_loop_optimizer_guard:
+            if not has_open_loop_targets:
+                raise RuntimeError(
+                    "skip_empty_open_loop_optimizer_guard=true requires every local "
+                    "open-loop train batch to contain at least one loss target. "
+                    "Run scripts/verify_flow_target_coverage.py on the selected "
+                    "train split, or set the guard flag back to false."
+                )
+            return
         has_open_loop_targets_pending = self._start_distributed_bool_any(
             has_open_loop_targets,
-            device=total_loss.device,
+            device=loss.device,
         )
         self._automatic_open_loop_has_target_pending.append(has_open_loop_targets_pending)
-        return total_loss
 
     def on_before_optimizer_step(self, optimizer) -> None:
         """DDP 전체에 target이 없는 automatic optimization step의 업데이트를 막습니다."""
         if not bool(getattr(self, "automatic_optimization", True)):
+            return
+        if bool(getattr(self, "skip_empty_open_loop_optimizer_guard", False)):
+            self._automatic_open_loop_has_target_pending.clear()
+            self._automatic_open_loop_has_target_since_step = False
+            self._skip_next_automatic_optimizer_step = False
             return
         has_open_loop_targets_global = bool(self._automatic_open_loop_has_target_since_step)
         if self._automatic_open_loop_has_target_pending:
