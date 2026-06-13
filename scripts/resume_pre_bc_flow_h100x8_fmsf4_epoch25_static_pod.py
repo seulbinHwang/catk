@@ -30,6 +30,7 @@ DEFAULT_BRANCH = "semi_control_stable_2"
 DEFAULT_CACHE_ROOT = "/workspace/womd_v1_3/SMART_cache"
 DEFAULT_LOG_DIR = "/mnt/nuplan/projects/catk/logs"
 DEFAULT_EXPERIMENT = "pre_bc_flow_2x4_h100"
+DEFAULT_FLOW_TARGET_SIDECAR_DIR = "/workspace/womd_v1_3/SMART_cache/flow_target_sidecars"
 DEFAULT_TASK_NAME = "flow_open_loop_pretrain_freq64_flow80_h100x8_fmsf4_bs18_lr6p5e-4_warm5_val8_membal"
 DEFAULT_CKPT_PATH = (
     "/mnt/nuplan/projects/catk/logs/"
@@ -87,6 +88,16 @@ def render_env(args: argparse.Namespace) -> str:
         export_line("LEARNING_RATE", args.learning_rate),
         export_line("LR_WARMUP_STEPS", args.lr_warmup_steps),
         export_line("EXPECTED_CKPT_EPOCH", args.expected_ckpt_epoch),
+        export_line("FLOW_TARGET_SIDECAR_DIR", args.flow_target_sidecar_dir),
+        export_line("FLOW_TARGET_SIDECAR_READ", str(args.flow_target_sidecar_read).lower()),
+        export_line("FLOW_TARGET_SIDECAR_REQUIRED", str(args.flow_target_sidecar_required).lower()),
+        export_line("TRAIN_OPEN_LOOP_METRICS", str(args.train_open_loop_metrics).lower()),
+        export_line(
+            "SKIP_EMPTY_OPEN_LOOP_OPTIMIZER_GUARD",
+            str(args.skip_empty_open_loop_optimizer_guard).lower(),
+        ),
+        export_line("SIDECAR_PREBUILD", str(args.sidecar_prebuild).lower()),
+        export_line("SIDECAR_PREBUILD_MAX_SAMPLES", args.sidecar_prebuild_max_samples),
     ]
     if args.extra_hydra_overrides:
         lines.append(export_line("CATK_EXTRA_OVERRIDES", args.extra_hydra_overrides))
@@ -135,6 +146,7 @@ echo "[resume-h100x8-fmsf4] started at $(date '+%F %T')"
 echo "[resume-h100x8-fmsf4] git=$(git rev-parse HEAD 2>/dev/null || true)"
 echo "[resume-h100x8-fmsf4] experiment=${{EXPERIMENT}} ckpt_path=${{CKPT_PATH}}"
 echo "[resume-h100x8-fmsf4] bs=${{TRAIN_BATCH_SIZE}} lr=${{LEARNING_RATE}} warmup=${{LR_WARMUP_STEPS}} max_epochs=${{MAX_EPOCHS}}"
+echo "[resume-h100x8-fmsf4] sidecar_dir=${{FLOW_TARGET_SIDECAR_DIR}} read=${{FLOW_TARGET_SIDECAR_READ}} required=${{FLOW_TARGET_SIDECAR_REQUIRED}} prebuild=${{SIDECAR_PREBUILD}}"
 echo "[resume-h100x8-fmsf4] run_root=${{RUN_ROOT}}"
 echo "[resume-h100x8-fmsf4] attempt_log=${{ATTEMPT_LOG}}"
 
@@ -159,6 +171,57 @@ if epoch != expected_epoch:
     sys.exit(2)
 PY
 
+if [[ "${{SIDECAR_PREBUILD}}" == "true" ]]; then
+  echo "[resume-h100x8-fmsf4] prebuilding flow target sidecars dir=${{FLOW_TARGET_SIDECAR_DIR}} max_samples=${{SIDECAR_PREBUILD_MAX_SAMPLES}} nproc=${{NPROC_PER_NODE}}"
+  sidecar_log="$RUN_ROOT/$(hostname).sidecar_prebuild.log"
+  torchrun --standalone --nproc_per_node="${{NPROC_PER_NODE}}" scripts/build_flow_target_sidecars.py \
+    --cache-root "$CACHE_ROOT" \
+    --sidecar-dir "$FLOW_TARGET_SIDECAR_DIR" \
+    --experiment "$EXPERIMENT" \
+    --device auto \
+    --max-samples "$SIDECAR_PREBUILD_MAX_SAMPLES" \
+    --status-every 500 \
+    "model.model_config.train_open_loop_metrics=${{TRAIN_OPEN_LOOP_METRICS}}" \
+    2>&1 | tee "$sidecar_log"
+  sidecar_status="${{PIPESTATUS[0]}}"
+  echo "[resume-h100x8-fmsf4] sidecar prebuild exited with status $sidecar_status log=$sidecar_log"
+  if (( sidecar_status != 0 )); then
+    exit "$sidecar_status"
+  fi
+fi
+
+FLOW_TARGET_SIDECAR_ROOT=""
+if [[ "${{FLOW_TARGET_SIDECAR_READ}}" == "true" && -n "${{FLOW_TARGET_SIDECAR_DIR}}" ]]; then
+  FLOW_TARGET_SIDECAR_ROOT="$(python - <<'PY'
+import os
+from pathlib import Path
+
+from hydra import compose, initialize_config_dir
+from omegaconf import OmegaConf
+
+from src.smart.tokens.flow_token_processor import FlowTokenProcessor
+
+config_dir = (Path.cwd() / "configs").as_posix()
+with initialize_config_dir(version_base=None, config_dir=config_dir):
+    cfg = compose(
+        config_name="run",
+        overrides=[
+            f"experiment={{os.environ['EXPERIMENT']}}",
+            f"paths.cache_root={{os.environ['CACHE_ROOT']}}",
+            f"model.model_config.token_processor.flow_target_sidecar_dir={{os.environ['FLOW_TARGET_SIDECAR_DIR']}}",
+            "model.model_config.token_processor.flow_target_sidecar_read=true",
+            "model.model_config.token_processor.flow_target_sidecar_write=false",
+        ],
+    )
+processor = FlowTokenProcessor(
+    **OmegaConf.to_container(cfg.model.model_config.token_processor, resolve=True)
+)
+print(processor._flow_target_sidecar_root())
+PY
+)"
+  echo "[resume-h100x8-fmsf4] dataloader sidecar root=${{FLOW_TARGET_SIDECAR_ROOT}}"
+fi
+
 HYDRA_OVERRIDES=(
   "experiment=${{EXPERIMENT}}"
   "action=fit"
@@ -175,8 +238,16 @@ HYDRA_OVERRIDES=(
   "data.val_batch_size=${{VAL_BATCH_SIZE}}"
   "data.test_batch_size=${{TEST_BATCH_SIZE}}"
   "data.train_memory_balanced_batches=${{TRAIN_MEMORY_BALANCED_BATCHES}}"
+  "data.train_flow_target_sidecar_root=${{FLOW_TARGET_SIDECAR_ROOT}}"
+  "data.train_flow_target_sidecar_required=${{FLOW_TARGET_SIDECAR_REQUIRED}}"
   "model.model_config.lr=${{LEARNING_RATE}}"
   "model.model_config.lr_warmup_steps=${{LR_WARMUP_STEPS}}"
+  "model.model_config.train_open_loop_metrics=${{TRAIN_OPEN_LOOP_METRICS}}"
+  "model.model_config.token_processor.flow_target_sidecar_dir=${{FLOW_TARGET_SIDECAR_DIR}}"
+  "model.model_config.token_processor.flow_target_sidecar_read=${{FLOW_TARGET_SIDECAR_READ}}"
+  "model.model_config.token_processor.flow_target_sidecar_write=false"
+  "model.model_config.token_processor.flow_target_sidecar_required=${{FLOW_TARGET_SIDECAR_REQUIRED}}"
+  "model.model_config.skip_empty_open_loop_optimizer_guard=${{SKIP_EMPTY_OPEN_LOOP_OPTIMIZER_GUARD}}"
 )
 if [[ -n "${{CATK_EXTRA_OVERRIDES:-}}" ]]; then
   # shellcheck disable=SC2206
@@ -217,6 +288,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", default="6.5e-4")
     parser.add_argument("--lr-warmup-steps", type=int, default=5)
     parser.add_argument("--expected-ckpt-epoch", type=int, default=24)
+    parser.add_argument("--flow-target-sidecar-dir", default=DEFAULT_FLOW_TARGET_SIDECAR_DIR)
+    parser.add_argument("--flow-target-sidecar-read", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--flow-target-sidecar-required", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--train-open-loop-metrics", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--skip-empty-open-loop-optimizer-guard", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--sidecar-prebuild", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--sidecar-prebuild-max-samples", type=int, default=0)
     parser.add_argument("--cuda-visible-devices", default="0,1,2,3,4,5,6,7")
     parser.add_argument("--nproc-per-node", type=int, default=8)
     parser.add_argument("--use-distributed-sampler", default="false")
