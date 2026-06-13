@@ -819,49 +819,28 @@ class FlowVelocityHead(nn.Module):
 
 
 class PlanFirstResidualVelocityHead(nn.Module):
-    """부드러운 기본 속도에 작은 frame 단위 보정을 더해 최종 속도를 만듭니다."""
+    """Frame velocity를 주 출력으로 쓰고 plan/chunk 경로는 작은 bias로만 더합니다."""
 
-    def __init__(self, flow_dim: int, flow_state_dim: int = 4) -> None:
+    def __init__(
+        self,
+        flow_dim: int,
+        flow_state_dim: int = 4,
+        plan_bias_scale: float = 0.10,
+    ) -> None:
         super().__init__()
         self.flow_state_dim = int(flow_state_dim)
-        self.base_head = nn.Linear(flow_dim, self.flow_state_dim)
-        self.residual_head = FlowVelocityHead(flow_dim=flow_dim, flow_state_dim=self.flow_state_dim)
-
-    def _interpolate_chunk_base(
-        self,
-        chunk_velocity: torch.Tensor,
-        num_steps: int,
-    ) -> torch.Tensor:
-        """묶음 단위 기본 속도를 0.1초 frame 단위로 부드럽게 펼칩니다.
-
-        Args:
-            chunk_velocity: 0.5초 묶음별 기본 속도입니다.
-                shape은 ``[n_path, n_chunk, flow_state_dim]`` 입니다.
-            num_steps: 펼칠 frame 수입니다.
-
-        Returns:
-            torch.Tensor: frame 단위 기본 속도입니다.
-                shape은 ``[n_path, num_steps, flow_state_dim]`` 입니다.
-        """
-        if chunk_velocity.shape[1] == 1:
-            return chunk_velocity.expand(-1, int(num_steps), -1)
-        # interpolation_input: [n_path, flow_state_dim, n_chunk]
-        interpolation_input = chunk_velocity.transpose(1, 2)
-        # base_velocity: [n_path, num_steps, flow_state_dim]
-        base_velocity = F.interpolate(
-            interpolation_input,
-            size=int(num_steps),
-            mode="linear",
-            align_corners=True,
-        ).transpose(1, 2)
-        return base_velocity
+        self.plan_bias_scale = float(plan_bias_scale)
+        self.frame_velocity_head = FlowVelocityHead(flow_dim=flow_dim, flow_state_dim=self.flow_state_dim)
+        self.plan_chunk_bias_head = nn.Linear(flow_dim, self.flow_state_dim)
+        nn.init.zeros_(self.plan_chunk_bias_head.weight)
+        nn.init.zeros_(self.plan_chunk_bias_head.bias)
 
     def _fill_invalid_chunk_velocity(
         self,
         chunk_velocity: torch.Tensor,
         chunk_valid_mask: torch.Tensor | None,
     ) -> torch.Tensor:
-        """Invalid chunk가 prefix-valid 기본 경로 보간에 섞이지 않게 합니다."""
+        """Invalid chunk bias는 가장 가까운 valid chunk bias로 채웁니다."""
         if chunk_valid_mask is None:
             return chunk_velocity
         if tuple(chunk_valid_mask.shape) != tuple(chunk_velocity.shape[:2]):
@@ -894,23 +873,35 @@ class PlanFirstResidualVelocityHead(nn.Module):
         filled = torch.where(has_valid.unsqueeze(-1), filled, chunk_velocity.new_zeros(chunk_velocity.shape))
         return torch.where(valid_mask.unsqueeze(-1), chunk_velocity, filled)
 
-    def _build_residual_scale(
+    def _expand_chunk_bias(
         self,
-        tau: torch.Tensor,
-        dtype: torch.dtype,
+        chunk_velocity: torch.Tensor,
+        num_steps: int,
     ) -> torch.Tensor:
-        """잡음이 큰 단계에서는 세부 보정 영향이 작게, 후반 단계에서는 크게 만듭니다.
+        """0.5초 chunk bias를 각 chunk 내부 0.1초 frame에 그대로 반복합니다."""
+        num_steps = int(num_steps)
+        num_chunks = int(chunk_velocity.shape[1])
+        if num_steps <= 0:
+            raise ValueError(f"num_steps must be positive, got {num_steps}.")
+        if num_chunks <= 0:
+            raise ValueError(f"num_chunks must be positive, got {num_chunks}.")
+        if num_steps % num_chunks == 0:
+            repeat = num_steps // num_chunks
+            return chunk_velocity.repeat_interleave(repeat, dim=1)
 
-        Args:
-            tau: Flow Matching 시간입니다. shape은 ``[n_path]`` 입니다.
-            dtype: 출력 tensor 자료형입니다.
+        # Defensive fallback for unusual horizons. The normal 20-step/4-chunk path does not use this.
+        step_idx = torch.arange(num_steps, device=chunk_velocity.device)
+        chunk_idx = torch.div(step_idx * num_chunks, num_steps, rounding_mode="floor").clamp(max=num_chunks - 1)
+        gather_idx = chunk_idx.view(1, num_steps, 1).expand(chunk_velocity.shape[0], -1, chunk_velocity.shape[-1])
+        return chunk_velocity.gather(dim=1, index=gather_idx)
 
-        Returns:
-            torch.Tensor: frame 보정 배율입니다. shape은 ``[n_path, 1, 1]`` 입니다.
-        """
-        # tau_scale: [n_path, 1, 1]
-        tau_scale = tau.to(dtype=dtype).clamp(min=0.0, max=1.0).view(-1, 1, 1)
-        return 0.10 + 0.90 * tau_scale
+    def _interpolate_chunk_base(
+        self,
+        chunk_velocity: torch.Tensor,
+        num_steps: int,
+    ) -> torch.Tensor:
+        """Backward-compatible wrapper: chunk bias는 보간하지 않고 chunk 내부에서 반복합니다."""
+        return self._expand_chunk_bias(chunk_velocity=chunk_velocity, num_steps=num_steps)
 
     def forward(
         self,
@@ -919,8 +910,9 @@ class PlanFirstResidualVelocityHead(nn.Module):
         tau: torch.Tensor,
         step_valid_mask: torch.Tensor | None = None,
         chunk_valid_mask: torch.Tensor | None = None,
+        plan_token: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """부드러운 기본 속도와 제한된 세부 보정을 합칩니다.
+        """Frame별 full velocity에 작은 plan/chunk bias를 더합니다.
 
         Args:
             step_tokens: 0.1초 단위 토큰입니다.
@@ -928,29 +920,37 @@ class PlanFirstResidualVelocityHead(nn.Module):
             chunk_tokens: 0.5초 묶음 토큰입니다.
                 shape은 ``[n_path, n_chunk, flow_dim]`` 입니다.
             tau: Flow Matching 시간입니다. shape은 ``[n_path]`` 입니다.
+                FM-safe head에서는 frame velocity를 suppress하지 않기 위해 사용하지 않습니다.
             step_valid_mask: 유효한 frame 표시입니다. shape은 ``[n_path, n_step]`` 입니다.
             chunk_valid_mask: 유효한 0.5초 묶음 표시입니다. shape은 ``[n_path, n_chunk]`` 입니다.
+            plan_token: 2초 전체 의도 토큰입니다. shape은 ``[n_path, flow_dim]`` 입니다.
 
         Returns:
             torch.Tensor: 최종 Flow Matching 속도입니다.
                 shape은 ``[n_path, n_step, flow_state_dim]`` 입니다.
         """
-        # chunk_velocity: [n_path, n_chunk, flow_state_dim]
-        chunk_velocity = self.base_head(chunk_tokens)
-        chunk_velocity = self._fill_invalid_chunk_velocity(
-            chunk_velocity=chunk_velocity,
+        del tau
+        frame_velocity = self.frame_velocity_head(step_tokens)
+
+        bias_input = chunk_tokens
+        if plan_token is not None:
+            if tuple(plan_token.shape) != (chunk_tokens.shape[0], chunk_tokens.shape[-1]):
+                raise ValueError(
+                    "plan_token shape must be [n_path, flow_dim]: "
+                    f"expected={(chunk_tokens.shape[0], chunk_tokens.shape[-1])}, actual={tuple(plan_token.shape)}."
+                )
+            bias_input = bias_input + plan_token.unsqueeze(1)
+
+        chunk_bias = self.plan_chunk_bias_head(bias_input)
+        chunk_bias = self._fill_invalid_chunk_velocity(
+            chunk_velocity=chunk_bias,
             chunk_valid_mask=chunk_valid_mask,
         )
-        # base_velocity: [n_path, n_step, flow_state_dim]
-        base_velocity = self._interpolate_chunk_base(
-            chunk_velocity=chunk_velocity,
+        frame_bias = self._expand_chunk_bias(
+            chunk_velocity=chunk_bias,
             num_steps=step_tokens.shape[1],
         )
-        # residual_velocity: [n_path, n_step, flow_state_dim]
-        residual_velocity = self.residual_head(step_tokens)
-        # residual_scale: [n_path, 1, 1]
-        residual_scale = self._build_residual_scale(tau=tau, dtype=step_tokens.dtype)
-        velocity = base_velocity + residual_scale * residual_velocity
+        velocity = frame_velocity + self.plan_bias_scale * frame_bias
         if step_valid_mask is not None:
             velocity = velocity * step_valid_mask.to(dtype=velocity.dtype).unsqueeze(-1)
         return velocity
@@ -1060,7 +1060,7 @@ class HierarchicalFlowDecoder(nn.Module):
             chunk_tokens=chunk_tokens,
             chunk_valid_mask=chunk_valid_mask,
         )
-        return chunk_summary + context + tau_emb
+        return (chunk_summary + context + tau_emb) * (3.0 ** -0.5)
 
     def _run_chunk_mixer(
         self,
@@ -1196,6 +1196,7 @@ class HierarchicalFlowDecoder(nn.Module):
             tau=tau,
             step_valid_mask=step_valid_mask,
             chunk_valid_mask=chunk_valid_mask,
+            plan_token=plan_token,
         )
 
 class ContinuousCommitBridge:
