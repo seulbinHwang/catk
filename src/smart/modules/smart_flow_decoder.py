@@ -106,6 +106,7 @@ class SMARTFlowDecoder(nn.Module):
         map_feature: Dict[str, Tensor],
         tokenized_agent: Dict[str, Tensor],
         anchor_mask_key: str = "flow_eval_mask",
+        compute_metric_outputs: bool = True,
     ) -> Dict[str, Tensor]:
         flow_clean_norm_key = {
             "flow_train_mask": "flow_train_clean_norm",
@@ -136,7 +137,12 @@ class SMARTFlowDecoder(nn.Module):
             flow_agent_type=tokenized_agent.get(flow_agent_type_key),
             flow_agent_length=tokenized_agent.get(flow_agent_length_key),
             flow_loss_mask=flow_loss_mask,
-            flow_clean_metric_norm=tokenized_agent.get(flow_clean_metric_norm_key),
+            flow_clean_metric_norm=(
+                tokenized_agent.get(flow_clean_metric_norm_key)
+                if compute_metric_outputs
+                else None
+            ),
+            compute_metric_outputs=compute_metric_outputs,
         )
 
     def build_anchor_context_from_map_feature(
@@ -144,6 +150,7 @@ class SMARTFlowDecoder(nn.Module):
         map_feature: Dict[str, Tensor],
         tokenized_agent: Dict[str, Tensor],
         anchor_mask_key: str = "flow_eval_mask",
+        compute_metric_outputs: bool = True,
     ) -> Dict[str, Tensor]:
         flow_clean_norm_key = {
             "flow_train_mask": "flow_train_clean_norm",
@@ -174,7 +181,12 @@ class SMARTFlowDecoder(nn.Module):
             flow_agent_type=tokenized_agent.get(flow_agent_type_key),
             flow_agent_length=tokenized_agent.get(flow_agent_length_key),
             flow_loss_mask=flow_loss_mask,
-            flow_clean_metric_norm=tokenized_agent.get(flow_clean_metric_norm_key),
+            flow_clean_metric_norm=(
+                tokenized_agent.get(flow_clean_metric_norm_key)
+                if compute_metric_outputs
+                else None
+            ),
+            compute_metric_outputs=compute_metric_outputs,
         )
 
     def build_anchor_context(
@@ -182,12 +194,14 @@ class SMARTFlowDecoder(nn.Module):
         tokenized_map: Dict[str, Tensor],
         tokenized_agent: Dict[str, Tensor],
         anchor_mask_key: str = "flow_eval_mask",
+        compute_metric_outputs: bool = True,
     ) -> Dict[str, Tensor]:
         map_feature = self.encode_map(tokenized_map)
         return self.build_anchor_context_from_map_feature(
             map_feature=map_feature,
             tokenized_agent=tokenized_agent,
             anchor_mask_key=anchor_mask_key,
+            compute_metric_outputs=compute_metric_outputs,
         )
 
     def forward(
@@ -195,12 +209,14 @@ class SMARTFlowDecoder(nn.Module):
         tokenized_map: Dict[str, Tensor],
         tokenized_agent: Dict[str, Tensor],
         anchor_mask_key: str = "flow_eval_mask",
+        compute_metric_outputs: bool = True,
     ) -> Dict[str, Tensor]:
         map_feature = self.encode_map(tokenized_map)
         return self.forward_from_map_feature(
             map_feature=map_feature,
             tokenized_agent=tokenized_agent,
             anchor_mask_key=anchor_mask_key,
+            compute_metric_outputs=compute_metric_outputs,
         )
 
     def prepare_inference_cache(

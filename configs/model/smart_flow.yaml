@@ -28,6 +28,14 @@ model_config:
   delete_local_videos_after_wandb_upload: false
   val_open_loop: false
   val_closed_loop: true
+  # Train ADE/FDE/yaw ADE/yaw FDE are diagnostics only. Disabling them leaves
+  # loss/backward/validation unchanged and skips the train-time pose metric
+  # conversion cost in open-loop pretrain.
+  train_open_loop_metrics: false
+  # Safety guard for rare automatic-optimization batches with no open-loop
+  # targets. Keep this false unless the selected train split has been scanned
+  # and every sample is known to produce at least one train target.
+  skip_empty_open_loop_optimizer_guard: false
   validation_open_seed: 0
   validation_closed_seed: 4
   token_processor:
@@ -59,6 +67,13 @@ model_config:
     control_cyclist_yaw_scale_rad: 0.06
     # control-space 학습에서 GT -> control -> pose 복원 위치 오차가 이 값보다 큰 anchor는 학습에서 제외합니다.
     control_round_trip_max_position_error_m: 0.5
+    # Optional deterministic training sidecar. When enabled, precomputed
+    # tokenized map/agent and flow target tensors are loaded by scenario id.
+    # The sidecar path is additionally namespaced by token vocab + flow config hash.
+    flow_target_sidecar_dir: ""
+    flow_target_sidecar_read: true
+    flow_target_sidecar_write: false
+    flow_target_sidecar_required: true
   validation_rollout_sampling:
     sample_steps: 16
     sample_method: euler

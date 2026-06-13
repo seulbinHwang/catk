@@ -497,8 +497,11 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         flow_agent_length: torch.Tensor | None = None,
         flow_loss_mask: torch.Tensor | None = None,
         flow_clean_metric_norm: torch.Tensor | None = None,
+        compute_metric_outputs: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """Open-loop anchor sampling에 필요한 context hidden만 계산합니다."""
+        if not compute_metric_outputs:
+            flow_clean_metric_norm = None
         if flow_clean_metric_norm is not None:
             expected_metric_shape = tuple(flow_clean_norm.shape[:2]) + (POSE_FLOW_DIM,)
             if tuple(flow_clean_metric_norm.shape) != expected_metric_shape:
@@ -1009,6 +1012,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         flow_agent_length: torch.Tensor | None = None,
         flow_loss_mask: torch.Tensor | None = None,
         flow_clean_metric_norm: torch.Tensor | None = None,
+        compute_metric_outputs: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """학습 또는 평가용 anchor를 골라 flow decoder 출력을 만듭니다.
 
@@ -1028,6 +1032,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             Dict[str, torch.Tensor]:
                 flow prediction, target, anchor 문맥, 현재 위치/방향, batch 정보를 담은 사전입니다.
         """
+        if not compute_metric_outputs:
+            flow_clean_metric_norm = None
         if flow_loss_mask is not None:
             expected_shape = tuple(flow_clean_norm.shape[:2])
             if tuple(flow_loss_mask.shape) != expected_shape:
@@ -1057,6 +1063,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             flow_agent_length=flow_agent_length,
             flow_loss_mask=flow_loss_mask,
             flow_clean_metric_norm=flow_clean_metric_norm,
+            compute_metric_outputs=compute_metric_outputs,
         )
         ctx_hidden_pack = anchor_context["ctx_hidden_pack"]
         anchor_hidden = anchor_context["anchor_hidden"]
@@ -1084,7 +1091,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 "anchor_interaction_pos": anchor_interaction_pos,
                 "anchor_interaction_head": anchor_interaction_head,
             }
-            if flow_agent_type is not None:
+            if compute_metric_outputs and flow_agent_type is not None:
                 output["flow_metric_agent_type"] = flow_agent_type
                 if flow_agent_length is not None:
                     output["flow_metric_agent_length"] = flow_agent_length
@@ -1098,7 +1105,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     if flow_clean_metric_norm is not None
                     else self._to_pose_metric_norm(empty, flow_agent_type, flow_agent_length)
                 )
-            elif flow_clean_metric_norm is not None:
+            elif compute_metric_outputs and flow_clean_metric_norm is not None:
                 output["flow_clean_metric_norm"] = flow_clean_metric_norm
             if flow_loss_mask is not None:
                 output["flow_loss_mask"] = flow_loss_mask
@@ -1143,7 +1150,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             "anchor_interaction_pos": anchor_interaction_pos,
             "anchor_interaction_head": anchor_interaction_head,
         }
-        if flow_agent_type is not None:
+        if compute_metric_outputs and flow_agent_type is not None:
             output["flow_metric_agent_type"] = flow_agent_type
             if flow_agent_length is not None:
                 output["flow_metric_agent_length"] = flow_agent_length
@@ -1161,7 +1168,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     flow_agent_length,
                 )
             )
-        elif flow_clean_metric_norm is not None:
+        elif compute_metric_outputs and flow_clean_metric_norm is not None:
             output["flow_clean_metric_norm"] = flow_clean_metric_norm
         if flow_loss_mask is not None:
             output["flow_loss_mask"] = flow_loss_mask
