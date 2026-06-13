@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Resume the seven global-2s Flow pretrain from the epoch-20 checkpoint.
 
-This wrapper is intentionally identical to the original seven/global-2s
+This wrapper is intentionally identical to the sidecar-enabled seven/global-2s
 pretrain launcher except that it passes an explicit ``ckpt_path`` for the first
 attempt. Lightning restores optimizer, scheduler, epoch, and global step from
 that checkpoint, so the resumed run should continue at epoch 21 with the same
-training semantics as an uninterrupted run.
+training semantics as an uninterrupted run while still using the 6a9a5ec4
+sidecar preload / train-metric-off fast path.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ from pathlib import Path
 
 
 BASE_LAUNCHER = Path(__file__).with_name(
-    "launch_pre_bc_flow_h100x8_fmsf3_a343315f_gelu_static_pod.py"
+    "launch_pre_bc_flow_h100x8_fmsf6_sidecar_static_pod.py"
 )
 
 TASK_NAME = (
