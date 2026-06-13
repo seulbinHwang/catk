@@ -347,6 +347,9 @@ class SMARTFlowDecoder(nn.Module):
         sampling_scheme: DictConfig,
         sampling_seed: int | None = None,
         backprop_last_k: int | None = None,
+        interaction_group: Tensor | None = None,
+        interaction_pos: Tensor | None = None,
+        interaction_head: Tensor | None = None,
     ) -> Tensor:
         """고정된 문맥에서 실제 생성 경로로 2초 미래를 만듭니다.
 
@@ -357,6 +360,8 @@ class SMARTFlowDecoder(nn.Module):
                 shape은 ``[n_agent, n_anchor]`` 입니다.
             sampling_scheme: 샘플링 단계 수, 방법, 잡음 크기 설정입니다.
             sampling_seed: validation마다 같은 샘플을 만들기 위한 고정 seed입니다.
+            interaction_group/pos/head: flow decoder의 same-chunk agent attention에
+                사용할 유효 anchor별 agent 상호작용 상태입니다.
 
         Returns:
             Tensor: 생성된 정규화 2초 미래입니다.
@@ -368,6 +373,9 @@ class SMARTFlowDecoder(nn.Module):
             sampling_scheme=sampling_scheme,
             sampling_seed=sampling_seed,
             backprop_last_k=backprop_last_k,
+            interaction_group=interaction_group,
+            interaction_pos=interaction_pos,
+            interaction_head=interaction_head,
         )
 
     def flow_norm_to_pose_metric_norm(

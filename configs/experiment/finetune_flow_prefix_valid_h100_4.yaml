@@ -30,7 +30,7 @@ model:
     n_vis_batch: 0
     n_vis_scenario: 0
     n_vis_rollout: 0
-    val_open_loop: true
+    val_open_loop: false
     val_closed_loop: true
     token_processor:
       use_prefix_valid_future_loss_mask: true

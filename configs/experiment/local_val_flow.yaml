@@ -10,7 +10,7 @@ model:
     n_vis_rollout: 0
     n_batch_sim_agents_metric: 100
     scorer_scene_num: 1680
-    val_open_loop: true
+    val_open_loop: false
     val_closed_loop: true
     n_rollout_closed_val: 32
     eval_sampling_noise:
