@@ -80,6 +80,7 @@ def render_env(args: argparse.Namespace) -> str:
         "LEARNING_RATE": args.learning_rate,
         "LR_WARMUP_STEPS": args.lr_warmup_steps,
         "LIMIT_TRAIN_BATCHES": args.limit_train_batches,
+        "INITIAL_CKPT_PATH": args.ckpt_path,
         "CATK_EXTRA_OVERRIDES": args.extra_hydra_overrides,
     }
     for name, value in optional.items():
@@ -190,6 +191,14 @@ while (( bs >= MIN_BS )); do
   if [[ -n "$latest_ckpt" ]]; then
     echo "[pretrain-h100x8-fmsf3] attempt #${{attempt}} bs=${{bs}} resume=${{latest_ckpt}}"
     ckpt_override="ckpt_path=${{latest_ckpt}}"
+  elif [[ -n "${{INITIAL_CKPT_PATH:-}}" ]]; then
+    if [[ ! -f "${{INITIAL_CKPT_PATH}}" ]]; then
+      echo "[pretrain-h100x8-fmsf3] initial checkpoint not found: ${{INITIAL_CKPT_PATH}}"
+      final_status=1
+      break
+    fi
+    echo "[pretrain-h100x8-fmsf3] attempt #${{attempt}} bs=${{bs}} resume_initial=${{INITIAL_CKPT_PATH}}"
+    ckpt_override="ckpt_path=${{INITIAL_CKPT_PATH}}"
   else
     echo "[pretrain-h100x8-fmsf3] attempt #${{attempt}} bs=${{bs}} fresh fit"
     ckpt_override="ckpt_path=null"
@@ -404,6 +413,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--learning-rate", default="6.5e-4")
     parser.add_argument("--lr-warmup-steps", default="5")
     parser.add_argument("--train-memory-balanced-batches", default="true")
+    parser.add_argument(
+        "--ckpt-path",
+        default="",
+        help=(
+            "Optional explicit checkpoint path for the first resume attempt. "
+            "If the new task later writes its own checkpoint, OOM retries resume "
+            "from that newer task checkpoint instead."
+        ),
+    )
     parser.add_argument("--max-non-oom-retries", type=int, default=3)
     parser.add_argument("--extra-hydra-overrides", default="")
     parser.add_argument("--monitor-interval", type=int, default=60)
