@@ -141,6 +141,14 @@ def _sample_categorical_logits_k_by_batch(
     return samples
 
 
+def _clamp_num_k_to_candidate_count(num_k: int, n_candidates: int) -> int:
+    if num_k <= 0:
+        raise ValueError(f"num_k should be positive for rollout sampling, got {num_k}")
+    if n_candidates <= 0:
+        raise ValueError(f"rollout sampling requires at least one candidate, got {n_candidates}")
+    return min(int(num_k), int(n_candidates))
+
+
 @torch.no_grad()
 def cal_polygon_contour(
     pos: Tensor,
@@ -223,8 +231,7 @@ def sample_policy_token_candidates(
     Returns:
         agent마다 독립적으로 뽑은 후보 token 번호이다. Shape은 ``[n_agent, num_k]``이다.
     """
-    if num_k <= 0:
-        raise ValueError(f"num_k should be positive for RoaD sampling, got {num_k}")
+    num_k = _clamp_num_k_to_candidate_count(num_k, next_token_logits.shape[-1])
     if temperature <= 0:
         raise ValueError(f"temperature should be positive for RoaD sampling, got {temperature}")
     sampling_logits = next_token_logits.detach() / temperature
@@ -300,11 +307,12 @@ def sample_next_token_traj(
     device = next_token_logits.device
     range_a = torch.arange(next_token_logits.shape[0], device=device)
     next_token_logits = next_token_logits.detach()
+    num_k = _clamp_num_k_to_candidate_count(sampling_scheme.num_k, next_token_logits.shape[-1])
 
     if sampling_scheme.criterium == "road_samplek_dist":
         candidate_indices = sample_policy_token_candidates(
             next_token_logits=next_token_logits,
-            num_k=sampling_scheme.num_k,
+            num_k=num_k,
             temperature=sampling_scheme.temp,
             sampling_generators_by_batch=sampling_generators_by_batch,
             sampling_batch=sampling_batch,
@@ -326,7 +334,7 @@ def sample_next_token_traj(
         or sampling_scheme.criterium == "topk_prob_sampled_with_dist"
     ):
         topk_logits, topk_indices = torch.topk(
-            next_token_logits, sampling_scheme.num_k, dim=-1, sorted=False
+            next_token_logits, num_k, dim=-1, sorted=False
         )
         if sampling_scheme.criterium == "topk_prob_sampled_with_dist":
             gt_contour = cal_polygon_contour(pos_next_gt, head_next_gt, token_agent_shape).unsqueeze(1)
@@ -354,7 +362,7 @@ def sample_next_token_traj(
         _logits = -1.0 * dist.masked_fill(_invalid.unsqueeze(1), 0.0)
         if _invalid.any():
             _logits[_invalid] = next_token_logits[_invalid]
-        _, topk_indices = torch.topk(_logits, sampling_scheme.num_k, dim=-1, sorted=False)
+        _, topk_indices = torch.topk(_logits, num_k, dim=-1, sorted=False)
         topk_logits = next_token_logits[range_a.unsqueeze(1), topk_indices]
     else:
         raise ValueError(f"Invalid criterium: {sampling_scheme.criterium}")
@@ -392,8 +400,9 @@ def sample_next_gmm_traj(
     ]
 
     assert sampling_scheme.criterium in {"topk_prob", "topk_prob_sampled_with_dist"}
+    num_k = _clamp_num_k_to_candidate_count(sampling_scheme.num_k, ego_next_logits.shape[-1])
     topk_logits, topk_indices = torch.topk(
-        ego_next_logits, sampling_scheme.num_k, dim=-1, sorted=False
+        ego_next_logits, num_k, dim=-1, sorted=False
     )
     ego_pose_topk = ego_next_poses[
         torch.arange(n_batch, device=ego_next_logits.device).unsqueeze(1), topk_indices
