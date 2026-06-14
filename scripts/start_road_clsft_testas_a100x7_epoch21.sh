@@ -95,7 +95,7 @@ main() {
   local val_batch_size="${VAL_BATCH_SIZE:-12}"
   local test_batch_size="${TEST_BATCH_SIZE:-12}"
   local road_cache_root="${ROAD_CACHE_ROOT:-/workspace/road_cache/${task_name}}"
-  local road_data_use_ratio="${ROAD_DATA_USE_RATIO:-0.1}"
+  local road_data_use_ratio="${ROAD_DATA_USE_RATIO:-1.0}"
   local road_num_rollouts="${ROAD_NUM_ROLLOUTS_PER_SCENARIO:-1}"
   local road_generation_batch_size="${ROAD_GENERATION_BATCH_SIZE:-160}"
   local road_num_workers="${ROAD_NUM_WORKERS:-10}"
