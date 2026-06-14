@@ -1027,6 +1027,23 @@ class SMART(LightningModule):
             current = max(1, math.ceil(current / 2))
         return chunk_sizes
 
+    def _build_rlftsim_replay_chunk_size_candidates(
+        self,
+        repeat_count: int,
+    ) -> list[int]:
+        chunk_sizes: list[int] = []
+        current = min(
+            max(1, int(self.rlftsim_replay_rollout_chunk_size)),
+            max(1, int(repeat_count)),
+        )
+        while True:
+            if current not in chunk_sizes:
+                chunk_sizes.append(current)
+            if current == 1:
+                break
+            current = max(1, math.ceil(current / 2))
+        return chunk_sizes
+
     def _run_rlftsim_sample_rollouts(
         self,
         tokenized_map: Dict[str, torch.Tensor],
@@ -1254,6 +1271,57 @@ class SMART(LightningModule):
             scheduler.step()
         optimizer.zero_grad()
 
+    def _rlftsim_forced_replay_backward(
+        self,
+        *,
+        tokenized_map: Dict[str, torch.Tensor],
+        tokenized_agent: Dict[str, torch.Tensor],
+        forced_next_token_idx: torch.Tensor,
+        rewards: torch.Tensor,
+        replay_chunk_size: int,
+        should_step_optimizer: bool,
+        accumulate_grad_batches: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        repeat_count = int(rewards.shape[1])
+        loss_value = rewards.new_tensor(0.0)
+        policy_loss_value = rewards.new_tensor(0.0)
+        kl_value = rewards.new_tensor(0.0)
+        entropy_value = rewards.new_tensor(0.0)
+        for chunk_start in range(0, repeat_count, replay_chunk_size):
+            chunk_end = min(repeat_count, chunk_start + replay_chunk_size)
+            rollout_indices = list(range(chunk_start, chunk_end))
+            chunk_weight = float(chunk_end - chunk_start) / float(repeat_count)
+            sync_grad = should_step_optimizer and chunk_end >= repeat_count
+            with self._rlftsim_backward_sync_context(enabled=sync_grad):
+                stats = self._compute_rlftsim_forced_replay_stats(
+                    tokenized_map=tokenized_map,
+                    tokenized_agent=tokenized_agent,
+                    forced_next_token_idx=forced_next_token_idx,
+                    rollout_indices=rollout_indices,
+                )
+                chunk_rewards = rewards[:, chunk_start:chunk_end]
+                chunk_policy_loss = -(stats["log_prob"] * chunk_rewards).mean()
+                chunk_kl = stats["kl"].mean()
+                chunk_entropy = stats["entropy"].mean()
+                chunk_loss = chunk_policy_loss + float(self.rlftsim_kl_beta) * chunk_kl
+                if self.rlftsim_entropy_bonus != 0.0:
+                    chunk_loss = (
+                        chunk_loss - float(self.rlftsim_entropy_bonus) * chunk_entropy
+                    )
+                self.manual_backward(
+                    chunk_loss
+                    * chunk_weight
+                    / float(max(1, accumulate_grad_batches))
+                )
+            loss_value = loss_value + chunk_loss.detach() * chunk_weight
+            policy_loss_value = (
+                policy_loss_value + chunk_policy_loss.detach() * chunk_weight
+            )
+            kl_value = kl_value + chunk_kl.detach() * chunk_weight
+            entropy_value = entropy_value + chunk_entropy.detach() * chunk_weight
+            del stats, chunk_loss, chunk_policy_loss, chunk_kl, chunk_entropy
+        return loss_value, policy_loss_value, kl_value, entropy_value
+
     def _rlftsim_training_step(self, data, batch_idx):
         self._validate_rlftsim_batch(data)
         optimizer = self.optimizers()
@@ -1291,43 +1359,49 @@ class SMART(LightningModule):
 
         repeat_count = int(rewards.shape[1])
         replay_chunk_size = max(1, int(self.rlftsim_replay_rollout_chunk_size))
-        loss_value = rewards.new_tensor(0.0)
-        policy_loss_value = rewards.new_tensor(0.0)
-        kl_value = rewards.new_tensor(0.0)
-        entropy_value = rewards.new_tensor(0.0)
-        for chunk_start in range(0, repeat_count, replay_chunk_size):
-            chunk_end = min(repeat_count, chunk_start + replay_chunk_size)
-            rollout_indices = list(range(chunk_start, chunk_end))
-            chunk_weight = float(chunk_end - chunk_start) / float(repeat_count)
-            sync_grad = should_step_optimizer and chunk_end >= repeat_count
-            with self._rlftsim_backward_sync_context(enabled=sync_grad):
-                stats = self._compute_rlftsim_forced_replay_stats(
+        last_oom_error: RuntimeError | None = None
+        for candidate_chunk_size in self._build_rlftsim_replay_chunk_size_candidates(
+            repeat_count
+        ):
+            try:
+                (
+                    loss_value,
+                    policy_loss_value,
+                    kl_value,
+                    entropy_value,
+                ) = self._rlftsim_forced_replay_backward(
                     tokenized_map=tokenized_map,
                     tokenized_agent=tokenized_agent,
                     forced_next_token_idx=rollout["forced_next_token_idx"],
-                    rollout_indices=rollout_indices,
+                    rewards=rewards,
+                    replay_chunk_size=candidate_chunk_size,
+                    should_step_optimizer=should_step_optimizer,
+                    accumulate_grad_batches=accumulate_grad_batches,
                 )
-                chunk_rewards = rewards[:, chunk_start:chunk_end]
-                chunk_policy_loss = -(stats["log_prob"] * chunk_rewards).mean()
-                chunk_kl = stats["kl"].mean()
-                chunk_entropy = stats["entropy"].mean()
-                chunk_loss = chunk_policy_loss + float(self.rlftsim_kl_beta) * chunk_kl
-                if self.rlftsim_entropy_bonus != 0.0:
-                    chunk_loss = (
-                        chunk_loss - float(self.rlftsim_entropy_bonus) * chunk_entropy
-                    )
-                self.manual_backward(
-                    chunk_loss
-                    * chunk_weight
-                    / float(max(1, accumulate_grad_batches))
-                )
-            loss_value = loss_value + chunk_loss.detach() * chunk_weight
-            policy_loss_value = (
-                policy_loss_value + chunk_policy_loss.detach() * chunk_weight
-            )
-            kl_value = kl_value + chunk_kl.detach() * chunk_weight
-            entropy_value = entropy_value + chunk_entropy.detach() * chunk_weight
-            del stats, chunk_loss, chunk_policy_loss, chunk_kl, chunk_entropy
+                replay_chunk_size = candidate_chunk_size
+                self.rlftsim_replay_rollout_chunk_size = candidate_chunk_size
+                break
+            except RuntimeError as error:
+                if (
+                    (not self._is_cuda_out_of_memory(error))
+                    or candidate_chunk_size == 1
+                ):
+                    raise
+                if not is_accumulation_start:
+                    raise RuntimeError(
+                        "RLFTSim replay chunk fallback cannot safely retry in the "
+                        "middle of gradient accumulation; use accumulate_grad_batches=1."
+                    ) from error
+                last_oom_error = error
+                next_chunk_size = max(1, math.ceil(candidate_chunk_size / 2))
+                self.rlftsim_replay_rollout_chunk_size = next_chunk_size
+                optimizer.zero_grad()
+                self._cleanup_after_rollout_oom()
+                continue
+        else:
+            if last_oom_error is not None:
+                raise last_oom_error
+            raise RuntimeError("RLFTSim forced replay failed before producing a loss.")
 
         if should_step_optimizer:
             self._rlftsim_optimizer_step(optimizer)
@@ -1350,6 +1424,12 @@ class SMART(LightningModule):
         self.log(
             "train/rlftsim_entropy",
             entropy_value,
+            on_step=True,
+            batch_size=1,
+        )
+        self.log(
+            "train/rlftsim_replay_chunk_size",
+            torch.tensor(float(replay_chunk_size), device=self.device),
             on_step=True,
             batch_size=1,
         )

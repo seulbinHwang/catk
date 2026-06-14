@@ -48,3 +48,16 @@ def test_rlftsim_reference_encoder_state_is_not_persistent() -> None:
         filtered["encoder.agent_encoder.weight"],
         torch.tensor([1.0]),
     )
+
+
+def test_rlftsim_replay_chunk_candidates_fall_back_by_halves() -> None:
+    model = object.__new__(SMART)
+
+    model.rlftsim_replay_rollout_chunk_size = 4
+    assert model._build_rlftsim_replay_chunk_size_candidates(4) == [4, 2, 1]
+
+    model.rlftsim_replay_rollout_chunk_size = 2
+    assert model._build_rlftsim_replay_chunk_size_candidates(4) == [2, 1]
+
+    model.rlftsim_replay_rollout_chunk_size = 8
+    assert model._build_rlftsim_replay_chunk_size_candidates(4) == [4, 2, 1]
