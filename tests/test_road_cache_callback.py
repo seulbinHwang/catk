@@ -33,6 +33,7 @@ def _make_callback(
         original_train_raw_dir=original_train_raw_dir.as_posix(),
         cache_root_dir=cache_root_dir.as_posix(),
         sampling_scheme={},
+        road_data_use_ratio=1.0,
         num_rollouts_per_scenario=3,
         generation_batch_size=1,
         num_workers=0,

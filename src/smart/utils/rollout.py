@@ -321,6 +321,29 @@ def sample_next_token_traj(
         )
         return next_token_idx, token_traj_all[range_a, next_token_idx]
 
+    if sampling_scheme.criterium == "road_topk_dist":
+        num_k = int(sampling_scheme.num_k)
+        if num_k <= 0:
+            raise ValueError(f"num_k should be positive for RoaD top-k, got {num_k}")
+        num_k = min(num_k, next_token_logits.shape[-1])
+        _, candidate_indices = torch.topk(
+            next_token_logits,
+            num_k,
+            dim=-1,
+            sorted=True,
+        )
+        next_token_idx = select_road_samplek_candidate(
+            token_traj=token_traj,
+            candidate_indices=candidate_indices,
+            pos_now=pos_now,
+            head_now=head_now,
+            pos_next_gt=pos_next_gt,
+            head_next_gt=head_next_gt,
+            valid_next_gt=valid_next_gt,
+            token_agent_shape=token_agent_shape,
+        )
+        return next_token_idx, token_traj_all[range_a, next_token_idx]
+
     if (
         sampling_scheme.criterium == "topk_prob"
         or sampling_scheme.criterium == "topk_prob_sampled_with_dist"

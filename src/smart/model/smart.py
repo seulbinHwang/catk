@@ -79,7 +79,11 @@ class SMART(LightningModule):
         self.encoder = SMARTDecoder(
             **model_config.decoder, n_token_agent=self.token_processor.n_token_agent
         )
-        set_model_for_finetuning(self.encoder, model_config.finetune)
+        set_model_for_finetuning(
+            self.encoder,
+            model_config.finetune,
+            getattr(model_config, "finetune_freeze_mode", "legacy"),
+        )
 
         self.minADE = minADE()
         self.TokenCls = TokenCls(max_guesses=5)

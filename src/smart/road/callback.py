@@ -17,6 +17,7 @@ class RoadCacheRefreshCallback(Callback):
         original_train_raw_dir: str,
         cache_root_dir: str,
         sampling_scheme: DictConfig,
+        road_data_use_ratio: float,
         num_rollouts_per_scenario: int,
         generation_batch_size: int,
         num_workers: int,
@@ -29,6 +30,7 @@ class RoadCacheRefreshCallback(Callback):
             original_train_raw_dir: 원본 WOMD training pickle cache 디렉터리이다.
             cache_root_dir: epoch별 RoaD cache를 만들 상위 디렉터리이다.
             sampling_scheme: RoaD Sample-K rollout 설정이다.
+            road_data_use_ratio: epoch마다 RoaD cache로 만들 원본 training scenario 비율이다.
             num_rollouts_per_scenario: scenario당 생성할 rollout 수이다.
             generation_batch_size: cache 생성용 batch size이다. 0 이하면 학습 batch size를 쓴다.
             num_workers: cache 생성용 worker 수이다.
@@ -44,6 +46,7 @@ class RoadCacheRefreshCallback(Callback):
         self.original_train_raw_dir = original_train_raw_dir
         self.cache_root_dir = cache_root_dir
         self.sampling_scheme = sampling_scheme
+        self.road_data_use_ratio = road_data_use_ratio
         self.num_rollouts_per_scenario = num_rollouts_per_scenario
         self.generation_batch_size = generation_batch_size
         self.num_workers = num_workers
@@ -112,6 +115,7 @@ class RoadCacheRefreshCallback(Callback):
                 output_dir=cache_dir,
                 transform=trainer.datamodule.train_transform,
                 sampling_scheme=self.sampling_scheme,
+                road_data_use_ratio=self.road_data_use_ratio,
                 num_rollouts_per_scenario=self.num_rollouts_per_scenario,
                 batch_size=self._generation_batch_size(trainer),
                 num_workers=self.num_workers,

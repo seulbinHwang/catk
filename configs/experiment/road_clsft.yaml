@@ -8,6 +8,7 @@ model:
   model_config:
     lr: 5e-5
     lr_min_ratio: 0.05
+    scorer_scene_num: 1680
     n_vis_batch: 0
     n_vis_scenario: 0
     n_vis_rollout: 0
@@ -23,25 +24,27 @@ model:
       label_smoothing: 0.0
       rollout_as_gt: false
     finetune: true
+    finetune_freeze_mode: map_encoder_only
 
 road:
-  cache_root_dir: ${paths.output_dir}/road_cache
+  cache_root_dir: /workspace/road_cache
+  road_data_use_ratio: 0.1
   num_rollouts_per_scenario: 3
   generation_batch_size: ${data.train_batch_size}
   num_workers: ${data.num_workers}
   pin_memory: ${data.pin_memory}
   delete_after_use: true
   rollout_sampling:
-    criterium: road_samplek_dist
+    criterium: road_topk_dist
     num_k: 64
-    temp: 0.8
 
 ckpt_path: BC_PRETRAINED_MODEL.ckpt
 
 trainer:
   limit_train_batches: 1.0
   limit_val_batches: 50
-  check_val_every_n_epoch: 16
+  check_val_every_n_epoch: 1
+  max_epochs: 10
   reload_dataloaders_every_n_epochs: 1
 
 data:

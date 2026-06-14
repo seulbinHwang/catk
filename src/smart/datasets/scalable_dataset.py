@@ -12,7 +12,6 @@
 # its affiliates is strictly prohibited.
 
 import pickle
-import random
 from collections import defaultdict
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
@@ -83,15 +82,10 @@ class MultiDataset(Dataset):
             if p.is_file() and not p.name.startswith(".")
         ]
         self._road_num_rollouts_per_scenario = road_num_rollouts_per_scenario
-        self._raw_path_groups: Optional[List[List[str]]] = None
 
         if road_num_rollouts_per_scenario > 1:
-            self._raw_path_groups = group_road_raw_paths(
-                self._raw_paths, road_num_rollouts_per_scenario
-            )
-            self._num_samples = len(self._raw_path_groups)
-        else:
-            self._num_samples = len(self._raw_paths)
+            group_road_raw_paths(self._raw_paths, road_num_rollouts_per_scenario)
+        self._num_samples = len(self._raw_paths)
 
         self._tfrecord_dir = Path(tfrecord_dir) if tfrecord_dir is not None else None
 
@@ -111,16 +105,13 @@ class MultiDataset(Dataset):
         """학습에 사용할 pickle 하나를 고른다.
 
         Args:
-            idx: dataset index이다. RoaD cache에서는 원본 scenario index를 뜻한다.
+            idx: dataset index이다. RoaD cache에서는 rollout 파일 index를 뜻한다.
 
         Returns:
-            실제로 열 pickle 파일 경로이다. RoaD cache에서는 같은 scenario의 3개
-            rollout 중 하나를 균등하게 고른다.
+            실제로 열 pickle 파일 경로이다. RoaD cache에서는 같은 scenario의
+            rollout 3개가 각각 독립 학습 sample이 된다.
         """
-        if self._raw_path_groups is None:
-            return self._raw_paths[idx]
-        rollout_paths = self._raw_path_groups[idx]
-        return rollout_paths[random.randrange(len(rollout_paths))]
+        return self._raw_paths[idx]
 
     def get(self, idx: int):
         raw_path = self._select_raw_path(idx)

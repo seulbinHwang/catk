@@ -18,12 +18,32 @@ from src.utils import RankedLogger
 log = RankedLogger(__name__, rank_zero_only=True)
 
 
-def set_model_for_finetuning(model: torch.nn.Module, finetune: bool) -> None:
+def set_model_for_finetuning(
+    model: torch.nn.Module,
+    finetune: bool,
+    freeze_mode: str = "legacy",
+) -> None:
     def _unfreeze(module: torch.nn.Module) -> None:
         for p in module.parameters():
             p.requires_grad = True
 
+    def _freeze(module: torch.nn.Module) -> None:
+        for p in module.parameters():
+            p.requires_grad = False
+
     if finetune:
+        if freeze_mode == "map_encoder_only":
+            for p in model.parameters():
+                p.requires_grad = True
+            if not hasattr(model, "map_encoder"):
+                raise ValueError("map_encoder_only finetuning requires model.map_encoder")
+            _freeze(model.map_encoder)
+            log.info("Freezing map_encoder only for finetuning")
+            return
+
+        if freeze_mode != "legacy":
+            raise ValueError(f"Unsupported finetune freeze_mode: {freeze_mode}")
+
         for p in model.parameters():
             p.requires_grad = False
 

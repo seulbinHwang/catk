@@ -1,5 +1,6 @@
 import contextlib
 import copy
+import math
 import os
 import pickle
 import shutil
@@ -9,6 +10,7 @@ from typing import Any, Dict, List, Mapping, Optional
 import torch
 from omegaconf import DictConfig
 from torch import Tensor
+from torch.utils.data import Subset
 from torch_geometric.loader import DataLoader
 
 from src.smart.datasets import MultiDataset
@@ -117,6 +119,28 @@ def make_scenario_path_map(raw_dir: str) -> Dict[str, str]:
         key는 scenario id이고, value는 해당 pickle 파일 경로인 dict이다.
     """
     return {Path(raw_path).stem: raw_path for raw_path in list_pickle_paths(raw_dir)}
+
+
+def select_road_dataset_indices(
+    dataset_size: int,
+    road_data_use_ratio: float,
+) -> Optional[List[int]]:
+    """RoaD cache 생성에 사용할 원본 scenario index subset을 고른다.
+
+    Args:
+        dataset_size: 원본 WOMD training cache의 scenario 개수이다.
+        road_data_use_ratio: 이번 epoch에 사용할 scenario 비율이다. 범위는 ``(0, 1]``이다.
+
+    Returns:
+        전체를 쓰면 ``None``이고, subset을 쓰면 무작위 index list이다.
+    """
+    ratio = float(road_data_use_ratio)
+    if ratio <= 0.0 or ratio > 1.0:
+        raise ValueError(f"road_data_use_ratio must be in (0, 1], got {ratio}")
+    if ratio >= 1.0:
+        return None
+    num_selected = max(1, math.ceil(dataset_size * ratio))
+    return torch.randperm(dataset_size).tolist()[:num_selected]
 
 
 def normalize_scenario_ids(scenario_ids: Any) -> List[str]:
@@ -235,6 +259,7 @@ def generate_road_cache(
     output_dir: str,
     transform: Any,
     sampling_scheme: DictConfig,
+    road_data_use_ratio: float,
     num_rollouts_per_scenario: int,
     batch_size: int,
     num_workers: int,
@@ -250,7 +275,8 @@ def generate_road_cache(
         original_train_raw_dir: 원본 WOMD training pickle cache 디렉터리이다.
         output_dir: 새로 만들 RoaD cache 디렉터리이다.
         transform: 기존 training transform이다.
-        sampling_scheme: RoaD Sample-K 설정이다.
+        sampling_scheme: RoaD rollout token 후보 선택 설정이다.
+        road_data_use_ratio: 원본 training cache 중 이번 epoch에 사용할 비율이다.
         num_rollouts_per_scenario: scenario당 생성할 rollout 수이다. 기본값은 3이다.
         batch_size: cache 생성용 batch size이다.
         num_workers: cache 생성용 worker 수이다.
@@ -273,8 +299,17 @@ def generate_road_cache(
 
     scenario_path_map = make_scenario_path_map(original_train_raw_dir)
     dataset = MultiDataset(original_train_raw_dir, transform)
+    selected_indices = select_road_dataset_indices(len(dataset), road_data_use_ratio)
+    generation_dataset = dataset
+    if selected_indices is not None:
+        generation_dataset = Subset(dataset, selected_indices)
+        log.info(
+            f"RoaD cache will use {len(selected_indices)}/{len(dataset)} "
+            f"training scenarios for this epoch "
+            f"(road_data_use_ratio={float(road_data_use_ratio):.6g})."
+        )
     dataloader = DataLoader(
-        dataset,
+        generation_dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,

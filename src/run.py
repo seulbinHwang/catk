@@ -56,6 +56,7 @@ def build_road_cache_callback(cfg: DictConfig) -> RoadCacheRefreshCallback:
         original_train_raw_dir=cfg.data.train_raw_dir,
         cache_root_dir=cfg.road.cache_root_dir,
         sampling_scheme=cfg.road.rollout_sampling,
+        road_data_use_ratio=cfg.road.road_data_use_ratio,
         num_rollouts_per_scenario=cfg.road.num_rollouts_per_scenario,
         generation_batch_size=cfg.road.generation_batch_size,
         num_workers=cfg.road.num_workers,

@@ -16,7 +16,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
 
-from src.smart.road.cache import resolve_autocast_dtype_from_precision
+from src.smart.road.cache import (
+    resolve_autocast_dtype_from_precision,
+    select_road_dataset_indices,
+)
 
 
 def test_resolve_autocast_dtype_mapping():
@@ -37,8 +40,15 @@ def test_resolve_autocast_dtype_mapping():
     print(f"resolve_autocast_dtype_from_precision: {len(cases)} cases OK")
 
 
+def test_select_road_dataset_indices_ratio_count():
+    assert select_road_dataset_indices(10, 1.0) is None
+    assert len(select_road_dataset_indices(10, 0.25)) == 3
+    assert len(select_road_dataset_indices(10, 0.01)) == 1
+
+
 def main():
     test_resolve_autocast_dtype_mapping()
+    test_select_road_dataset_indices_ratio_count()
     print("\nAll autocast precision mapping tests PASSED.")
 
 

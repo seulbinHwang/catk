@@ -43,7 +43,11 @@ class EgoGMMSMART(LightningModule):
         self.token_processor = TokenProcessor(**model_config.token_processor)
 
         self.encoder = EgoGMMSMARTDecoder(**model_config.decoder)
-        set_model_for_finetuning(self.encoder, model_config.finetune)
+        set_model_for_finetuning(
+            self.encoder,
+            model_config.finetune,
+            getattr(model_config, "finetune_freeze_mode", "legacy"),
+        )
 
         self.minADE = minADE()
         self.wosac_metrics = WOSACMetrics("val_closed", ego_only=True)
