@@ -217,7 +217,7 @@ def build_selected_epoch_cache(
     rank: int,
     world_size: int,
 ) -> int:
-    """생성된 3N cache 중 scenario마다 하나만 골라 학습용 폴더를 만듭니다.
+    """생성된 3N cache를 모두 학습용 폴더에 모읍니다.
 
     Args:
         variant_dirs: rollout 번호별 cache 폴더 목록입니다.
@@ -243,16 +243,11 @@ def build_selected_epoch_cache(
     made = 0
     for source0 in base_paths[rank::world_size]:
         scenario_id = source0.stem
-        variant_idx = choose_variant_for_epoch(
-            scenario_id=scenario_id,
-            epoch_idx=epoch_idx,
-            num_variants=len(variant_dirs),
-            seed=seed,
-        )
-        source_path = variant_dirs[variant_idx] / source0.name
-        if not source_path.exists():
-            raise FileNotFoundError(f"Selected RoaD variant is missing: {source_path}")
-        target_path = selected_dir / source0.name
-        link_or_copy_variant(source_path, target_path)
-        made += 1
+        for variant_idx, variant_dir in enumerate(variant_dirs):
+            source_path = variant_dir / source0.name
+            if not source_path.exists():
+                raise FileNotFoundError(f"Selected RoaD variant is missing: {source_path}")
+            target_path = selected_dir / f"{scenario_id}__road_r{variant_idx:02d}{source0.suffix}"
+            link_or_copy_variant(source_path, target_path)
+            made += 1
     return made

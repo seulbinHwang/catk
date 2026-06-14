@@ -63,7 +63,10 @@ def _is_self_forced_enabled(cfg: DictConfig) -> bool:
 
 
 def _load_lightning_checkpoint(ckpt_path: str) -> dict[str, Any]:
-    checkpoint = torch.load(ckpt_path, map_location="cpu")
+    try:
+        checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(ckpt_path, map_location="cpu")
     if not isinstance(checkpoint, dict) or "state_dict" not in checkpoint:
         raise ValueError(
             "ckpt_path must point to a Lightning checkpoint dictionary containing "

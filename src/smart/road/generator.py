@@ -26,12 +26,13 @@ class RoadGenerationConfig:
     commit_steps: int = 5
     selection_horizon_steps: int = 20
     temperature: float = 0.8
-    sample_steps: int = 32
+    sample_steps: int = 16
     sample_method: str = "euler"
     generation_batch_size: int = 1
     candidate_micro_batch_size: int = 4
     seed: int = 817
     source_count_hint: int = 486_995
+    road_data_use_ratio: float = 0.1
     overwrite_cache: bool = False
 
 
@@ -66,6 +67,35 @@ def chunked_paths(paths: Sequence[Path], chunk_size: int) -> Iterable[list[Path]
     chunk_size = max(1, int(chunk_size))
     for start in range(0, len(paths), chunk_size):
         yield list(paths[start : start + chunk_size])
+
+
+def select_epoch_source_paths(
+    source_paths: Sequence[Path],
+    config: RoadGenerationConfig,
+    epoch_idx: int,
+) -> list[Path]:
+    """이번 RoaD epoch에서 cache를 생성할 원본 scenario subset을 고릅니다.
+
+    Args:
+        source_paths: 전체 원본 training scenario cache 경로입니다.
+        config: RoaD 생성 설정입니다.
+        epoch_idx: 현재 RoaD epoch 번호입니다.
+
+    Returns:
+        list[Path]: 이번 epoch에서 사용할 원본 scenario 경로입니다.
+    """
+    ratio = float(config.road_data_use_ratio)
+    if ratio <= 0.0 or ratio > 1.0:
+        raise ValueError(f"road_data_use_ratio must be in (0, 1], got {ratio}.")
+    if ratio >= 1.0:
+        return list(source_paths)
+
+    num_selected = max(1, math.ceil(len(source_paths) * ratio))
+    generator = torch.Generator()
+    generator.manual_seed(int(config.seed) + int(epoch_idx) * 1_000_003 + 97_531)
+    selected_indices = torch.randperm(len(source_paths), generator=generator)[:num_selected]
+    selected_indices = selected_indices.sort().values.tolist()
+    return [source_paths[int(idx)] for idx in selected_indices]
 
 
 def load_source_sample(source_path: Path) -> Mapping[str, Any]:
@@ -254,6 +284,16 @@ def extract_rollout_prediction(prediction: Mapping[str, Tensor]) -> tuple[Tensor
         raise ValueError(f"rollout heading must be [N,T], got {tuple(heading.shape)}.")
     if valid is None:
         valid = torch.ones(xy.shape[:2], device=xy.device, dtype=torch.bool)
+    elif valid.dim() == 2 and valid.shape[1] != xy.shape[1]:
+        if xy.shape[1] % 5 == 0 and valid.shape[1] >= xy.shape[1] // 5:
+            valid = valid[:, -(xy.shape[1] // 5):].repeat_interleave(5, dim=1)
+        elif xy.shape[1] % valid.shape[1] == 0:
+            valid = valid.repeat_interleave(xy.shape[1] // valid.shape[1], dim=1)
+        else:
+            raise ValueError(
+                "rollout valid time dimension must match 10Hz rollout or divide it, "
+                f"got valid={tuple(valid.shape)} and xy={tuple(xy.shape)}."
+            )
     return xy, heading, valid.bool()
 
 
@@ -598,6 +638,11 @@ def generate_road_epoch_cache(
     source_paths = sorted(p for p in Path(source_train_raw_dir).glob("*") if p.is_file())
     if len(source_paths) == 0:
         raise FileNotFoundError(f"No source WOMD cache files found under: {source_train_raw_dir}")
+    source_paths = select_epoch_source_paths(
+        source_paths=source_paths,
+        config=config,
+        epoch_idx=epoch_idx,
+    )
 
     variant_dirs = [epoch_dir / "all" / f"variant_{idx:02d}" for idx in range(config.rollouts_per_scenario)]
     for variant_dir in variant_dirs:

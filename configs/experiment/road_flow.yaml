@@ -8,12 +8,13 @@ action: road_finetune
 road:
   enabled: true
   source_train_raw_dir: ${paths.cache_root}/training
-  work_dir: ${paths.output_dir}/road_cache
+  work_dir: /workspace/road_cache
+  road_data_use_ratio: 0.1
   num_source_scenarios: 486995
   rollouts_per_scenario: 3
   candidates_per_agent: 64
   temperature: 0.8
-  sample_steps: 32
+  sample_steps: 16
   sample_method: euler
   rollout_steps: 80
   commit_steps: 5
@@ -28,8 +29,9 @@ model:
   model_config:
     lr: 5e-5
     lr_warmup_steps: 1
-    lr_total_steps: 32
+    lr_total_steps: 10
     lr_min_ratio: 1e-2
+    scorer_scene_num: 1680
     n_rollout_closed_val: 32
     val_open_loop: false
     val_closed_loop: true
@@ -38,13 +40,14 @@ model:
     draft:
       enabled: false
     finetune:
-      enabled: false
+      enabled: true
+      freeze_smart_map_decoder_only: true
       train_full_flow_decoder_only: false
 
 trainer:
-  max_epochs: 32
+  max_epochs: 10
   reload_dataloaders_every_n_epochs: 1
-  check_val_every_n_epoch: 2
+  check_val_every_n_epoch: 1
   limit_train_batches: 1.0
   limit_val_batches: 0.1
   precision: bf16-mixed

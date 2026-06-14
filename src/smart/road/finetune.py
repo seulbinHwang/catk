@@ -66,12 +66,13 @@ def build_road_runtime_config(cfg: DictConfig) -> RoadRuntimeConfig:
         commit_steps=int(road_cfg.get("commit_steps", 5)),
         selection_horizon_steps=int(road_cfg.get("selection_horizon_steps", 20)),
         temperature=float(road_cfg.get("temperature", 0.8)),
-        sample_steps=int(road_cfg.get("sample_steps", 32)),
+        sample_steps=int(road_cfg.get("sample_steps", 16)),
         sample_method=str(road_cfg.get("sample_method", "euler")),
         generation_batch_size=int(road_cfg.get("generation_batch_size", 1)),
         candidate_micro_batch_size=int(road_cfg.get("candidate_micro_batch_size", 4)),
         seed=int(cfg.get("seed", 817)),
         source_count_hint=int(road_cfg.get("num_source_scenarios", 486_995)),
+        road_data_use_ratio=float(road_cfg.get("road_data_use_ratio", 0.1)),
         overwrite_cache=bool(road_cfg.get("overwrite_cache", False)),
     )
     if generation.rollouts_per_scenario != 3:
@@ -83,6 +84,16 @@ def build_road_runtime_config(cfg: DictConfig) -> RoadRuntimeConfig:
         raise ValueError(
             "This RoaD implementation follows the requested K=64 candidate setting, "
             f"got {generation.candidates_per_agent}."
+        )
+    if generation.sample_steps != 16:
+        raise ValueError(
+            "RoaD candidate generation diffusion step must be 16, "
+            f"got {generation.sample_steps}."
+        )
+    if generation.road_data_use_ratio <= 0.0 or generation.road_data_use_ratio > 1.0:
+        raise ValueError(
+            "road_data_use_ratio must be in (0, 1], "
+            f"got {generation.road_data_use_ratio}."
         )
     if generation.rollout_steps != 80 or generation.commit_steps != 5:
         raise ValueError(
@@ -225,11 +236,20 @@ class RoadEpochCacheManager:
         epoch_dir.mkdir(parents=True, exist_ok=True)
 
         if getattr(trainer, "is_global_zero", rank == 0):
+            selected_hint = max(
+                1,
+                int(torch.ceil(torch.tensor(
+                    float(self.runtime_config.generation.source_count_hint)
+                    * float(self.runtime_config.generation.road_data_use_ratio)
+                )).item()),
+            )
             log.info(
                 "Preparing RoaD epoch cache: "
                 f"epoch={epoch_idx}, source={self.runtime_config.source_train_raw_dir}, "
-                f"work_dir={epoch_dir}, N={self.runtime_config.generation.source_count_hint}, "
-                f"generated_per_epoch={self.runtime_config.generation.source_count_hint * 3}"
+                f"work_dir={epoch_dir}, "
+                f"road_data_use_ratio={self.runtime_config.generation.road_data_use_ratio}, "
+                f"selected_N~={selected_hint}, "
+                f"generated_per_epoch~={selected_hint * self.runtime_config.generation.rollouts_per_scenario}"
             )
 
         was_training = bool(model.training)

@@ -1887,16 +1887,20 @@ H100 preset은 `experiment=self_forced_npfm_sid_h100_4` 또는
 |---|---:|
 | action | `road_finetune` |
 | 시작 checkpoint | Flow Matching pretrained checkpoint |
-| fine-tuning epoch | 32 |
+| fine-tuning epoch | 10 |
 | max learning rate | `5e-5` |
 | 원본 WOMD training scenario 수 | 486,995 |
+| epoch당 원본 scenario 사용 비율 | `road_data_use_ratio=0.1` |
+| epoch당 원본 scenario 수 | 약 48,700 |
 | scenario당 RoaD rollout 수 | 3 |
-| epoch마다 생성되는 RoaD cache 수 | 1,460,985 |
-| RoaD 1 epoch에서 실제 학습 sample 수 | 486,995 |
+| epoch마다 생성되는 RoaD cache 수 | 약 146,100 |
+| RoaD 1 epoch에서 실제 학습 sample 수 | 약 146,100 |
 | candidate 수 | 64 |
+| candidate 생성 diffusion step | 16 |
 | sampling temperature | 0.8 |
 | closed-loop commit 단위 | 0.5초, 즉 5 step |
 | 후보 선택 기준 | 첫 20 step의 사각형 4개 꼭지점 평균 거리 |
+| validation scorer scene 수 | 1680 |
 | data update frequency | always |
 | 사용 완료 cache | epoch 종료 직후 삭제 |
 
@@ -1942,14 +1946,14 @@ python src/run.py \
 3. 각 0.5초 block마다 현재 closed-loop scene에서 후보 64개를 temperature 0.8로 새로 만들고, GT future와 사각형 4개 꼭지점 평균 거리가 가장 작은 후보를 agent별로 고릅니다.
 4. 선택된 후보의 앞 0.5초만 scene에 반영하고, 이 과정을 16번 반복해 8초 future를 만듭니다.
 5. 선택된 future를 기존 WOMD `.pkl` schema와 같은 RoaD `.pkl` cache로 저장합니다.
-6. 생성된 3N개 cache 중 scenario마다 하나만 균등하게 골라 selected cache 폴더를 만듭니다.
-7. selected cache N개만 사용해 1 epoch 학습합니다. 따라서 optimizer update 수는 기존 CAT-K fine-tuning 1 epoch와 같습니다.
+6. 생성된 3N개 cache를 모두 selected cache 폴더에 넣습니다.
+7. selected cache 3N개를 모두 사용해 1 epoch 학습합니다.
 8. epoch 종료 후 다음 epoch용 RoaD cache를 최신 모델로 다시 만들고, 이미 사용한 이전 epoch cache는 삭제합니다.
-9. 이 과정을 32 epoch 반복합니다.
+9. 이 과정을 10 epoch 반복합니다.
 
 ### 저장 구조
 
-기본 저장 위치는 `${paths.output_dir}/road_cache`입니다.
+기본 저장 위치는 `/workspace/road_cache`입니다.
 
 ```text
 road_cache/
@@ -1958,7 +1962,7 @@ road_cache/
       variant_00/  # N개
       variant_01/  # N개
       variant_02/  # N개
-    selected/      # 실제 학습에 쓰는 N개
+    selected/      # 실제 학습에 쓰는 3N개
 ```
 
 `selected/`는 hardlink를 먼저 시도하고, 파일 시스템이 지원하지 않으면 복사합니다. 한 epoch 학습이 끝나면 해당 epoch 폴더는 삭제됩니다.

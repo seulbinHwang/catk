@@ -46,9 +46,22 @@ def set_model_for_finetuning(
         for p in module.parameters():
             p.requires_grad = True
 
+    def _freeze(module: torch.nn.Module) -> None:
+        for p in module.parameters():
+            p.requires_grad = False
+
     resolved_finetune_cfg = finetune if finetune_cfg is None else finetune_cfg
 
     if _is_finetune_enabled(resolved_finetune_cfg):
+        if _get_finetune_option(resolved_finetune_cfg, "freeze_smart_map_decoder_only", False):
+            for p in model.parameters():
+                p.requires_grad = True
+            if not hasattr(model, "map_encoder"):
+                raise ValueError("freeze_smart_map_decoder_only requires model.map_encoder")
+            _freeze(model.map_encoder)
+            log.info("Freezing SMARTMapDecoder/map_encoder only for finetuning")
+            return
+
         for p in model.parameters():
             p.requires_grad = False
 
