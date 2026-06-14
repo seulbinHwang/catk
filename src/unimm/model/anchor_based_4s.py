@@ -45,10 +45,11 @@ class UniMMAnchorBased4s(LightningModule):
 
     @staticmethod
     def _required_sim_agents_rollout_count() -> int:
-        submission_config = submission_specs.get_submission_config(
-            submission_specs.ChallengeType.SIM_AGENTS
-        )
-        return int(submission_config.n_rollouts)
+        get_submission_config = getattr(submission_specs, "get_submission_config", None)
+        challenge_type = getattr(getattr(submission_specs, "ChallengeType", None), "SIM_AGENTS", None)
+        if get_submission_config is not None and challenge_type is not None:
+            return int(get_submission_config(challenge_type).n_rollouts)
+        return int(submission_specs.N_ROLLOUTS)
 
     @staticmethod
     def _check_sim_agents_submission_rollout_count(is_active: bool, n_rollout_closed_val: int) -> None:

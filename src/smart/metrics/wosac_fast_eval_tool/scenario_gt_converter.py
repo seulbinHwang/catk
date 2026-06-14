@@ -7,6 +7,20 @@ from waymo_open_dataset.protos import map_pb2
 
 _LaneType = map_pb2.LaneCenter.LaneType
 
+
+def _get_sim_agent_ids(scenario: scenario_pb2.Scenario) -> List[int]:
+    challenge_type = getattr(getattr(submission_specs, "ChallengeType", None), "SIM_AGENTS", None)
+    if challenge_type is not None:
+        return submission_specs.get_sim_agent_ids(scenario, challenge_type)
+    return submission_specs.get_sim_agent_ids(scenario)
+
+
+def _get_evaluation_sim_agent_ids(scenario: scenario_pb2.Scenario) -> List[int]:
+    challenge_type = getattr(getattr(submission_specs, "ChallengeType", None), "SIM_AGENTS", None)
+    if challenge_type is not None:
+        return submission_specs.get_evaluation_sim_agent_ids(scenario, challenge_type)
+    return submission_specs.get_evaluation_sim_agent_ids(scenario)
+
 def extract_gt_scenario(scenario: scenario_pb2.Scenario, device='cpu') -> Dict:
     num_tracks = len(scenario.tracks)
     num_steps = 91
@@ -62,10 +76,7 @@ def extract_gt_scenario(scenario: scenario_pb2.Scenario, device='cpu') -> Dict:
 
     try:
         predict_agent_ids = torch.tensor(
-            submission_specs.get_evaluation_sim_agent_ids(
-                scenario,
-                submission_specs.ChallengeType.SIM_AGENTS,
-            ),
+            _get_evaluation_sim_agent_ids(scenario),
             device=device,
         ).int()
     except AttributeError:
@@ -82,7 +93,7 @@ def extract_gt_scenario(scenario: scenario_pb2.Scenario, device='cpu') -> Dict:
             'object_types': object_types,
             'road_edges': road_edges,
             'predict_index': predict_index.int(),
-            'sim_agent_ids': torch.tensor(submission_specs.get_sim_agent_ids(scenario, submission_specs.ChallengeType.SIM_AGENTS), device=device).int(),
+            'sim_agent_ids': torch.tensor(_get_sim_agent_ids(scenario), device=device).int(),
             'predict_agent_ids': predict_agent_ids,
             'lane_ids': lane_ids,
             'lane_polylines': lane_polylines,
