@@ -4,6 +4,7 @@ model_config:
   lr_warmup_steps: 0
   lr_total_steps: ${trainer.max_epochs}
   lr_min_ratio: 0.05
+  weight_decay: 0.01
   n_rollout_closed_val: 32
   # Optional: set this to the SMART pretrain CPD value only when you want DPR.
   # CPD/CES are evaluated regardless of this value.
@@ -38,6 +39,29 @@ model_config:
     criterium: topk_prob # {topk_dist_sampled_with_prob, topk_prob, topk_prob_sampled_with_dist}
     num_k: -1 # for k nearest neighbors, set to -1 to turn-off closed-loop training
     temp: 1.0
+  rlftsim:
+    enabled: false
+    train_rollouts_per_scenario: 4
+    wosac_version: "2025"
+    ego_only: false
+    reward_scale: 1.0
+    normalize_rewards: false
+    entropy_bonus: 0.0
+    kl_initial_beta: 0.01
+    kl_target: 0.01
+    kl_horizon: 5
+    kl_min: 1e-3
+    kl_max: 1e3
+    reference_sync_steps: 500
+    reference_sync_alpha: 0.005
+    accumulate_grad_batches: 1
+    gradient_clip_val: 1.0
+    gradient_clip_algorithm: norm
+    replay_rollout_chunk_size: 2
+    sampling:
+      criterium: categorical
+      num_k: -1
+      temp: 1.0
   decoder:
     hidden_dim: 128
     num_freq_bands: 64

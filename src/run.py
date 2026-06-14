@@ -128,6 +128,13 @@ def run(cfg: DictConfig) -> None:
             strict=False,
         )
         trainer.fit(model=model, datamodule=datamodule)
+    elif cfg.action == "rlftsim_finetune":
+        log.info("Starting RLFTSim finetuning!")
+        model.load_state_dict(
+            torch.load(cfg.ckpt_path, weights_only=False)["state_dict"],
+            strict=False,
+        )
+        trainer.fit(model=model, datamodule=datamodule)
     elif cfg.action == "validate":
         log.info("Starting validating!")
         trainer.validate(
