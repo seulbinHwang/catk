@@ -3,7 +3,11 @@ from types import SimpleNamespace
 
 import torch
 
-from src.smart.road.cache import build_selected_epoch_cache
+from src.smart.road.cache import (
+    ROAD_UNUSED_AGENT_FIELDS,
+    build_road_cache_sample,
+    build_selected_epoch_cache,
+)
 from src.smart.road.generator import (
     RoadGenerationConfig,
     _split_repeated_rollout_by_sample,
@@ -213,6 +217,36 @@ def _make_source_sample(num_agents: int = 2) -> dict:
             "shape": shape,
         },
     }
+
+
+def test_road_cache_sample_drops_stale_control_side_fields(tmp_path) -> None:
+    sample = _make_source_sample(num_agents=2)
+    sample["scenario_id"] = "scenario_with_control_sidecars"
+    sample["agent"]["control_aligned_future_pos"] = torch.ones(2, 16, 20, 2)
+    sample["agent"]["control_aligned_future_heading"] = torch.ones(2, 16, 20)
+    sample["agent"]["control_transition_norm_future"] = torch.ones(2, 16, 3)
+    sample["agent"]["control_alignment_cache_key"] = "stale-original-future"
+
+    road_sample = build_road_cache_sample(
+        source_sample=sample,
+        rollout_xy=torch.full((2, 80, 2), 3.0),
+        rollout_heading=torch.full((2, 80), 0.25),
+        rollout_valid=torch.ones(2, 80, dtype=torch.bool),
+        rollout_index=1,
+        source_path=tmp_path / "scenario_with_control_sidecars.pkl",
+    )
+
+    for key in ROAD_UNUSED_AGENT_FIELDS:
+        assert key not in road_sample["agent"]
+    assert road_sample["scenario_id"] == "scenario_with_control_sidecars__road_r01"
+    assert torch.equal(
+        road_sample["agent"]["position"][:, 11:91, :2],
+        torch.full((2, 80, 2), 3.0),
+    )
+    assert torch.equal(
+        road_sample["agent"]["heading"][:, 11:91],
+        torch.full((2, 80), 0.25),
+    )
 
 
 def test_generate_road_epoch_cache_uses_generation_batch_size(tmp_path, monkeypatch) -> None:

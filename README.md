@@ -1989,7 +1989,9 @@ road_cache/
 
 ### 주의사항
 
-`trainer.reload_dataloaders_every_n_epochs=1`이 필요합니다. 새 epoch마다 selected cache 폴더가 바뀌기 때문입니다. `road_flow` 실험 설정에는 이 값이 이미 들어 있습니다.
+`trainer.reload_dataloaders_every_n_epochs=1`이 필요합니다. 새 epoch마다 selected cache 폴더가 바뀌기 때문입니다. `road_flow` 실험 설정에는 이 값이 이미 들어 있습니다. 같은 이유로 `data.persistent_workers=false`도 고정합니다. persistent worker가 켜져 있으면 epoch 사이에 오래된 train dataset/cache handle을 잡고 있을 수 있으므로 RoaD fine-tuning action은 이 설정이 켜진 경우 실행을 거부합니다.
+
+RoaD cache는 원본 WOMD sample의 future position/heading/velocity만 RoaD rollout으로 교체합니다. Flow-control pretrain cache에 들어 있는 원본 future 기준 control-side 보조 target field는 새 RoaD future와 의미가 맞지 않으므로 저장 전에 제거합니다. 학습 target은 항상 저장된 RoaD future에서 다시 계산되도록 유지합니다.
 
 `road.generation_batch_size`는 rank마다 여러 scenario를 묶어 cache 생성 inference를 수행하는 단위입니다. 기본 8이며, testas A100에서 GPU 사용량을 더 키우도록 설정되어 있습니다. agent 수가 많은 batch에서 CUDA OOM이 나면 해당 rank의 scene batch를 자동으로 쪼개 재시도합니다.
 

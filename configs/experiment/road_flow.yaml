@@ -72,5 +72,6 @@ data:
   # on_fit_start에서 epoch_000/selected로 자동 교체됩니다.
   # setup 단계에서는 원본 cache가 존재해야 하므로 먼저 원본 경로를 둡니다.
   train_raw_dir: ${road.source_train_raw_dir}
+  persistent_workers: false
   train_epoch_sample_fraction: 1.0
   train_use_eval_agent_selection: true

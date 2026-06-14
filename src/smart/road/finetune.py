@@ -426,6 +426,12 @@ def run_road_finetune(
         None
     """
     runtime_config = build_road_runtime_config(cfg)
+    data_cfg = cfg.get("data")
+    if bool(_cfg_get(data_cfg, "persistent_workers", False)):
+        raise ValueError(
+            "RoaD fine-tuning refreshes the train cache every epoch, so "
+            "data.persistent_workers must be false to avoid stale worker dataset state."
+        )
     manager = RoadEpochCacheManager(runtime_config)
     callback = RoadAlwaysRefreshCallback(manager)
     trainer.callbacks.append(callback)

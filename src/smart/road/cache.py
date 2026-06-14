@@ -11,6 +11,14 @@ import torch
 from torch import Tensor
 
 
+ROAD_UNUSED_AGENT_FIELDS = (
+    "control_aligned_future_heading",
+    "control_aligned_future_pos",
+    "control_alignment_cache_key",
+    "control_transition_norm_future",
+)
+
+
 def clone_sample_to_cpu(value: Any) -> Any:
     """캐시 저장 전에 tensor를 안전하게 CPU 값으로 복사합니다.
 
@@ -29,6 +37,22 @@ def clone_sample_to_cpu(value: Any) -> Any:
     if isinstance(value, tuple):
         return tuple(clone_sample_to_cpu(v) for v in value)
     return value
+
+
+def drop_unused_road_agent_fields(sample: dict[str, Any]) -> dict[str, Any]:
+    """RoaD future와 충돌할 수 있는 원본 control-side target cache를 제거합니다.
+
+    Args:
+        sample: RoaD future가 반영된 sample입니다.
+
+    Returns:
+        dict[str, Any]: stale control-side field가 제거된 sample입니다.
+    """
+    agent = sample.get("agent")
+    if isinstance(agent, MutableMapping):
+        for key in ROAD_UNUSED_AGENT_FIELDS:
+            agent.pop(key, None)
+    return sample
 
 
 def safe_scenario_id(sample: Mapping[str, Any], source_path: Path) -> str:
@@ -145,7 +169,7 @@ def build_road_cache_sample(
     road_sample["source_scenario_id"] = scenario_id
     road_sample["road_rollout_index"] = int(rollout_index)
     road_sample["road_source_path"] = source_path.as_posix()
-    return road_sample
+    return drop_unused_road_agent_fields(road_sample)
 
 
 def write_pickle(sample: Mapping[str, Any], output_path: Path) -> None:
