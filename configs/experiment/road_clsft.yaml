@@ -29,7 +29,7 @@ model:
 road:
   cache_root_dir: /workspace/road_cache
   road_data_use_ratio: 0.1
-  num_rollouts_per_scenario: 3
+  num_rollouts_per_scenario: 1
   generation_batch_size: ${data.train_batch_size}
   num_workers: ${data.num_workers}
   pin_memory: ${data.pin_memory}

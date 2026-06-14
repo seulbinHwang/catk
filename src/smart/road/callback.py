@@ -7,6 +7,8 @@ from omegaconf import DictConfig
 from src.smart.road.cache import (
     delete_cache_dir,
     generate_road_cache,
+    prepare_road_cache_output_dir,
+    resolve_road_num_rollouts_per_scenario,
     resolve_autocast_dtype_from_precision,
 )
 
@@ -106,28 +108,39 @@ class RoadCacheRefreshCallback(Callback):
         """
         cache_dir = self._cache_dir(epoch)
         if trainer.global_rank == 0:
-            autocast_dtype = resolve_autocast_dtype_from_precision(
-                getattr(trainer, "precision", None)
-            )
-            generate_road_cache(
-                model=pl_module,
-                original_train_raw_dir=self.original_train_raw_dir,
-                output_dir=cache_dir,
-                transform=trainer.datamodule.train_transform,
-                sampling_scheme=self.sampling_scheme,
-                road_data_use_ratio=self.road_data_use_ratio,
-                num_rollouts_per_scenario=self.num_rollouts_per_scenario,
-                batch_size=self._generation_batch_size(trainer),
-                num_workers=self.num_workers,
-                pin_memory=self.pin_memory,
-                num_historical_steps=pl_module.num_historical_steps,
-                device=None,
-                autocast_dtype=autocast_dtype,
-            )
+            prepare_road_cache_output_dir(cache_dir)
+        self._sync(trainer, f"road_cache_epoch_{epoch:03d}_prepared")
+
+        autocast_dtype = resolve_autocast_dtype_from_precision(
+            getattr(trainer, "precision", None)
+        )
+        effective_num_rollouts_per_scenario = resolve_road_num_rollouts_per_scenario(
+            sampling_scheme=self.sampling_scheme,
+            requested_num_rollouts_per_scenario=self.num_rollouts_per_scenario,
+        )
+        generate_road_cache(
+            model=pl_module,
+            original_train_raw_dir=self.original_train_raw_dir,
+            output_dir=cache_dir,
+            transform=trainer.datamodule.train_transform,
+            sampling_scheme=self.sampling_scheme,
+            road_data_use_ratio=self.road_data_use_ratio,
+            num_rollouts_per_scenario=effective_num_rollouts_per_scenario,
+            batch_size=self._generation_batch_size(trainer),
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            num_historical_steps=pl_module.num_historical_steps,
+            device=None,
+            autocast_dtype=autocast_dtype,
+            distributed_rank=trainer.global_rank,
+            distributed_world_size=trainer.world_size,
+            selection_seed=epoch,
+            clean_output_dir=False,
+        )
         self._sync(trainer, f"road_cache_epoch_{epoch:03d}_generated")
         trainer.datamodule.set_train_raw_dir(
             cache_dir,
-            road_num_rollouts_per_scenario=self.num_rollouts_per_scenario,
+            road_num_rollouts_per_scenario=effective_num_rollouts_per_scenario,
         )
         return cache_dir
 

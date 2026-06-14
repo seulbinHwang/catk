@@ -96,11 +96,8 @@ main() {
   local test_batch_size="${TEST_BATCH_SIZE:-12}"
   local road_cache_root="${ROAD_CACHE_ROOT:-/workspace/road_cache/${task_name}}"
   local road_data_use_ratio="${ROAD_DATA_USE_RATIO:-0.1}"
-  local road_num_rollouts="${ROAD_NUM_ROLLOUTS_PER_SCENARIO:-3}"
-  local road_generation_batch_size="${ROAD_GENERATION_BATCH_SIZE:-}"
-  if [[ -z "$road_generation_batch_size" ]]; then
-    road_generation_batch_size=$((train_batch_size * 4))
-  fi
+  local road_num_rollouts="${ROAD_NUM_ROLLOUTS_PER_SCENARIO:-1}"
+  local road_generation_batch_size="${ROAD_GENERATION_BATCH_SIZE:-160}"
   local road_num_workers="${ROAD_NUM_WORKERS:-10}"
   local ckpt_artifact="${CKPT_ARTIFACT:-jksg01019-naver-labs/SMART-FLOW/epoch-last-1iapr5ed:v21}"
   local ckpt_download_dir="${CKPT_DOWNLOAD_DIR:-/workspace/checkpoints/road_clsft_epoch21_1iapr5ed_v21}"
