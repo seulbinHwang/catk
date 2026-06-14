@@ -64,6 +64,7 @@ def render_env_file(*, args: argparse.Namespace, task_name: str, run_id: str) ->
         export_line("TRAIN_BATCH_SIZE", args.train_batch_size),
         export_line("VAL_BATCH_SIZE", args.val_batch_size),
         export_line("TEST_BATCH_SIZE", args.test_batch_size),
+        export_line("RLFTSIM_TRAIN_RATIO", args.rlftsim_train_ratio),
         export_line("MAX_EPOCHS", args.max_epochs),
         export_line("CATK_LR", args.learning_rate),
         export_line("CATK_CKPT_PATH", args.ckpt_path),
@@ -317,6 +318,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-batch-size", default=os.environ.get("TRAIN_BATCH_SIZE", "8"))
     parser.add_argument("--val-batch-size", default=os.environ.get("VAL_BATCH_SIZE", "8"))
     parser.add_argument("--test-batch-size", default=os.environ.get("TEST_BATCH_SIZE", "8"))
+    parser.add_argument("--rlftsim-train-ratio", default=os.environ.get("RLFTSIM_TRAIN_RATIO", "1.0"))
     parser.add_argument("--limit-train-batches", default=os.environ.get("LIMIT_TRAIN_BATCHES", ""))
     parser.add_argument("--limit-val-batches", default=os.environ.get("LIMIT_VAL_BATCHES", ""))
     parser.add_argument("--limit-test-batches", default=os.environ.get("LIMIT_TEST_BATCHES", ""))
@@ -341,6 +343,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("--ckpt-path/CKPT_PATH or --ckpt-artifact/CKPT_ARTIFACT is required")
     if not args.nproc_per_node.isdigit() or int(args.nproc_per_node) != 7:
         parser.error("--nproc-per-node must be 7 for the testas A100x7 preset")
+    try:
+        rlftsim_train_ratio = float(args.rlftsim_train_ratio)
+    except ValueError:
+        parser.error("--rlftsim-train-ratio must be a float in (0, 1]")
+    if not 0.0 < rlftsim_train_ratio <= 1.0:
+        parser.error("--rlftsim-train-ratio must be in (0, 1]")
     if args.monitor_interval < 1:
         parser.error("--monitor-interval must be >= 1")
     if args.extra_hydra_overrides:

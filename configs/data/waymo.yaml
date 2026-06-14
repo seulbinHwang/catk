@@ -13,3 +13,4 @@ test_raw_dir: ${paths.cache_root}/testing
 train_max_num: 32
 train_use_eval_agent_selection: false
 road_num_rollouts_per_scenario: 1
+train_epoch_sample_fraction: 1.0

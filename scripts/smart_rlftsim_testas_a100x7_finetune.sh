@@ -120,6 +120,7 @@ main() {
   local ckpt_path="${CATK_CKPT_PATH:-${CKPT_PATH:-}}"
   local ckpt_artifact="${CATK_CKPT_ARTIFACT:-${CKPT_ARTIFACT:-}}"
   local ckpt_download_dir="${CATK_CKPT_DOWNLOAD_DIR:-${CKPT_DOWNLOAD_DIR:-/workspace/checkpoints/smart_rlftsim_testas_a100x7}}"
+  local rlftsim_train_ratio="${RLFTSIM_TRAIN_RATIO:-1.0}"
 
   case "$action" in
     rlftsim_finetune|validate|test) ;;
@@ -178,6 +179,7 @@ main() {
   log "  ckpt_path:        $ckpt_path"
   log "  ckpt_artifact:    ${ckpt_artifact:-none}"
   log "  train_batch_size: ${TRAIN_BATCH_SIZE:-8}"
+  log "  train_ratio:      $rlftsim_train_ratio"
   log "  rlftsim_accum:    1"
 
   local app_args=(
@@ -198,7 +200,11 @@ main() {
     data.train_batch_size="${TRAIN_BATCH_SIZE:-8}"
     data.val_batch_size="${VAL_BATCH_SIZE:-8}"
     data.test_batch_size="${TEST_BATCH_SIZE:-8}"
+    rlftsim_train_ratio="$rlftsim_train_ratio"
+    trainer.check_val_every_n_epoch=1
     trainer.accumulate_grad_batches=1
+    model.model_config.finetune=true
+    model.model_config.finetune_freeze_mode=map_encoder_only
     model.model_config.rlftsim.accumulate_grad_batches=1
     model.model_config.val_open_loop=false
     model.model_config.validation_rollout_sampling.num_k=32

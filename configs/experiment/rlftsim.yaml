@@ -3,6 +3,8 @@
 defaults:
   - override /model: smart
 
+rlftsim_train_ratio: 1.0
+
 model:
   model_config:
     lr: 3e-6
@@ -47,7 +49,8 @@ model:
         criterium: topk_prob
         num_k: 32
         temp: 1.0
-    finetune: false
+    finetune: true
+    finetune_freeze_mode: map_encoder_only
 
 ckpt_path: BC_PRETRAINED_MODEL.ckpt
 
@@ -70,6 +73,7 @@ data:
   test_batch_size: 8
   num_workers: 8
   train_use_eval_agent_selection: true
+  train_epoch_sample_fraction: ${rlftsim_train_ratio}
   train_tfrecords_splitted: ${paths.cache_root}/training_tfrecords_splitted
 
 action: rlftsim_finetune
