@@ -121,6 +121,7 @@ main() {
   local ckpt_artifact="${CATK_CKPT_ARTIFACT:-${CKPT_ARTIFACT:-}}"
   local ckpt_download_dir="${CATK_CKPT_DOWNLOAD_DIR:-${CKPT_DOWNLOAD_DIR:-/workspace/checkpoints/smart_rlftsim_testas_a100x7}}"
   local rlftsim_train_ratio="${RLFTSIM_TRAIN_RATIO:-1.0}"
+  local find_unused_parameters="${FIND_UNUSED_PARAMETERS:-false}"
 
   case "$action" in
     rlftsim_finetune|validate|test) ;;
@@ -181,6 +182,7 @@ main() {
   log "  train_batch_size: ${TRAIN_BATCH_SIZE:-8}"
   log "  train_ratio:      $rlftsim_train_ratio"
   log "  rlftsim_accum:    1"
+  log "  find_unused:      $find_unused_parameters"
 
   local app_args=(
     -m src.run
@@ -191,7 +193,7 @@ main() {
     trainer.num_nodes=1
     ++trainer.enable_progress_bar=true
     trainer.precision=bf16-mixed
-    trainer.strategy.find_unused_parameters=true
+    trainer.strategy.find_unused_parameters="$find_unused_parameters"
     trainer.sync_batchnorm=false
     +trainer.use_distributed_sampler=false
     paths.cache_root="$cache_root"

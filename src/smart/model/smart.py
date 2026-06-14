@@ -1159,6 +1159,12 @@ class SMART(LightningModule):
             if was_encoder_training:
                 self.encoder.train()
 
+    def _rlftsim_map_encoder_is_frozen(self) -> bool:
+        return all(
+            not parameter.requires_grad
+            for parameter in self.encoder.map_encoder.parameters()
+        )
+
     def _compute_rlftsim_forced_replay_stats(
         self,
         *,
@@ -1188,8 +1194,16 @@ class SMART(LightningModule):
         try:
             with self._rlftsim_replay_precision_context(tokenized_agent["batch"].device):
                 map_feature = self.encoder.map_encoder(tokenized_map)
-                with torch.no_grad():
-                    ref_map_feature = self._rlftsim_ref_encoder.map_encoder(tokenized_map)
+                if self._rlftsim_map_encoder_is_frozen():
+                    # The reference encoder is initialized from the current encoder and
+                    # a frozen map encoder cannot drift, so this avoids an identical
+                    # fp32 map pass without changing the replay objective.
+                    ref_map_feature = map_feature
+                else:
+                    with torch.no_grad():
+                        ref_map_feature = self._rlftsim_ref_encoder.map_encoder(
+                            tokenized_map
+                        )
                 rollout_map_feature = self._build_parallel_rollout_map_feature(
                     map_feature=map_feature,
                     repeat_count=chunk_repeat,
