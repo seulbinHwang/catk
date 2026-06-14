@@ -1186,52 +1186,53 @@ class SMART(LightningModule):
         was_encoder_training = self.encoder.training
         self.encoder.eval()
         try:
-            map_feature = self.encoder.map_encoder(tokenized_map)
-            with torch.no_grad():
-                ref_map_feature = self._rlftsim_ref_encoder.map_encoder(tokenized_map)
-            rollout_map_feature = self._build_parallel_rollout_map_feature(
-                map_feature=map_feature,
-                repeat_count=chunk_repeat,
-                num_graphs=num_graphs,
-            )
-            ref_rollout_map_feature = self._build_parallel_rollout_map_feature(
-                map_feature=ref_map_feature,
-                repeat_count=chunk_repeat,
-                num_graphs=num_graphs,
-            )
-            rollout_tokenized_agent = self._build_parallel_rollout_tokenized_agent(
-                tokenized_agent=tokenized_agent,
-                repeat_count=chunk_repeat,
-                num_graphs=num_graphs,
-            )
-            forced_chunk = forced_next_token_idx[:, list(rollout_indices)]
-            forced_chunk = (
-                forced_chunk.permute(1, 0, 2)
-                .reshape(chunk_repeat * num_agent, forced_chunk.shape[-1])
-                .contiguous()
-            )
-            pred = self.encoder.agent_encoder.inference(
-                rollout_tokenized_agent,
-                rollout_map_feature,
-                self.rlftsim_sampling,
-                scenario_sampling_seeds=None,
-                forced_next_token_idx=forced_chunk,
-            )
-            with torch.no_grad():
-                ref_pred = self._rlftsim_ref_encoder.agent_encoder.inference(
+            with self._rlftsim_replay_precision_context(tokenized_agent["batch"].device):
+                map_feature = self.encoder.map_encoder(tokenized_map)
+                with torch.no_grad():
+                    ref_map_feature = self._rlftsim_ref_encoder.map_encoder(tokenized_map)
+                rollout_map_feature = self._build_parallel_rollout_map_feature(
+                    map_feature=map_feature,
+                    repeat_count=chunk_repeat,
+                    num_graphs=num_graphs,
+                )
+                ref_rollout_map_feature = self._build_parallel_rollout_map_feature(
+                    map_feature=ref_map_feature,
+                    repeat_count=chunk_repeat,
+                    num_graphs=num_graphs,
+                )
+                rollout_tokenized_agent = self._build_parallel_rollout_tokenized_agent(
+                    tokenized_agent=tokenized_agent,
+                    repeat_count=chunk_repeat,
+                    num_graphs=num_graphs,
+                )
+                forced_chunk = forced_next_token_idx[:, list(rollout_indices)]
+                forced_chunk = (
+                    forced_chunk.permute(1, 0, 2)
+                    .reshape(chunk_repeat * num_agent, forced_chunk.shape[-1])
+                    .contiguous()
+                )
+                pred = self.encoder.agent_encoder.inference(
                     rollout_tokenized_agent,
-                    ref_rollout_map_feature,
+                    rollout_map_feature,
                     self.rlftsim_sampling,
                     scenario_sampling_seeds=None,
                     forced_next_token_idx=forced_chunk,
                 )
-            return self._compute_rlftsim_policy_stats(
-                pred=pred,
-                ref_pred=ref_pred,
-                rollout_tokenized_agent=rollout_tokenized_agent,
-                repeat_count=chunk_repeat,
-                num_graphs=num_graphs,
-            )
+                with torch.no_grad():
+                    ref_pred = self._rlftsim_ref_encoder.agent_encoder.inference(
+                        rollout_tokenized_agent,
+                        ref_rollout_map_feature,
+                        self.rlftsim_sampling,
+                        scenario_sampling_seeds=None,
+                        forced_next_token_idx=forced_chunk,
+                    )
+                return self._compute_rlftsim_policy_stats(
+                    pred=pred,
+                    ref_pred=ref_pred,
+                    rollout_tokenized_agent=rollout_tokenized_agent,
+                    repeat_count=chunk_repeat,
+                    num_graphs=num_graphs,
+                )
         finally:
             if was_encoder_training:
                 self.encoder.train()
@@ -1243,6 +1244,11 @@ class SMART(LightningModule):
         strategy = getattr(trainer, "strategy", None)
         if strategy is not None and hasattr(strategy, "block_backward_sync"):
             return strategy.block_backward_sync()
+        return nullcontext()
+
+    def _rlftsim_replay_precision_context(self, device: torch.device):
+        if device.type == "cuda":
+            return torch.autocast(device_type="cuda", enabled=False)
         return nullcontext()
 
     def _rlftsim_optimizer_step(self, optimizer) -> None:
