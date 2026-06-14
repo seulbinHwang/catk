@@ -1,16 +1,5 @@
 #!/usr/bin/env python3
-"""Launch goal-free RLFTSim fine-tuning on four existing V100x2 pods.
-
-The default layout is svvvv-2-1..svvvv-2-4, each with two V100 GPUs. The
-launcher never creates, deletes, or restarts pods. It only runs ``kubectl exec``
-against already-running pods and starts/kills tmux sessions inside them.
-The default training batch is microbatch 2 with gradient accumulation 4, which
-keeps the optimizer-effective per-process scenario batch at the paper value 8
-without exceeding 32GB V100 memory during four-rollout RLFTSim unrolls. For
-``rlftsim_finetune`` this accumulation is applied inside the RLFTSim manual
-optimization step because Lightning does not support automatic accumulation
-with manual optimization.
-"""
+"""Launch goal-free RLFTSim fine-tuning on the existing testas A100x7 pod."""
 
 from __future__ import annotations
 
@@ -23,22 +12,14 @@ import sys
 
 
 DEFAULT_NAMESPACE = "p-pnc"
-DEFAULT_PODS = ["svvvv-2-1", "svvvv-2-2", "svvvv-2-3", "svvvv-2-4"]
+DEFAULT_POD = "testas"
 DEFAULT_BRANCH = "traktok-rlftsim"
-DEFAULT_PROJECT_ROOT = "/tmp/catk_rlftsim_v100x2x4"
+DEFAULT_PROJECT_ROOT = "/tmp/catk_rlftsim_testas_a100x7"
 DEFAULT_LOG_DIR = "/mnt/nuplan/projects/catk/logs"
 DEFAULT_CACHE_ROOT = "/workspace/womd_v1_3/SMART_cache"
-DEFAULT_NPROC_PER_NODE = "2"
+DEFAULT_NPROC_PER_NODE = "7"
 DEFAULT_EXPERIMENT = "rlftsim"
 DEFAULT_ACTION = "rlftsim_finetune"
-DEFAULT_EXTRA_HYDRA_OVERRIDES = (
-    "trainer.precision=16-mixed "
-    "trainer.strategy.find_unused_parameters=true "
-    "trainer.sync_batchnorm=false "
-    "+trainer.use_distributed_sampler=false "
-    "logger.wandb.group=smart_rlftsim_v100x2x4 "
-    "logger.wandb.job_type=rlftsim_finetune"
-)
 
 
 def shq(value: object) -> str:
@@ -55,21 +36,6 @@ def run_kubectl(args: list[str], *, capture: bool = False) -> str:
     return result.stdout.strip() if capture else ""
 
 
-def pod_ip(namespace: str, pod: str) -> str:
-    return run_kubectl(
-        [
-            "get",
-            "pod",
-            pod,
-            "-n",
-            namespace,
-            "-o",
-            "jsonpath={.status.podIP}",
-        ],
-        capture=True,
-    )
-
-
 def export_line(name: str, value: object) -> str:
     return f"export {name}={shq(value)}"
 
@@ -83,27 +49,12 @@ def split_extra_hydra_overrides(overrides: str) -> list[str]:
         raise ValueError(f"--extra-hydra-overrides is not shell-parseable: {exc}") from exc
 
 
-def combine_hydra_overrides(user_overrides: str) -> str:
-    parts = split_extra_hydra_overrides(DEFAULT_EXTRA_HYDRA_OVERRIDES)
-    parts.extend(split_extra_hydra_overrides(user_overrides))
-    return " ".join(shq(part) for part in parts)
-
-
-def render_env_file(
-    *,
-    args: argparse.Namespace,
-    rank: int,
-    master_addr: str,
-    task_name: str,
-    run_id: str,
-) -> str:
+def render_env_file(*, args: argparse.Namespace, task_name: str, run_id: str) -> str:
     lines = [
         export_line("CACHE_ROOT", args.cache_root),
-        export_line("NNODES", len(args.pods)),
         export_line("NPROC_PER_NODE", args.nproc_per_node),
         export_line("TRAINER_DEVICES", args.nproc_per_node),
-        export_line("NODE_RANK", rank),
-        export_line("MASTER_ADDR", master_addr),
+        export_line("MASTER_ADDR", "127.0.0.1"),
         export_line("MASTER_PORT", args.master_port),
         export_line("TASK_NAME", task_name),
         export_line("CATK_EXPERIMENT", args.experiment),
@@ -113,12 +64,12 @@ def render_env_file(
         export_line("TRAIN_BATCH_SIZE", args.train_batch_size),
         export_line("VAL_BATCH_SIZE", args.val_batch_size),
         export_line("TEST_BATCH_SIZE", args.test_batch_size),
-        export_line("ACCUMULATE_GRAD_BATCHES", args.accumulate_grad_batches),
         export_line("MAX_EPOCHS", args.max_epochs),
         export_line("CATK_LR", args.learning_rate),
         export_line("CATK_CKPT_PATH", args.ckpt_path),
-        export_line("CATK_HYDRA_OVERRIDES", combine_hydra_overrides(args.extra_hydra_overrides)),
+        export_line("CATK_HYDRA_OVERRIDES", args.extra_hydra_overrides),
         export_line("CATK_ATTENTION_GRAPH_FP32", args.graph_attn_fp32),
+        export_line("WANDB_GROUP", args.wandb_group),
     ]
     optional_env = {
         "LIMIT_TRAIN_BATCHES": args.limit_train_batches,
@@ -142,12 +93,12 @@ set -a
 source {shq(env_file)}
 set +a
 
-echo "[tmux-run] pod=$(hostname) rank=${{NODE_RANK}} task=${{TASK_NAME}}"
+echo "[tmux-run] pod=$(hostname) task=${{TASK_NAME}}"
 echo "[tmux-run] started at $(date '+%F %T')"
 echo "[tmux-run] attach survives after exit; press Ctrl-b d to detach"
 echo
 
-bash scripts/smart_rlftsim_v100x2x4_finetune.sh
+bash scripts/smart_rlftsim_testas_a100x7_finetune.sh
 status=$?
 echo
 echo "[tmux-run] exited with status $status at $(date '+%F %T')"
@@ -168,29 +119,15 @@ done
 """
 
 
-def render_start_command(
-    *,
-    args: argparse.Namespace,
-    pod: str,
-    rank: int,
-    master_addr: str,
-    task_name: str,
-    run_id: str,
-) -> str:
+def render_start_command(*, args: argparse.Namespace, task_name: str, run_id: str) -> str:
     safe_task = task_name.replace("/", "_")
-    run_root = f"{args.log_dir.rstrip('/')}/tmux_smart_rlftsim_v100x2x4/{safe_task}"
-    env_file = f"{run_root}/{pod}.env"
-    run_file = f"{run_root}/{pod}_run.sh"
-    monitor_file = f"{run_root}/{pod}_monitor.sh"
-    log_file = f"{run_root}/{pod}.tmux.log"
+    run_root = f"{args.log_dir.rstrip('/')}/tmux_smart_rlftsim_testas_a100x7/{safe_task}"
+    env_file = f"{run_root}/{args.pod}.env"
+    run_file = f"{run_root}/{args.pod}_run.sh"
+    monitor_file = f"{run_root}/{args.pod}_monitor.sh"
+    log_file = f"{run_root}/{args.pod}.tmux.log"
     pipe_command = f"cat >> {shq(log_file)}"
-    env_text = render_env_file(
-        args=args,
-        rank=rank,
-        master_addr=master_addr,
-        task_name=task_name,
-        run_id=run_id,
-    )
+    env_text = render_env_file(args=args, task_name=task_name, run_id=run_id)
     run_text = render_run_script(args.project_root, env_file)
     monitor_text = render_monitor_script(args.monitor_interval, task_name)
 
@@ -257,7 +194,7 @@ chmod +x {shq(run_file)}
 tmux new-session -d -s {shq(args.session)} -c {shq(args.project_root)} {shq(run_file)}
 tmux pipe-pane -t {shq(args.session)} -o {shq(pipe_command)}
 {monitor_block}
-echo "[launcher] started tmux session {args.session} on pod {pod}"
+echo "[launcher] started tmux session {args.session} on pod {args.pod}"
 echo "[launcher] cache root: {args.cache_root}"
 echo "[launcher] tmux log: {log_file}"
 """
@@ -286,27 +223,20 @@ fi
 """
 
 
-def exec_in_pod(
-    namespace: str,
-    container: str,
-    pod: str,
-    script: str,
-    *,
-    dry_run: bool,
-) -> None:
+def exec_in_pod(args: argparse.Namespace, script: str) -> None:
     cmd = [
         "exec",
         "-n",
-        namespace,
-        pod,
+        args.namespace,
+        args.pod,
         "-c",
-        container,
+        args.container,
         "--",
         "bash",
         "-lc",
         script,
     ]
-    if dry_run:
+    if args.dry_run:
         print("kubectl " + " ".join(shq(part) for part in cmd))
         return
     run_kubectl(cmd)
@@ -329,20 +259,15 @@ git checkout -B "$branch" "origin/$branch"
 git status --short --branch
 git rev-parse --short HEAD
 """
-    for pod in args.pods:
-        exec_in_pod(args.namespace, args.container, pod, script, dry_run=args.dry_run)
+    exec_in_pod(args, script)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Start RLFTSim fine-tuning in tmux on four V100x2 pods.",
+        description="Start RLFTSim fine-tuning in tmux on the testas A100x7 pod.",
     )
     parser.add_argument("--namespace", default=os.environ.get("NAMESPACE", DEFAULT_NAMESPACE))
-    parser.add_argument(
-        "--pods",
-        nargs="+",
-        default=os.environ.get("PODS", " ".join(DEFAULT_PODS)).split(),
-    )
+    parser.add_argument("--pod", default=os.environ.get("POD", DEFAULT_POD))
     parser.add_argument("--container", default=os.environ.get("CONTAINER", "main"))
     parser.add_argument("--repo-url", default=os.environ.get("REPO_URL", "https://github.com/seulbinHwang/catk.git"))
     parser.add_argument("--project-root", default=os.environ.get("PROJECT_ROOT", DEFAULT_PROJECT_ROOT))
@@ -362,31 +287,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ckpt-path", default=os.environ.get("CKPT_PATH", ""))
     parser.add_argument("--task-name", default="")
     parser.add_argument("--run-id", default=os.environ.get("CATK_RUN_ID", ""))
-    parser.add_argument("--session", default=os.environ.get("SESSION", "catk-smart-rlftsim-v100x2x4"))
-    parser.add_argument("--master-addr", default="")
-    parser.add_argument("--master-port", default=os.environ.get("MASTER_PORT", "29561"))
+    parser.add_argument("--session", default=os.environ.get("SESSION", "catk-smart-rlftsim-testas-a100x7"))
+    parser.add_argument("--master-port", default=os.environ.get("MASTER_PORT", "29571"))
     parser.add_argument("--nproc-per-node", default=os.environ.get("NPROC_PER_NODE", DEFAULT_NPROC_PER_NODE))
     parser.add_argument("--log-dir", default=os.environ.get("REMOTE_LOG_DIR", DEFAULT_LOG_DIR))
-    parser.add_argument("--train-batch-size", default=os.environ.get("TRAIN_BATCH_SIZE", "2"))
+    parser.add_argument("--train-batch-size", default=os.environ.get("TRAIN_BATCH_SIZE", "8"))
     parser.add_argument("--val-batch-size", default=os.environ.get("VAL_BATCH_SIZE", "8"))
     parser.add_argument("--test-batch-size", default=os.environ.get("TEST_BATCH_SIZE", "8"))
-    parser.add_argument("--accumulate-grad-batches", default=os.environ.get("ACCUMULATE_GRAD_BATCHES", "4"))
     parser.add_argument("--limit-train-batches", default=os.environ.get("LIMIT_TRAIN_BATCHES", ""))
     parser.add_argument("--limit-val-batches", default=os.environ.get("LIMIT_VAL_BATCHES", ""))
     parser.add_argument("--limit-test-batches", default=os.environ.get("LIMIT_TEST_BATCHES", ""))
     parser.add_argument("--max-epochs", default=os.environ.get("MAX_EPOCHS", "1"))
     parser.add_argument("--learning-rate", default=os.environ.get("LEARNING_RATE", "3e-6"))
-    parser.add_argument(
-        "--graph-attn-fp32",
-        default=os.environ.get("CATK_ATTENTION_GRAPH_FP32", "0"),
-        choices=["0", "1"],
-        help="V100 memory guard. 0 keeps graph attention in mixed precision.",
-    )
-    parser.add_argument(
-        "--extra-hydra-overrides",
-        default=os.environ.get("EXTRA_HYDRA_OVERRIDES", ""),
-        help="Additional space-separated Hydra overrides appended after the V100 defaults.",
-    )
+    parser.add_argument("--graph-attn-fp32", default=os.environ.get("CATK_ATTENTION_GRAPH_FP32", "1"), choices=["0", "1"])
+    parser.add_argument("--wandb-group", default=os.environ.get("WANDB_GROUP", "smart_rlftsim_testas_a100x7"))
+    parser.add_argument("--extra-hydra-overrides", default=os.environ.get("EXTRA_HYDRA_OVERRIDES", ""))
     parser.add_argument("--monitor-interval", type=int, default=int(os.environ.get("MONITOR_INTERVAL", "30")))
     parser.add_argument("--no-monitor-pane", action="store_true")
     parser.add_argument("--replace", action="store_true")
@@ -396,15 +311,15 @@ def parse_args() -> argparse.Namespace:
 
     if not args.stop and not args.ckpt_path:
         parser.error("--ckpt-path or CKPT_PATH is required")
-    if len(args.pods) != 4 and not args.stop:
-        parser.error("this preset expects exactly four V100x2 pods")
-    if not args.nproc_per_node.isdigit() or int(args.nproc_per_node) != 2:
-        parser.error("--nproc-per-node must be 2 for the V100x2x4 preset")
+    if not args.nproc_per_node.isdigit() or int(args.nproc_per_node) != 7:
+        parser.error("--nproc-per-node must be 7 for the testas A100x7 preset")
     if args.monitor_interval < 1:
         parser.error("--monitor-interval must be >= 1")
+    if args.extra_hydra_overrides:
+        split_extra_hydra_overrides(args.extra_hydra_overrides)
     if not args.task_name:
         stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        args.task_name = f"smart_rlftsim_v100x2x4_{stamp}"
+        args.task_name = f"smart_rlftsim_testas_a100x7_{stamp}"
     if not args.run_id:
         args.run_id = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     return args
@@ -413,50 +328,29 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     if args.stop:
-        for pod in args.pods:
-            exec_in_pod(
-                args.namespace,
-                args.container,
-                pod,
-                render_stop_command(args.session, args.task_name),
-                dry_run=args.dry_run,
-            )
+        exec_in_pod(args, render_stop_command(args.session, args.task_name))
         return
 
     if args.prepare:
         prepare_project_root(args)
 
-    master_addr = args.master_addr or (
-        "<MASTER_POD_IP>" if args.dry_run else pod_ip(args.namespace, args.pods[0])
-    )
-    print(f"[launcher] master pod: {args.pods[0]} ({master_addr}:{args.master_port})")
+    print(f"[launcher] pod:       {args.pod}")
     print(f"[launcher] task_name: {args.task_name}")
     print(f"[launcher] run_id:    {args.run_id}")
     print(f"[launcher] session:   {args.session}")
     print(f"[launcher] cache root: {args.cache_root}")
     print(f"[launcher] ckpt_path:  {args.ckpt_path}")
-    print("[launcher] rank layout:")
-    for rank, pod in enumerate(args.pods):
-        print(f"  {pod}: node_rank={rank}, local_world_size={args.nproc_per_node}")
+    print(f"[launcher] GPUs:       {args.nproc_per_node}")
 
-    for rank, pod in enumerate(args.pods):
-        script = render_start_command(
-            args=args,
-            pod=pod,
-            rank=rank,
-            master_addr=master_addr,
-            task_name=args.task_name,
-            run_id=args.run_id,
-        )
-        exec_in_pod(args.namespace, args.container, pod, script, dry_run=args.dry_run)
+    script = render_start_command(args=args, task_name=args.task_name, run_id=args.run_id)
+    exec_in_pod(args, script)
 
-    print("\nAttach commands:")
-    for pod in args.pods:
-        print(
-            "  kubectl exec -it "
-            f"-n {args.namespace} {pod} -c {args.container} -- "
-            f"tmux attach -t {args.session}"
-        )
+    print("\nAttach command:")
+    print(
+        "  kubectl exec -it "
+        f"-n {args.namespace} {args.pod} -c {args.container} -- "
+        f"tmux attach -t {args.session}"
+    )
 
 
 if __name__ == "__main__":

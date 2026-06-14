@@ -1,9 +1,5 @@
 #!/usr/bin/env bash
-# Run goal-free RLFTSim fine-tuning on one node of a homogeneous V100x2x4 job.
-#
-# This script is executed inside each pod by
-# scripts/launch_smart_rlftsim_v100x2x4.py. It expects NODE_RANK,
-# MASTER_ADDR, NNODES, and NPROC_PER_NODE to be exported by the launcher.
+# Run goal-free RLFTSim fine-tuning on the testas A100x7 pod.
 set -Eeuo pipefail
 
 log() {
@@ -88,15 +84,13 @@ main() {
   activate_conda_if_available
 
   local cache_root="${CACHE_ROOT:-$(default_cache_root)}"
-  local nnodes="${NNODES:-4}"
-  local nproc_per_node="${NPROC_PER_NODE:-2}"
+  local nproc_per_node="${NPROC_PER_NODE:-7}"
   local trainer_devices="${TRAINER_DEVICES:-}"
-  local node_rank="${NODE_RANK:-}"
-  local master_addr="${MASTER_ADDR:-}"
-  local master_port="${MASTER_PORT:-29561}"
+  local master_addr="${MASTER_ADDR:-127.0.0.1}"
+  local master_port="${MASTER_PORT:-29571}"
   local experiment="${CATK_EXPERIMENT:-rlftsim}"
   local action="${CATK_ACTION:-rlftsim_finetune}"
-  local task_name="${TASK_NAME:-smart_rlftsim_v100x2x4}"
+  local task_name="${TASK_NAME:-smart_rlftsim_testas_a100x7}"
   local run_id="${CATK_RUN_ID:-}"
   local ckpt_path="${CATK_CKPT_PATH:-${CKPT_PATH:-}}"
 
@@ -112,19 +106,11 @@ main() {
     exit 2
   fi
   if [[ ! -f "$ckpt_path" ]]; then
-    log "ERROR: checkpoint does not exist in this node: $ckpt_path"
-    exit 2
-  fi
-  if [[ "$nnodes" -gt 1 && -z "$node_rank" ]]; then
-    log "ERROR: multi-node launch requires NODE_RANK."
-    exit 2
-  fi
-  if [[ "$nnodes" -gt 1 && -z "$master_addr" ]]; then
-    log "ERROR: multi-node launch requires MASTER_ADDR."
+    log "ERROR: checkpoint does not exist: $ckpt_path"
     exit 2
   fi
   if [[ ! -d "$cache_root" ]]; then
-    log "ERROR: CACHE_ROOT does not exist in this node: $cache_root"
+    log "ERROR: CACHE_ROOT does not exist: $cache_root"
     exit 2
   fi
   if [[ "$action" == "rlftsim_finetune" && ! -d "$cache_root/training_tfrecords_splitted" ]]; then
@@ -148,20 +134,19 @@ main() {
     read -r -a extra_overrides <<< "$CATK_HYDRA_OVERRIDES"
   fi
 
-  log "starting SMART RLFTSim V100x2x4 run"
+  log "starting SMART RLFTSim testas A100x7 run"
   log "  experiment:       $experiment"
   log "  action:           $action"
   log "  task_name:        $task_name"
   log "  run_id:           ${run_id:-auto}"
-  log "  nnodes:           $nnodes"
   log "  nproc_per_node:   $nproc_per_node"
   log "  trainer.devices:  $trainer_devices"
-  log "  node_rank:        ${node_rank:-0}"
   log "  master_addr:      $master_addr"
   log "  master_port:      $master_port"
   log "  cache_root:       $cache_root"
   log "  ckpt_path:        $ckpt_path"
-  log "  graph_attn_fp32:  $CATK_ATTENTION_GRAPH_FP32"
+  log "  train_batch_size: ${TRAIN_BATCH_SIZE:-8}"
+  log "  rlftsim_accum:    1"
 
   local app_args=(
     -m src.run
@@ -169,36 +154,30 @@ main() {
     action="$action"
     trainer=ddp
     trainer.devices="$trainer_devices"
-    trainer.num_nodes="$nnodes"
+    trainer.num_nodes=1
     ++trainer.enable_progress_bar=true
+    trainer.precision=bf16-mixed
+    trainer.strategy.find_unused_parameters=true
+    trainer.sync_batchnorm=false
+    +trainer.use_distributed_sampler=false
     paths.cache_root="$cache_root"
     task_name="$task_name"
     ckpt_path="$ckpt_path"
+    data.train_batch_size="${TRAIN_BATCH_SIZE:-8}"
+    data.val_batch_size="${VAL_BATCH_SIZE:-8}"
+    data.test_batch_size="${TEST_BATCH_SIZE:-8}"
+    trainer.accumulate_grad_batches=1
+    model.model_config.rlftsim.accumulate_grad_batches=1
+    model.model_config.val_open_loop=false
+    model.model_config.validation_rollout_sampling.num_k=32
+    logger.wandb.group="${WANDB_GROUP:-smart_rlftsim_testas_a100x7}"
+    logger.wandb.job_type=rlftsim_finetune
   )
   if [[ -n "$run_id" ]]; then
     app_args+=("hydra.run.dir=${LOG_DIR:-${PWD}/logs}/${task_name}/runs/${run_id}")
   fi
   if [[ -n "${LOG_DIR:-}" ]]; then
     app_args+=(paths.log_dir="$LOG_DIR")
-  fi
-  if [[ -n "${TRAIN_BATCH_SIZE:-}" ]]; then
-    app_args+=(data.train_batch_size="$TRAIN_BATCH_SIZE")
-  fi
-  if [[ -n "${VAL_BATCH_SIZE:-}" ]]; then
-    app_args+=(data.val_batch_size="$VAL_BATCH_SIZE")
-  fi
-  if [[ -n "${TEST_BATCH_SIZE:-}" ]]; then
-    app_args+=(data.test_batch_size="$TEST_BATCH_SIZE")
-  fi
-  if [[ -n "${ACCUMULATE_GRAD_BATCHES:-}" ]]; then
-    if [[ "$experiment" == "rlftsim" ]]; then
-      app_args+=(trainer.accumulate_grad_batches=1)
-      if [[ "$action" == "rlftsim_finetune" ]]; then
-        app_args+=(model.model_config.rlftsim.accumulate_grad_batches="$ACCUMULATE_GRAD_BATCHES")
-      fi
-    else
-      app_args+=(trainer.accumulate_grad_batches="$ACCUMULATE_GRAD_BATCHES")
-    fi
   fi
   if [[ -n "${LIMIT_TRAIN_BATCHES:-}" ]]; then
     app_args+=(trainer.limit_train_batches="$LIMIT_TRAIN_BATCHES")
@@ -221,9 +200,8 @@ main() {
   app_args+=("$@")
 
   local torchrun_args=(
-    --nnodes "$nnodes"
+    --nnodes 1
     --nproc_per_node "$nproc_per_node"
-    --node_rank "${node_rank:-0}"
     --master_addr "$master_addr"
     --master_port "$master_port"
     "${app_args[@]}"
