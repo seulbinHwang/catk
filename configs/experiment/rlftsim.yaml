@@ -22,7 +22,7 @@ model:
       temp: 1.0
     training_rollout_sampling:
       criterium: topk_prob
-      num_k: -1
+      num_k: 32
       temp: 1.0
     rlftsim:
       enabled: true
@@ -44,8 +44,8 @@ model:
       gradient_clip_algorithm: norm
       replay_rollout_chunk_size: 2
       sampling:
-        criterium: categorical
-        num_k: -1
+        criterium: topk_prob
+        num_k: 32
         temp: 1.0
     finetune: false
 
