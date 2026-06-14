@@ -14,8 +14,9 @@
 import pickle
 import random
 from collections import defaultdict
+from os import PathLike
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Sequence, Union
 
 import numpy as np
 from torch_geometric.data import Dataset
@@ -23,6 +24,14 @@ from torch_geometric.data import Dataset
 from src.utils import RankedLogger
 
 log = RankedLogger(__name__, rank_zero_only=True)
+
+RawDir = Union[str, PathLike[str], Sequence[Union[str, PathLike[str]]]]
+
+
+def normalize_raw_dirs(raw_dir: RawDir) -> List[Path]:
+    if isinstance(raw_dir, (str, PathLike)):
+        return [Path(raw_dir)]
+    return [Path(path) for path in raw_dir]
 
 
 def get_road_group_key(raw_path: str) -> str:
@@ -72,19 +81,21 @@ def group_road_raw_paths(raw_paths: List[str], group_size: int) -> List[List[str
 class MultiDataset(Dataset):
     def __init__(
         self,
-        raw_dir: str,
+        raw_dir: RawDir,
         transform: Callable,
         tfrecord_dir: Optional[str] = None,
         road_num_rollouts_per_scenario: int = 1,
         random_scene_scale_config: Optional[dict] = None,
         random_time_shift_config: Optional[dict] = None,
     ) -> None:
-        raw_dir = Path(raw_dir)
-        self._raw_paths = [
-            p.as_posix()
-            for p in sorted(raw_dir.glob("*"))
-            if p.is_file() and not p.name.startswith(".")
-        ]
+        raw_dirs = normalize_raw_dirs(raw_dir)
+        self._raw_paths = []
+        for raw_dir_path in raw_dirs:
+            self._raw_paths.extend(
+                p.as_posix()
+                for p in sorted(raw_dir_path.glob("*"))
+                if p.is_file() and not p.name.startswith(".")
+            )
         self._road_num_rollouts_per_scenario = road_num_rollouts_per_scenario
         self._raw_path_groups: Optional[List[List[str]]] = None
 
@@ -100,7 +111,10 @@ class MultiDataset(Dataset):
         self.random_scene_scale_config = random_scene_scale_config
         self.random_time_shift_config = random_time_shift_config
 
-        log.info("Length of {} dataset is ".format(raw_dir) + str(self._num_samples))
+        raw_dir_label = ", ".join(path.as_posix() for path in raw_dirs)
+        log.info(
+            "Length of {} dataset is ".format(raw_dir_label) + str(self._num_samples)
+        )
         super(MultiDataset, self).__init__(
             transform=transform, pre_transform=None, pre_filter=None
         )

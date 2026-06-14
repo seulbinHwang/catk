@@ -56,6 +56,7 @@ class MultiDataModule(LightningDataModule):
         pin_memory: bool,
         persistent_workers: bool,
         train_max_num: int,
+        train_include_validation: bool = False,
         train_use_eval_agent_selection: bool = False,
         train_agent_token_sidecar_dir: Optional[str] = None,
         train_agent_token_sidecar_required: bool = False,
@@ -79,6 +80,7 @@ class MultiDataModule(LightningDataModule):
         self.persistent_workers = persistent_workers and num_workers > 0
         self.train_raw_dir = train_raw_dir
         self.val_raw_dir = val_raw_dir
+        self.train_include_validation = bool(train_include_validation)
         self.test_raw_dir = test_raw_dir
         self.val_tfrecords_splitted = val_tfrecords_splitted
         self.train_use_eval_agent_selection = train_use_eval_agent_selection
@@ -98,6 +100,7 @@ class MultiDataModule(LightningDataModule):
         self.random_scene_scale_config = random_scene_scale_config
         self.random_time_shift_config = random_time_shift_config
         self._train_dataset_raw_dir: Optional[str] = None
+        self._train_dataset_include_validation: Optional[bool] = None
         self._train_dataset_road_group_size: Optional[int] = None
         self._train_batch_sampler: Optional[MemoryBalancedDistributedBatchSampler] = None
 
@@ -124,6 +127,7 @@ class MultiDataModule(LightningDataModule):
         self.road_num_rollouts_per_scenario = road_num_rollouts_per_scenario
         self.train_dataset = None
         self._train_dataset_raw_dir = None
+        self._train_dataset_include_validation = None
         self._train_dataset_road_group_size = None
         self._train_batch_sampler = None
 
@@ -133,14 +137,25 @@ class MultiDataModule(LightningDataModule):
         RoaD fine-tuning에서는 epoch마다 cache 디렉터리가 바뀐다. 이 함수는
         dataloader가 새로 만들어질 때 현재 cache 위치를 기준으로 dataset을 다시 만든다.
         """
+        if self.train_include_validation and self.road_num_rollouts_per_scenario != 1:
+            raise ValueError(
+                "train_include_validation supports standard one-pickle-per-sample "
+                "training only. Set road_num_rollouts_per_scenario=1."
+            )
+        train_raw_dir = (
+            [self.train_raw_dir, self.val_raw_dir]
+            if self.train_include_validation
+            else self.train_raw_dir
+        )
         self.train_dataset = MultiDataset(
-            self.train_raw_dir,
+            train_raw_dir,
             self.train_transform,
             road_num_rollouts_per_scenario=self.road_num_rollouts_per_scenario,
             random_scene_scale_config=self.random_scene_scale_config,
             random_time_shift_config=self.random_time_shift_config,
         )
         self._train_dataset_raw_dir = self.train_raw_dir
+        self._train_dataset_include_validation = self.train_include_validation
         self._train_dataset_road_group_size = self.road_num_rollouts_per_scenario
 
     def setup(self, stage: Optional[str] = None) -> None:
@@ -167,6 +182,7 @@ class MultiDataModule(LightningDataModule):
             not hasattr(self, "train_dataset")
             or self.train_dataset is None
             or self._train_dataset_raw_dir != self.train_raw_dir
+            or self._train_dataset_include_validation != self.train_include_validation
             or self._train_dataset_road_group_size != self.road_num_rollouts_per_scenario
         )
         if needs_rebuild:
