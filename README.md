@@ -1897,7 +1897,7 @@ H100 preset은 `experiment=self_forced_npfm_sid_h100_4` 또는
 | RoaD 1 epoch에서 실제 학습 sample 수 | 약 146,100 |
 | candidate 수 | 64 |
 | cache 생성 scene batch | `generation_batch_size=8` |
-| candidate micro-batch | `candidate_micro_batch_size=8` |
+| candidate micro-batch | `candidate_micro_batch_size=16` |
 | checkpoint-compatible flow schema | control-space, `flow_window_steps=20`, `num_freq_bands=64`, `head_dim=15` |
 | candidate 생성 diffusion step | 16 |
 | sampling temperature | 0.8 |
@@ -1995,4 +1995,4 @@ RoaD cache는 원본 WOMD sample의 future position/heading/velocity만 RoaD rol
 
 `road.generation_batch_size`는 rank마다 여러 scenario를 묶어 cache 생성 inference를 수행하는 단위입니다. 기본 8이며, testas A100에서 GPU 사용량을 더 키우도록 설정되어 있습니다. agent 수가 많은 batch에서 CUDA OOM이 나면 해당 rank의 scene batch를 자동으로 쪼개 재시도합니다.
 
-`road.candidate_micro_batch_size`는 기본 8입니다. K=64 후보를 작은 묶음으로 나누어 생성하되, 단일 scene에서도 CUDA OOM이 나면 micro-batch를 자동으로 반씩 줄여 재시도합니다.
+`road.candidate_micro_batch_size`는 기본 16입니다. K=64 후보를 기존보다 큰 묶음으로 생성해 RoaD cache 생성 병목을 줄이고, CUDA OOM이 나면 먼저 micro-batch를 반씩 줄인 뒤 그래도 부족할 때 scene batch를 쪼개 재시도합니다.

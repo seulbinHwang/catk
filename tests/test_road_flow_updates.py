@@ -2,6 +2,7 @@ import pickle
 from types import SimpleNamespace
 
 import torch
+from torch_geometric.data import HeteroData
 
 from src.smart.road.cache import (
     ROAD_UNUSED_AGENT_FIELDS,
@@ -11,6 +12,7 @@ from src.smart.road.cache import (
 from src.smart.road.generator import (
     RoadGenerationConfig,
     _split_repeated_rollout_by_sample,
+    _to_repeated_batch_for_samples,
     extract_rollout_prediction,
     generate_road_epoch_cache,
     select_epoch_source_paths,
@@ -306,3 +308,24 @@ def test_generate_road_epoch_cache_uses_generation_batch_size(tmp_path, monkeypa
     assert generated == 5
     assert seen_batch_sizes == [2, 2, 1]
     assert len(list((tmp_path / "road_epoch" / "all" / "variant_00").glob("*.pkl"))) == 5
+
+
+def test_repeated_batch_transforms_each_source_sample_once() -> None:
+    source_samples = [_make_source_sample(num_agents=1), _make_source_sample(num_agents=2)]
+    transform_calls = 0
+
+    def counted_transform(sample):
+        nonlocal transform_calls
+        transform_calls += 1
+        return HeteroData(sample)
+
+    batch = _to_repeated_batch_for_samples(
+        samples=source_samples,
+        repeat_count=4,
+        transform=counted_transform,
+        device=torch.device("cpu"),
+    )
+
+    assert transform_calls == 2
+    assert batch.num_graphs == 8
+    assert batch["agent"]["position"].shape[0] == 12

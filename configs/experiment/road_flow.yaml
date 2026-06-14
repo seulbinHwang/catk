@@ -20,7 +20,7 @@ road:
   commit_steps: 5
   selection_horizon_steps: 20
   generation_batch_size: 8
-  candidate_micro_batch_size: 8
+  candidate_micro_batch_size: 16
   selected_variant_seed: ${seed}
   cleanup_used_cache: true
   overwrite_cache: false

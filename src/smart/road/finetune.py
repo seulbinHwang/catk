@@ -69,7 +69,7 @@ def build_road_runtime_config(cfg: DictConfig) -> RoadRuntimeConfig:
         sample_steps=int(road_cfg.get("sample_steps", 16)),
         sample_method=str(road_cfg.get("sample_method", "euler")),
         generation_batch_size=int(road_cfg.get("generation_batch_size", 1)),
-        candidate_micro_batch_size=int(road_cfg.get("candidate_micro_batch_size", 4)),
+        candidate_micro_batch_size=int(road_cfg.get("candidate_micro_batch_size", 16)),
         seed=int(cfg.get("seed", 817)),
         source_count_hint=int(road_cfg.get("num_source_scenarios", 486_995)),
         road_data_use_ratio=float(road_cfg.get("road_data_use_ratio", 0.1)),

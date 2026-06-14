@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import copy
+import gc
 import logging
 import math
 import pickle
@@ -33,7 +33,7 @@ class RoadGenerationConfig:
     sample_steps: int = 16
     sample_method: str = "euler"
     generation_batch_size: int = 8
-    candidate_micro_batch_size: int = 8
+    candidate_micro_batch_size: int = 16
     seed: int = 817
     source_count_hint: int = 486_995
     road_data_use_ratio: float = 0.1
@@ -48,8 +48,10 @@ def _is_cuda_oom(error: BaseException) -> bool:
 
 
 def _clear_cuda_cache(device: torch.device) -> None:
+    gc.collect()
     if device.type == "cuda" and torch.cuda.is_available():
         torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
 
 def build_sampling_scheme(config: RoadGenerationConfig) -> SimpleNamespace:
@@ -186,8 +188,8 @@ def build_shifted_sample(
         dict[str, Any]: 모델 입력용 scenario cache입니다.
             map 정보는 원본을 유지하고 agent 시간축만 현재 기준으로 바꿉니다.
     """
-    shifted = copy.deepcopy(source_sample)
-    agent = copy.deepcopy(source_sample["agent"])
+    shifted = dict(source_sample)
+    agent = dict(source_sample["agent"])
     total_steps = int(agent["position"].shape[1])
     source_steps = torch.arange(total_steps, dtype=torch.long) + int(current_abs_step) - 10
     in_range = (source_steps >= 0) & (source_steps < total_steps)
@@ -244,7 +246,8 @@ def _to_repeated_batch(
     Returns:
         Batch: 모델 입력입니다. agent 총 개수는 ``repeat_count * A`` 입니다.
     """
-    data_list = [transform(copy.deepcopy(sample)) for _ in range(int(repeat_count))]
+    data = transform(sample)
+    data_list = [data] * int(repeat_count)
     return _move_batch_to_device(Batch.from_data_list(data_list), device)
 
 
@@ -267,7 +270,8 @@ def _to_repeated_batch_for_samples(
     """
     data_list = []
     for sample in samples:
-        data_list.extend(transform(copy.deepcopy(sample)) for _ in range(int(repeat_count)))
+        data = transform(sample)
+        data_list.extend([data] * int(repeat_count))
     return _move_batch_to_device(Batch.from_data_list(data_list), device)
 
 
@@ -928,6 +932,26 @@ def generate_road_rollout_batch_with_oom_fallback(
         if not _is_cuda_oom(error):
             raise
         _clear_cuda_cache(device)
+        micro_batch_size = int(config.candidate_micro_batch_size)
+        if micro_batch_size > 1:
+            next_micro_batch_size = max(1, micro_batch_size // 2)
+            log.warning(
+                "RoaD cache generation CUDA OOM for one scene; reducing "
+                "candidate_micro_batch_size epoch=%s rollout=%s %s -> %s",
+                epoch_idx,
+                rollout_idx,
+                micro_batch_size,
+                next_micro_batch_size,
+            )
+            return generate_road_rollout_batch_with_oom_fallback(
+                model=model,
+                source_samples=source_samples,
+                transform=transform,
+                config=replace(config, candidate_micro_batch_size=next_micro_batch_size),
+                epoch_idx=epoch_idx,
+                rollout_idx=rollout_idx,
+                device=device,
+            )
         if len(source_samples) > 1:
             mid = max(1, len(source_samples) // 2)
             log.warning(
@@ -959,27 +983,6 @@ def generate_road_rollout_batch_with_oom_fallback(
                 device=device,
             )
             return first + second
-
-        micro_batch_size = int(config.candidate_micro_batch_size)
-        if micro_batch_size > 1:
-            next_micro_batch_size = max(1, micro_batch_size // 2)
-            log.warning(
-                "RoaD cache generation CUDA OOM for one scene; reducing "
-                "candidate_micro_batch_size epoch=%s rollout=%s %s -> %s",
-                epoch_idx,
-                rollout_idx,
-                micro_batch_size,
-                next_micro_batch_size,
-            )
-            return generate_road_rollout_batch_with_oom_fallback(
-                model=model,
-                source_samples=source_samples,
-                transform=transform,
-                config=replace(config, candidate_micro_batch_size=next_micro_batch_size),
-                epoch_idx=epoch_idx,
-                rollout_idx=rollout_idx,
-                device=device,
-            )
         raise
 
 
