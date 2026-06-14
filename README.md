@@ -38,7 +38,7 @@
 2025년 1월
 - **WOSAC 최고 수준 성능**: CAT-K는 [WOSAC 리더보드](https://waymo.com/open/challenges/2024/sim-agents/) 1위를 달성했다. agent token vocabulary 문제를 해결한 뒤 fine-tuned model은 **0.7702** RMM을 달성했다. 리더보드에는 공개하지 않았지만 BC로 32 epoch만 학습한 재현 SMART-tiny-7M도 **0.7671** RMM을 달성했고, 이는 당시 2위 방법과 비슷한 수준이다. 재현 절차도 비교적 단순하다.
 
-- **TrajTok paper-submit agent vocabulary and supervision**: agent token vocabulary는 [TrajTok](https://github.com/seulbinHwang/TrajTok)의 grid/expansion 기반 생성 방식으로 교체했다. [TrajTok 생성기](src/smart/tokens/trajtok.py)는 로그 궤적을 agent local frame으로 정규화하고 좌우 반전을 추가한 뒤, endpoint grid count, 주변 grid 기반 expansion/filtering, 빈 grid 보간을 거쳐 type별 vocabulary를 만든다. 현재 [trajtok_vocab.pkl](src/smart/tokens/trajtok_vocab.pkl)은 arXiv:2506.21618 Table 1의 submit grid를 사용한다. Vehicle grid는 `x=[-5, 20]`, `x_interval=0.1`, `y=[-1.5, 4.5]`, `y_interval=0.05`이고, 생성된 vocab size는 `veh=8037`, `ped=2998`, `cyc=2798`이다. 논문 Table 3의 submit/best size `8040/3001/2798`과 vehicle/ped는 3개 차이, cyclist는 exact다. Grid 안 대표 trajectory는 `x/y`는 일반 평균, heading은 sin/cos circular mean으로 만든다. Non-empty grid는 wrapped heading jump가 작으면 이 대표 trajectory를 그대로 쓰고, jump가 큰 non-empty grid와 expansion empty grid만 circular endpoint heading을 반영한 Hermite 보간 trajectory를 쓴다. Sparse subset vocab smoke처럼 filtering 뒤 interpolation source가 비는 예외 상황에서는 제거된 raw non-empty grid를 source로 사용해 전처리 생성을 계속한다. 정상 full-data 생성처럼 filtered non-empty source가 있으면 이 fallback은 동작하지 않는다. Token matching은 마지막 endpoint만 보지 않고, 현재 시점을 제외한 0.5초 미래 5개 frame의 box contour `[5, 4 corners, x/y]` 전체 평균 거리로 GT token을 고른다. Rolling recurrence는 유지하므로 선택된 token의 마지막 pose가 다음 0.5초 구간의 기준 pose가 된다. Spatial-aware label smoothing도 하나의 최종 구현만 사용한다. 정답 token과 모든 후보 token의 미래 5-frame contour distance를 계산하고, non-GT smoothing mass를 `1 / (distance^2 + epsilon)` 비율로 정확히 나눈다. 추가 uniform label smoothing이나 extra normalization은 적용하지 않는다. 전처리 cache 생성 시 heading은 `np.unwrap`으로 연속 보간하되, tokenization 단계에서는 TrajTok 공식 구현과 같이 `wrap_angle`을 먼저 적용한 뒤 heading cleaning을 수행한다. 현재 pretrain train dataset의 on-the-fly augmentation은 `random_scene_scale_config: null`, `random_time_shift_config: null`로 꺼져 있으며, validation/test/submission cache나 원본 pickle도 바꾸지 않는다.
+- **TrajTok paper-lock agent vocabulary and supervision**: `trajtok_upgrade`는 기존 `trajtok_vocab.pkl`을 보존하고 새 paper-lock vocab을 [trajtok_paperlock_vocab.pkl](src/smart/tokens/trajtok_paperlock_vocab.pkl)로 분리한다. [TrajTok 생성기](src/smart/tokens/trajtok.py)는 로그 궤적을 agent local frame으로 정규화하고 좌우 반전을 추가한 뒤, endpoint가 실제로 들어간 cell에 `floor` 기준으로 배정한다. 실제 궤적이 있는 cell은 `x/y` 일반 평균과 heading sin/cos circular mean으로 대표 trajectory를 만들며, cell center로 덮어쓰거나 보간으로 대체하지 않는다. Expansion으로 추가된 빈 cell만 cell center까지 Hermite 보간한다. Full training split 생성은 `--use-grid-stats --gpu-devices 0,1,2,3,4,5,6` 경로로 per-cell sufficient statistics를 직접 누적해 전체 궤적 materialization을 피한다. 목표 vocab size는 arXiv:2506.21618 Table 3의 `veh=8040`, `ped=3001`, `cyc=2798`이다. Token matching은 마지막 endpoint만 보지 않고 현재 시점을 제외한 0.5초 미래 5개 frame의 box contour `[5, 4 corners, x/y]` 전체 평균 거리로 GT token을 고른다. Rolling recurrence는 유지하므로 선택된 token의 마지막 pose가 다음 0.5초 구간의 기준 pose가 된다. Spatial-aware label smoothing도 하나의 최종 구현만 사용한다. 정답 token과 모든 후보 token의 미래 5-frame contour distance를 계산하고, non-GT smoothing mass를 `1 / (distance^2 + epsilon)` 비율로 정확히 나눈다. 추가 uniform label smoothing이나 extra normalization은 적용하지 않는다. 단어장 의미가 바뀌므로 기존 `trajtok` checkpoint를 이어 쓰지 않고 새 vocab으로 fresh pretrain한다.
 - **TrajTok decoder capacity**: 기본 SMART decoder는 `hidden_dim=128`, `num_heads=8`, `head_dim=16`, `num_map_layers=3`, `num_agent_layers=6`를 사용한다. Paper-submit vocab `veh=8037`, `ped=2998`, `cyc=2798` 기준으로 Hydra config를 compose한 뒤 SMART 모델을 직접 instantiate해서 측정한 전체 model parameter 수는 `8,580,025`개다. 모든 parameter가 trainable이며 non-trainable parameter는 0개다.
 
 ## 설치
@@ -314,14 +314,14 @@ bash scripts/start_smart_ntp_testas_a100x7_trajtok_pretrain_oom_retry.sh
 
 | 항목 | 값 |
 |---|---|
-| branch | `trajtok` |
+| branch | `trajtok_upgrade` |
 | pod / GPU | `testas`, A100 80GB 7장 |
 | total DDP ranks | 7 |
-| task name | `trajtok_pretrain_testas_a100x7_gbs126_lr595e4_oom_retry_20260605` |
-| remote project root | `/tmp/catk_smart_ntp_testas_a100x7_trajtok_20260605` |
+| task name | `trajtok_upgrade_paperlock_pretrain_testas_a100x7_gbs126_lr595e4_oom_retry` |
+| remote project root | `/tmp/catk_smart_ntp_testas_a100x7_trajtok_upgrade_paperlock` |
 | experiment | `pre_bc_a100x4x2` |
 | cache root | `/workspace/womd_v1_3/SMART_cache` |
-| model/tokenizer | Paper-submit TrajTok vocab `trajtok_vocab.pkl` (`veh=8037`, `ped=2998`, `cyc=2798`), type-specific agent heads, full 0.5초 future contour token matching, spatial-aware smoothing |
+| model/tokenizer | Paper-lock TrajTok vocab `trajtok_paperlock_vocab.pkl` (`veh=8040`, `ped=3001`, `cyc=2798`), type-specific agent heads, full 0.5초 future contour token matching, spatial-aware smoothing |
 | decoder | `hidden_dim=128`, `num_heads=8`, `head_dim=16`, `num_map_layers=3`, `num_agent_layers=6` |
 | train batch | `INITIAL_BS=18` per rank, effective global batch 126 |
 | OOM retry | `MIN_BS=14`, `OOM_STEP=2`, latest task checkpoint resume (`18 -> 16 -> 14`); retry attempt마다 LR도 현재 global batch 기준으로 재계산 |
@@ -505,6 +505,7 @@ GPU로 full 0.5초 future contour target을 검증했다.
 | 20260604 globalbs120 script smoke | `trajtok_h100x4_h100x2_globalbs120_lr612e4_script_smoke_20260604`, `data.train_batch_size=20`, 6 ranks, `lr=0.00061237244` | wrapper auto LR 계산, 1 train batch + 1 validation batch 정상 종료, open-loop/closed-loop Fast WOSAC/CPD/CES logging 확인, `run.py DONE` |
 | 20260605 circular vocab unit | `hsb-npc-training`, `wo-pvc-2`, direct Python test | circular heading mean이 `179/-179deg` 평균을 `0deg`로 무너뜨리지 않음, Hermite 보간 endpoint heading 보존 |
 | 20260605 circular vocab generation | `hsb-npc-training`, `/tmp/trajtok_paper_50k_traj_data.pkl` | 새 vocab 생성 성공, `veh=8037`, `ped=2998`, `cyc=2798`, shape `[N,6,3]`, `[N,6,4,2]`, `[N,4,2]` 정상 |
+| 20260614 paper-lock full-split vocab generation | `testas`, A100 7장, `--use-grid-stats`, `--grid-stats-worker-backend process`, `--max-workers 28`, full training cache | 새 `trajtok_paperlock_vocab.pkl` 생성 성공, `veh=8040`, `ped=3001`, `cyc=2798`, shape/finite 정상. 손상된 cache 파일 `/workspace/womd_v1_3/SMART_cache/training/11472cfedbb698ab.pkl` 1개는 warning 후 skip |
 | 20260605 old/new vocab delta | old calibrated 50k vocab vs circular vocab | changed token `veh=5763/8037`, `ped=2500/2998`, `cyc=2010/2798`; endpoint heading mean diff `13.38/9.67/7.26deg` |
 | 20260605 sparse real-cache vocab smoke | `hsb-npc-training`, real train cache 64 files, `max_traj_nums=5000` | sparse cyclist subset에서 filtered source가 비는 케이스 수정 후 vocab 생성 성공, `veh=1470`, `ped=213`, `cyc=7`, shape/finite check 정상 |
 | 20260605 circular vocab H100 4+2 fit smoke | `hsb-npc-training` 4 ranks + `wo-pvc-2` 2 ranks, real train cache, 1 train batch | 새 vocab load, forward/backward/optimizer step 정상 종료, `run.py DONE` |
@@ -539,29 +540,33 @@ unused parameter로 볼 수 있으므로, loss 값은 바꾸지 않는 `0 * para
 `find_unused_parameters=false`를 사용해도 type별 head gradient bucket이 항상 안전하게
 연결되고, PyTorch DDP의 unused-parameter extra traversal 비용은 피한다.
 
-현재 TrajTok vocab은 paper-submit recipe 재현용으로 아래 조건에서 생성했다.
+`trajtok_upgrade`의 TrajTok vocab은 paper-lock recipe 재현용으로 기존
+`trajtok_vocab.pkl`과 분리된 `trajtok_paperlock_vocab.pkl`에 생성한다. `testas`
+A100 7장을 쓰는 full training split 생성은 아래 wrapper를 사용한다.
+
+```bash
+bash scripts/build_trajtok_upgrade_paperlock_vocab_testas_a100x7.sh
+```
+
+직접 실행할 때의 핵심 명령은 다음과 같다.
 
 ```bash
 python -m src.smart.tokens.trajtok \
   --raw-data-path /workspace/womd_v1_3/SMART_cache/training \
-  --traj-data-path /tmp/trajtok_paper_50k_traj_data.pkl \
-  --output-path src/smart/tokens/trajtok_vocab.pkl \
-  --max-workers 64 \
-  --max-file-nums 50000 \
-  --max-traj-nums 12000000
+  --traj-data-path /workspace/womd_v1_3/SMART_cache/trajtok_upgrade_paperlock_grid_stats.pkl \
+  --output-path src/smart/tokens/trajtok_paperlock_vocab.pkl \
+  --use-grid-stats \
+  --gpu-devices 0,1,2,3,4,5,6 \
+  --grid-stats-worker-backend process \
+  --max-workers 28 \
+  --no-cache
 ```
 
-생성기는 arXiv:2506.21618 Table 1 grid와 Table 3 submit vocab size를 맞추도록
-class별 filtering threshold를 사용한다. 실 cache 기준 생성 결과는 `veh=8037`,
-`ped=2998`, `cyc=2798`이며, 논문 submit size `8040/3001/2798`에서 vehicle/ped는
-각각 3개 차이, cyclist는 exact다. Grid 안 representative trajectory의 heading은
-일반 평균이 아니라 sin/cos circular mean으로 계산한다. Non-empty grid는 wrapped yaw
-jump가 `10deg` 이하이면 이 representative를 그대로 사용하고, jump가 큰 non-empty
-grid와 expansion으로 추가된 empty grid만 가까운 valid grid의 circular endpoint heading을
-사용해 Hermite curve로 보간한다. 보간 curve의 시작/끝 tangent는 endpoint 거리 기준
-크기를 사용하며 마지막 heading은 source grid의 circular endpoint heading으로 고정한다.
-따라서 새 vocab 파일은 기존 checkpoint와 tensor shape은 호환되지만 token geometry가
-바뀌므로, 최종 RMM 비교는 이 vocab으로 새로 pretrain한 checkpoint에서 판단해야 한다.
+생성기는 arXiv:2506.21618 Table 1 grid와 Table 3 submit vocab size
+`8040/3001/2798`을 맞추도록 class별 filtering threshold 주변을 작게 탐색한 뒤 필요한
+경우에만 경계 cell을 최소 개수 보정한다. 실제 데이터가 있는 cell은 평균 trajectory를
+그대로 사용하고, expansion으로 추가된 빈 cell만 cell center까지 보간한다. 이 파일은 기존
+`trajtok_vocab.pkl`과 의미가 다르므로 기존 checkpoint를 이어 쓰지 않고 새로 pretrain한다.
 
 smoke test나 batch 조정은 환경 변수로만 바꾼다.
 

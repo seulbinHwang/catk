@@ -67,7 +67,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--train-max-num", type=int, default=32)
-    parser.add_argument("--agent-token-file", default="trajtok_vocab.pkl")
+    parser.add_argument("--agent-token-file", default="trajtok_paperlock_vocab.pkl")
     parser.add_argument("--map-token-file", default="map_traj_token5.pkl")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--limit-batches", type=int, default=0)
@@ -91,7 +91,7 @@ def main() -> None:
     output_dir = (
         Path(args.output_dir)
         if args.output_dir is not None
-        else cache_root / "trajtok_agent_token_sidecar" / args.split
+        else cache_root / "trajtok_paperlock_agent_token_sidecar" / args.split
     )
 
     module_dir = Path(__file__).resolve().parents[1] / "src" / "smart" / "tokens"

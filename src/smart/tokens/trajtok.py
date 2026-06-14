@@ -1,7 +1,8 @@
 import argparse
 import os
 import pickle
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections.abc import Sequence
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -10,6 +11,9 @@ from scipy.interpolate import CubicHermiteSpline
 from tqdm import tqdm
 
 from ..utils import transform_to_local, wrap_angle
+
+
+PAPERLOCK_AGENT_TOKEN_FILE = "trajtok_paperlock_vocab.pkl"
 
 
 class TrajTok:
@@ -23,6 +27,10 @@ class TrajTok:
         max_traj_nums: int | None = None,
         use_cache: bool = True,
         sample_seed: int = 2025,
+        use_grid_stats: bool = False,
+        gpu_devices: str | Sequence[int] | None = None,
+        grid_stats_worker_backend: str = "process",
+        enforce_paper_vocab_size: bool = True,
     ):
         self.shift = 5
         self.t = 0.1 * self.shift
@@ -43,10 +51,12 @@ class TrajTok:
         self.filter_range = {'veh': 4, 'ped': 4, 'cyc': 4}
         self.filter_threshold_add = {'veh': 18, 'ped': 26, 'cyc': 22}
         self.filter_threshold_remove = {'veh': 14, 'ped': 22, 'cyc': 28}
+        self.filter_threshold_search_radius = 6
         self.target_vocab_size = {'veh': 8040, 'ped': 3001, 'cyc': 2798}
         cache_root = Path(os.environ.get("SMART_CACHE_ROOT", "/scratch/cache/SMART"))
         default_raw_data_path = cache_root / "training"
-        default_traj_data_path = cache_root / "trajtok_paper_lock_traj_data.pkl"
+        default_cache_name = "trajtok_paperlock_grid_stats.pkl" if use_grid_stats else "trajtok_paperlock_traj_data.pkl"
+        default_traj_data_path = cache_root / default_cache_name
         self.raw_data_path = Path(raw_data_path or default_raw_data_path)
         self.traj_data_path = Path(traj_data_path or default_traj_data_path)
         self.max_workers = max_workers
@@ -54,17 +64,60 @@ class TrajTok:
         self.max_traj_nums = max_traj_nums
         self.sample_seed = sample_seed
         self.use_cache = use_cache
-        self.output_path = Path(output_path or Path(__file__).resolve().parent / "trajtok_vocab.pkl")
+        self.use_grid_stats = use_grid_stats
+        self.gpu_devices = self._parse_gpu_devices(gpu_devices)
+        if grid_stats_worker_backend not in {"process", "thread"}:
+            raise ValueError(
+                "grid_stats_worker_backend must be either 'process' or 'thread', "
+                f"got {grid_stats_worker_backend!r}."
+            )
+        self.grid_stats_worker_backend = grid_stats_worker_backend
+        self.enforce_paper_vocab_size = enforce_paper_vocab_size
+        if self.use_grid_stats and self.max_traj_nums is not None:
+            raise ValueError(
+                "--use-grid-stats accumulates full per-cell statistics and does not support "
+                "--max-traj-nums. Use the legacy trajectory cache path for trajectory-count "
+                "subsampling, or omit --max-traj-nums for a paper-lock full-split build."
+            )
+        self.output_path = Path(output_path or Path(__file__).resolve().parent / PAPERLOCK_AGENT_TOKEN_FILE)
 
         if self.use_cache and os.path.exists(self.traj_data_path):
-            print(f"loading traj data cache from {self.traj_data_path}...")
+            print(f"loading trajtok cache from {self.traj_data_path}...")
             with open(self.traj_data_path, 'rb') as f:
-                self.traj_data = pickle.load(f)
+                cached = pickle.load(f)
+            if self.use_grid_stats:
+                self.grid_stats = cached
+            else:
+                self.traj_data = cached
         else:
-            self.get_traj_data_multi_workers()
+            if self.use_grid_stats:
+                self.get_grid_stats_multi_workers()
+                cached = self.grid_stats
+            else:
+                self.get_traj_data_multi_workers()
+                cached = self.traj_data
             self.traj_data_path.parent.mkdir(parents=True, exist_ok=True)
             with open(self.traj_data_path, 'wb') as f:
-                pickle.dump(self.traj_data, f)
+                pickle.dump(cached, f)
+
+    @staticmethod
+    def _parse_gpu_devices(gpu_devices: str | Sequence[int] | None) -> list[int]:
+        if gpu_devices is None:
+            visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+            if not visible or visible.strip() in {"", "-1"}:
+                return []
+            gpu_devices = visible
+        if isinstance(gpu_devices, str):
+            devices = []
+            for item in gpu_devices.split(","):
+                item = item.strip()
+                if not item:
+                    continue
+                if not item.isdigit():
+                    return []
+                devices.append(int(item))
+            return devices
+        return [int(device) for device in gpu_devices]
 
     @staticmethod
     def _sample_names(names: list[str], max_count: int | None, seed: int) -> list[str]:
@@ -191,7 +244,7 @@ class TrajTok:
         neighbor_counts: np.ndarray,
         grid_mask_count: np.ndarray,
     ) -> np.ndarray:
-        """논문 표의 최종 단어 수에 맞도록 주변 증거가 강한 칸부터 조정한다.
+        """논문 표의 최종 단어 수에 맞도록 주변 기준을 작게 탐색한다.
 
         Args:
             agent_class: agent 종류. 'veh', 'ped', 'cyc' 중 하나다.
@@ -203,13 +256,52 @@ class TrajTok:
         Returns:
             목표 단어 수에 맞춘 선택 칸 여부. shape은 [x_binnum, y_binnum]이다.
         """
-        target_size = self.target_vocab_size.get(agent_class)
-        if target_size is None:
+        target_size = getattr(self, "target_vocab_size", {}).get(agent_class)
+        if target_size is None or not getattr(self, "enforce_paper_vocab_size", True):
             return grid_mask_filtered
 
-        calibrated = grid_mask_filtered.copy()
+        add_threshold = self.filter_threshold_add[agent_class]
+        remove_threshold = self.filter_threshold_remove[agent_class]
+        search_radius = getattr(self, "filter_threshold_search_radius", 0)
+        max_neighbor_count = int(neighbor_counts.max()) if neighbor_counts.size else 0
+        add_min = max(0, add_threshold - search_radius)
+        add_max = min(max_neighbor_count + 1, add_threshold + search_radius)
+        remove_min = max(0, remove_threshold - search_radius)
+        remove_max = min(max_neighbor_count + 1, remove_threshold + search_radius)
+
+        best_score: tuple[int, int, int, int] | None = None
+        calibrated: np.ndarray | None = None
+        best_add_threshold = add_threshold
+        best_remove_threshold = remove_threshold
+        for add_candidate in range(add_min, add_max + 1):
+            for remove_candidate in range(remove_min, remove_max + 1):
+                candidate = grid_mask.copy()
+                candidate[grid_mask & (neighbor_counts < remove_candidate)] = False
+                candidate[(~grid_mask) & (neighbor_counts > add_candidate)] = True
+                count_error = abs(int(candidate.sum()) - target_size)
+                threshold_error = abs(add_candidate - add_threshold) + abs(remove_candidate - remove_threshold)
+                score = (
+                    count_error,
+                    threshold_error,
+                    abs(add_candidate - add_threshold),
+                    abs(remove_candidate - remove_threshold),
+                )
+                if best_score is None or score < best_score:
+                    best_score = score
+                    calibrated = candidate
+                    best_add_threshold = add_candidate
+                    best_remove_threshold = remove_candidate
+
+        if calibrated is None:
+            calibrated = grid_mask_filtered.copy()
+
         current_size = int(calibrated.sum())
         if current_size == target_size:
+            print(
+                f"{agent_class} vocab size calibrated from {int(grid_mask_filtered.sum())} "
+                f"to {current_size} (target={target_size}, add={best_add_threshold}, "
+                f"remove={best_remove_threshold})"
+            )
             return calibrated
 
         if current_size < target_size:
@@ -266,8 +358,9 @@ class TrajTok:
                     calibrated[x, y] = False
 
         print(
-            f"{agent_class} vocab size calibrated from {current_size} "
-            f"to {int(calibrated.sum())} (target={target_size})"
+            f"{agent_class} vocab size calibrated from {int(grid_mask_filtered.sum())} "
+            f"to {int(calibrated.sum())} (target={target_size}, add={best_add_threshold}, "
+            f"remove={best_remove_threshold})"
         )
         return calibrated
 
@@ -294,6 +387,10 @@ class TrajTok:
                     except Exception as e:
                         print(f"Error extracting traj data: {e}")
         for agent_class in self.agent_classes:
+            if len(self.traj_data[agent_class]) == 0:
+                self.traj_data[agent_class] = np.empty((0, self.shift, 3), dtype=np.float32)
+                print(f"traj num of {agent_class}: 0")
+                continue
             self.traj_data[agent_class] = torch.cat(self.traj_data[agent_class])
             headings = self.traj_data[agent_class][:,:,-1]
             heading_diffs = torch.abs(wrap_angle(headings[:,1:] - headings[:,:-1]))
@@ -301,12 +398,225 @@ class TrajTok:
             self.traj_data[agent_class] = self.traj_data[agent_class][head_valid].numpy()
             print(f"traj num of {agent_class}: {len(self.traj_data[agent_class])}")
 
+    def _new_grid_stats(self) -> dict[str, dict[str, np.ndarray]]:
+        stats = {}
+        for agent_class in self.agent_classes:
+            x_binnum = self.x_binnum[agent_class]
+            y_binnum = self.y_binnum[agent_class]
+            stats[agent_class] = {
+                "count": np.zeros((x_binnum, y_binnum), dtype=np.int64),
+                "pos_sum": np.zeros((x_binnum, y_binnum, self.shift + 1, 2), dtype=np.float64),
+                "sin_sum": np.zeros((x_binnum, y_binnum, self.shift + 1), dtype=np.float64),
+                "cos_sum": np.zeros((x_binnum, y_binnum, self.shift + 1), dtype=np.float64),
+            }
+        return stats
+
+    def _merge_grid_stats(
+        self,
+        dst: dict[str, dict[str, np.ndarray]],
+        src: dict[str, dict[str, np.ndarray]],
+    ) -> None:
+        for agent_class in self.agent_classes:
+            for key in ("count", "pos_sum", "sin_sum", "cos_sum"):
+                dst[agent_class][key] += src[agent_class][key]
+
+    def get_grid_stats_multi_workers(self) -> None:
+        """Build per-grid trajectory statistics without materializing all trajectories.
+
+        The paper-lock vocabulary only needs one representative trajectory per
+        endpoint cell. For full training-split builds, storing every valid 0.5s
+        trajectory can be both slow and memory-heavy. This path accumulates the
+        sufficient statistics for each cell directly: count, xy sum, sin heading
+        sum, and cos heading sum. When CUDA devices are supplied, input files are
+        split across worker threads and each worker keeps its tensor operations
+        on one GPU.
+        """
+        self.grid_stats = self._new_grid_stats()
+        file_names = sorted(os.listdir(self.raw_data_path))
+        file_names = self._sample_names(file_names, self.max_file_nums, self.sample_seed)
+        file_paths = [self.raw_data_path / file_name for file_name in file_names]
+        if not file_paths:
+            print("No files found for TrajTok grid-stat extraction.")
+            return
+
+        worker_count = self.max_workers if self.max_workers and self.max_workers > 0 else 1
+        worker_count = min(worker_count, len(file_paths))
+        chunks = [file_paths[i::worker_count] for i in range(worker_count)]
+        devices = self.gpu_devices
+
+        if worker_count == 1:
+            device = devices[0] if devices else None
+            self.grid_stats = self._get_grid_stats_for_files(chunks[0], device=device)
+        else:
+            executor_cls = ProcessPoolExecutor if self.grid_stats_worker_backend == "process" else ThreadPoolExecutor
+            print(
+                f"Extracting TrajTok grid stats with {worker_count} "
+                f"{self.grid_stats_worker_backend} workers across "
+                f"{len(devices) if devices else 0} CUDA devices."
+            )
+            with executor_cls(max_workers=worker_count) as executor:
+                futures = []
+                for worker_idx, chunk in enumerate(chunks):
+                    if not chunk:
+                        continue
+                    device = devices[worker_idx % len(devices)] if devices else None
+                    futures.append(executor.submit(self._get_grid_stats_for_files, chunk, device))
+                for future in tqdm(as_completed(futures), total=len(futures), desc="Extracting TrajTok grid stats"):
+                    self._merge_grid_stats(self.grid_stats, future.result())
+
+        for agent_class in self.agent_classes:
+            print(f"grid-stat traj num of {agent_class}: {int(self.grid_stats[agent_class]['count'].sum())}")
+
+    def _get_grid_stats_for_files(
+        self,
+        file_paths: Sequence[str | os.PathLike],
+        device: int | None = None,
+    ) -> dict[str, dict[str, np.ndarray]]:
+        stats = self._new_grid_stats()
+        torch_device = torch.device("cpu")
+        if device is not None and torch.cuda.is_available():
+            torch.cuda.set_device(device)
+            torch_device = torch.device(f"cuda:{device}")
+
+        for file_path in file_paths:
+            self._accumulate_file_grid_stats(file_path, stats, torch_device)
+
+        if torch_device.type == "cuda":
+            torch.cuda.synchronize(torch_device)
+        return stats
+
+    def _accumulate_file_grid_stats(
+        self,
+        file_path: str | os.PathLike,
+        stats: dict[str, dict[str, np.ndarray]],
+        device: torch.device,
+    ) -> None:
+        try:
+            with open(file_path, 'rb') as f:
+                data = pickle.load(f)
+        except (EOFError, OSError, pickle.UnpicklingError) as exc:
+            print(f"WARNING: skipping unreadable TrajTok cache file {file_path}: {exc}", flush=True)
+            return
+
+        pos = torch.as_tensor(data['agent']['position'][..., 0:2], device=device, dtype=torch.float32)
+        masks = torch.as_tensor(data['agent']['valid_mask'], device=device, dtype=torch.bool)
+        types = torch.as_tensor(data['agent']['type'], device=device)
+        headings = wrap_angle(torch.as_tensor(data['agent']['heading'], device=device, dtype=torch.float32))
+        n_agent, n_step, _ = pos.shape
+
+        for i in range(0, n_step - self.shift, self.shift):
+            pos_local, head_local = transform_to_local(
+                pos_global=pos[:, i + 1:i + self.shift + 1],
+                head_global=headings[:, i + 1:i + self.shift + 1],
+                pos_now=pos[:, i],
+                head_now=headings[:, i],
+            )
+            trajs = torch.cat([pos_local, head_local.unsqueeze(-1)], dim=-1)
+            valid_mask = masks[:, i:i + self.shift + 1].all(dim=-1)
+            for class_idx, agent_class in enumerate(self.agent_classes):
+                class_trajs = trajs[(types == class_idx) & valid_mask]
+                if class_trajs.numel() == 0:
+                    continue
+                heading_diffs = torch.abs(wrap_angle(class_trajs[:, 1:, 2] - class_trajs[:, :-1, 2]))
+                class_trajs = class_trajs[heading_diffs.max(-1).values < 30 * np.pi / 180]
+                if class_trajs.numel() == 0:
+                    continue
+                origin = torch.zeros((class_trajs.shape[0], 1, 3), device=device, dtype=class_trajs.dtype)
+                class_trajs = torch.cat([origin, class_trajs], dim=1)
+                if self.flip_trajs:
+                    flipped = class_trajs.clone()
+                    flipped[:, :, 1] = -flipped[:, :, 1]
+                    flipped[:, :, 2] = -flipped[:, :, 2]
+                    class_trajs = torch.cat([class_trajs, flipped], dim=0)
+                self._accumulate_class_trajs_to_grid_stats(class_trajs, agent_class, stats[agent_class])
+
+    def _accumulate_class_trajs_to_grid_stats(
+        self,
+        trajs: torch.Tensor,
+        agent_class: str,
+        class_stats: dict[str, np.ndarray],
+    ) -> None:
+        if trajs.numel() == 0:
+            return
+        device = trajs.device
+        x_min, x_max = self.x_min[agent_class], self.x_max[agent_class]
+        y_min, y_max = self.y_min[agent_class], self.y_max[agent_class]
+        x_binnum, y_binnum = self.x_binnum[agent_class], self.y_binnum[agent_class]
+        x_bin_size, y_bin_size = self._grid_bin_size(agent_class)
+
+        endpoints = trajs[:, self.shift, :2]
+        grid_x = torch.floor((endpoints[:, 0] - x_min) / x_bin_size).to(torch.long)
+        grid_y = torch.floor((endpoints[:, 1] - y_min) / y_bin_size).to(torch.long)
+        valid = (
+            (endpoints[:, 0] >= x_min)
+            & (endpoints[:, 0] < x_max)
+            & (endpoints[:, 1] >= y_min)
+            & (endpoints[:, 1] < y_max)
+            & (grid_x >= 0)
+            & (grid_x < x_binnum)
+            & (grid_y >= 0)
+            & (grid_y < y_binnum)
+            & (torch.abs(trajs[:, :, 0]).mean(dim=-1) < x_max)
+            & (torch.abs(trajs[:, :, 1]).mean(dim=-1) < y_max)
+        )
+        if not bool(valid.any()):
+            return
+
+        trajs = trajs[valid]
+        linear = (grid_x[valid] * y_binnum + grid_y[valid]).to(torch.long)
+        n_bin = x_binnum * y_binnum
+        flat_stats = torch.zeros((n_bin, (self.shift + 1) * 4), device=device, dtype=torch.float64)
+        features = torch.cat(
+            [
+                trajs[:, :, :2].reshape(trajs.shape[0], -1).to(torch.float64),
+                torch.sin(trajs[:, :, 2]).to(torch.float64),
+                torch.cos(trajs[:, :, 2]).to(torch.float64),
+            ],
+            dim=1,
+        )
+        flat_stats.index_add_(0, linear, features)
+        flat_count = torch.bincount(linear, minlength=n_bin)
+
+        flat_stats_np = flat_stats.cpu().numpy().reshape(x_binnum, y_binnum, (self.shift + 1) * 4)
+        class_stats["count"] += flat_count.cpu().numpy().reshape(x_binnum, y_binnum)
+        pos_size = (self.shift + 1) * 2
+        heading_size = self.shift + 1
+        class_stats["pos_sum"] += flat_stats_np[:, :, :pos_size].reshape(x_binnum, y_binnum, self.shift + 1, 2)
+        class_stats["sin_sum"] += flat_stats_np[:, :, pos_size:pos_size + heading_size]
+        class_stats["cos_sum"] += flat_stats_np[:, :, pos_size + heading_size:]
+
+    def _mean_trajs_from_grid_stats(
+        self,
+        agent_class: str,
+        class_stats: dict[str, np.ndarray],
+    ) -> tuple[np.ndarray, list[list[np.ndarray | None]], list[list[np.ndarray | None]]]:
+        counts = class_stats["count"]
+        x_binnum, y_binnum = counts.shape
+        mean_traj_in_bin = [[None for _ in range(y_binnum)] for _ in range(x_binnum)]
+        heading_concentration_in_bin = [[None for _ in range(y_binnum)] for _ in range(x_binnum)]
+        non_empty = counts > 0
+        for x, y in np.argwhere(non_empty):
+            count = float(counts[x, y])
+            token_traj = np.empty((self.shift + 1, 3), dtype=np.float64)
+            token_traj[:, :2] = class_stats["pos_sum"][x, y] / count
+            sin_mean = class_stats["sin_sum"][x, y] / count
+            cos_mean = class_stats["cos_sum"][x, y] / count
+            token_traj[:, 2] = np.arctan2(sin_mean, cos_mean)
+            heading_concentration = np.sqrt(sin_mean * sin_mean + cos_mean * cos_mean)
+            mean_traj_in_bin[x][y] = token_traj
+            heading_concentration_in_bin[x][y] = heading_concentration
+        return counts, mean_traj_in_bin, heading_concentration_in_bin
+
 
 
     def _get_traj_data(self, file_path):
 
-        with open(file_path, 'rb') as f:
-            data = pickle.load(f)
+        try:
+            with open(file_path, 'rb') as f:
+                data = pickle.load(f)
+        except (EOFError, OSError, pickle.UnpicklingError) as exc:
+            print(f"WARNING: skipping unreadable TrajTok cache file {file_path}: {exc}", flush=True)
+            return {'veh': [], 'ped': [], 'cyc': []}
         n_agent, n_step, _ = data['agent']['position'].shape
         pos = data['agent']['position'][..., 0:2]
         masks = data['agent']['valid_mask']
@@ -440,42 +750,64 @@ class TrajTok:
             filter_threshold_remove = self.filter_threshold_remove[agent_class]
             valid_count_threshold = self.valid_count_threshold[agent_class]
 
-            grid_mask_count = np.zeros((x_binnum, y_binnum))
-            traj_in_bin = [[[] for _ in range(y_binnum)] for _ in range(x_binnum)]
-            trajs = np.concatenate([np.zeros((self.traj_data[agent_class].shape[0],1,3)),
-                                        self.traj_data[agent_class]], axis=1) #.numpy()
-            trajs = self._sample_rows(
-                trajs,
-                self.max_traj_nums,
-                self.sample_seed + self.agent_classes.index(agent_class),
-            )
+            if hasattr(self, "grid_stats"):
+                grid_mask_count, mean_traj_in_bin, heading_concentration_in_bin = self._mean_trajs_from_grid_stats(
+                    agent_class,
+                    self.grid_stats[agent_class],
+                )
+            else:
+                grid_mask_count = np.zeros((x_binnum, y_binnum))
+                traj_in_bin = [[[] for _ in range(y_binnum)] for _ in range(x_binnum)]
+                if len(self.traj_data[agent_class]) == 0:
+                    trajs = np.empty((0, self.shift + 1, 3), dtype=np.float32)
+                else:
+                    trajs = np.concatenate([np.zeros((self.traj_data[agent_class].shape[0],1,3)),
+                                            self.traj_data[agent_class]], axis=1) #.numpy()
+                    trajs = self._sample_rows(
+                        trajs,
+                        self.max_traj_nums,
+                        self.sample_seed + self.agent_classes.index(agent_class),
+                    )
 
-            if self.flip_trajs:
-                flip = trajs.copy()
-                flip[:,:,1] = -flip[:,:,1]
-                flip[:,:,2] = -flip[:,:,2]
-                trajs = np.concatenate([trajs, flip], axis=0)
+                    if self.flip_trajs:
+                        flip = trajs.copy()
+                        flip[:,:,1] = -flip[:,:,1]
+                        flip[:,:,2] = -flip[:,:,2]
+                        trajs = np.concatenate([trajs, flip], axis=0)
 
-            grid_end_x, grid_end_y, endpoint_mask = self._grid_indices_from_endpoints(
-                trajs[:, self.shift, 0:2],
-                agent_class,
-            )
-            x_max, y_max = self.x_max[agent_class], self.y_max[agent_class]
-            mask = endpoint_mask & \
-                    (np.abs(trajs[:, :, 0]).mean(axis=-1) < x_max) & \
-                    (np.abs(trajs[:, :, 1]).mean(axis=-1) < y_max)
+                if len(trajs) > 0:
+                    grid_end_x, grid_end_y, endpoint_mask = self._grid_indices_from_endpoints(
+                        trajs[:, self.shift, 0:2],
+                        agent_class,
+                    )
+                    x_max, y_max = self.x_max[agent_class], self.y_max[agent_class]
+                    mask = endpoint_mask & \
+                            (np.abs(trajs[:, :, 0]).mean(axis=-1) < x_max) & \
+                            (np.abs(trajs[:, :, 1]).mean(axis=-1) < y_max)
 
-            grid_end_x = grid_end_x[mask]
-            grid_end_y = grid_end_y[mask]
-            trajs = trajs[mask]
+                    grid_end_x = grid_end_x[mask]
+                    grid_end_y = grid_end_y[mask]
+                    trajs = trajs[mask]
 
-            for i in range(len(trajs)):
-                traj_in_bin[grid_end_x[i]][grid_end_y[i]].append(trajs[i])
+                    for i in range(len(trajs)):
+                        traj_in_bin[grid_end_x[i]][grid_end_y[i]].append(trajs[i])
+
+                mean_traj_in_bin = [[None for _ in range(y_binnum)] for _ in range(x_binnum)]
+                heading_concentration_in_bin = [[None for _ in range(y_binnum)] for _ in range(x_binnum)]
+                for x in range(x_binnum):
+                    for y in range(y_binnum):
+                        grid_mask_count[x][y] = len(traj_in_bin[x][y])
+                        if grid_mask_count[x][y] < valid_count_threshold:
+                            continue
+                        mean_traj, heading_concentration = self._mean_traj_with_circular_heading(
+                            np.asarray(traj_in_bin[x][y])
+                        )
+                        mean_traj_in_bin[x][y] = mean_traj
+                        heading_concentration_in_bin[x][y] = heading_concentration
 
             raw_eps = []
             for x in range(x_binnum):
                 for y in range(y_binnum):
-                    grid_mask_count[x][y] = len(traj_in_bin[x][y])
                     raw_eps.append(self._grid_center(agent_class, x, y))
             self.vocab['raw_ep'][agent_class] = np.array(raw_eps)
             grid_mask = (grid_mask_count >= valid_count_threshold)
@@ -495,18 +827,12 @@ class TrajTok:
                 neighbor_counts,
                 grid_mask_count,
             )
-
-            mean_traj_in_bin = [[None for _ in range(y_binnum)] for _ in range(x_binnum)]
-            heading_concentration_in_bin = [[None for _ in range(y_binnum)] for _ in range(x_binnum)]
-            for x in range(x_binnum):
-                for y in range(y_binnum):
-                    if not grid_mask[x, y]:
-                        continue
-                    mean_traj, heading_concentration = self._mean_traj_with_circular_heading(
-                        np.asarray(traj_in_bin[x][y])
-                    )
-                    mean_traj_in_bin[x][y] = mean_traj
-                    heading_concentration_in_bin[x][y] = heading_concentration
+            if int(grid_mask_filtered.sum()) == 0 and int(grid_mask.sum()) > 0:
+                print(
+                    f"{agent_class} filtered vocab is empty on this sparse build; "
+                    "falling back to raw non-empty grids."
+                )
+                grid_mask_filtered = grid_mask.copy()
 
             nearest_source_pos = np.argwhere(grid_mask & grid_mask_filtered)
             if len(nearest_source_pos) == 0:
@@ -586,6 +912,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-file-nums", type=int, default=None)
     parser.add_argument("--max-traj-nums", type=int, default=None)
     parser.add_argument("--sample-seed", type=int, default=2025)
+    parser.add_argument(
+        "--use-grid-stats",
+        action="store_true",
+        help=(
+            "Accumulate per-grid sufficient statistics directly. This avoids materializing "
+            "all 0.5s trajectories and is the recommended path for full training-split "
+            "paper-lock vocabulary generation."
+        ),
+    )
+    parser.add_argument(
+        "--gpu-devices",
+        default=None,
+        help=(
+            "Comma-separated CUDA device ids for --use-grid-stats workers. If omitted, "
+            "CUDA_VISIBLE_DEVICES is used when available."
+        ),
+    )
+    parser.add_argument(
+        "--grid-stats-worker-backend",
+        choices=("process", "thread"),
+        default="process",
+        help="Worker backend for --use-grid-stats. Process workers avoid Python GIL bottlenecks.",
+    )
+    parser.add_argument(
+        "--no-enforce-paper-vocab-size",
+        action="store_true",
+        help="Disable the final 8040/3001/2798 paper vocabulary-size calibration.",
+    )
     parser.add_argument("--no-cache", action="store_true")
     return parser.parse_args()
 
@@ -600,6 +954,10 @@ if __name__ == "__main__":
         max_file_nums=args.max_file_nums,
         max_traj_nums=args.max_traj_nums,
         sample_seed=args.sample_seed,
+        use_grid_stats=args.use_grid_stats,
+        gpu_devices=args.gpu_devices,
+        grid_stats_worker_backend=args.grid_stats_worker_backend,
+        enforce_paper_vocab_size=not args.no_enforce_paper_vocab_size,
         use_cache=not args.no_cache,
     )
     generator.get_trajtok_vocab()
