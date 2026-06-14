@@ -52,5 +52,7 @@ data:
   val_batch_size: 10
   test_batch_size: 10
   num_workers: 10
+  persistent_workers: false
+  train_use_eval_agent_selection: true
 
 action: road_finetune
