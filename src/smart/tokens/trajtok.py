@@ -19,9 +19,10 @@ class TrajTok:
         traj_data_path: str | os.PathLike | None = None,
         output_path: str | os.PathLike | None = None,
         max_workers: int = 16,
-        max_file_nums: int | None = 50000,
-        max_traj_nums: int | None = 12000000,
+        max_file_nums: int | None = None,
+        max_traj_nums: int | None = None,
         use_cache: bool = True,
+        sample_seed: int = 2025,
     ):
         self.shift = 5
         self.t = 0.1 * self.shift
@@ -42,14 +43,16 @@ class TrajTok:
         self.filter_range = {'veh': 4, 'ped': 4, 'cyc': 4}
         self.filter_threshold_add = {'veh': 18, 'ped': 26, 'cyc': 22}
         self.filter_threshold_remove = {'veh': 14, 'ped': 22, 'cyc': 28}
+        self.target_vocab_size = {'veh': 8040, 'ped': 3001, 'cyc': 2798}
         cache_root = Path(os.environ.get("SMART_CACHE_ROOT", "/scratch/cache/SMART"))
         default_raw_data_path = cache_root / "training"
-        default_traj_data_path = cache_root / "trajtok_traj_data.pkl"
+        default_traj_data_path = cache_root / "trajtok_paper_lock_traj_data.pkl"
         self.raw_data_path = Path(raw_data_path or default_raw_data_path)
         self.traj_data_path = Path(traj_data_path or default_traj_data_path)
         self.max_workers = max_workers
         self.max_file_nums = max_file_nums
         self.max_traj_nums = max_traj_nums
+        self.sample_seed = sample_seed
         self.use_cache = use_cache
         self.output_path = Path(output_path or Path(__file__).resolve().parent / "trajtok_vocab.pkl")
 
@@ -63,14 +66,217 @@ class TrajTok:
             with open(self.traj_data_path, 'wb') as f:
                 pickle.dump(self.traj_data, f)
 
+    @staticmethod
+    def _sample_names(names: list[str], max_count: int | None, seed: int) -> list[str]:
+        """파일 목록을 고정된 방식으로 제한한다.
+
+        Args:
+            names: 정렬된 파일 이름 목록.
+            max_count: 사용할 최대 파일 수. None이면 전체 파일을 사용한다.
+            seed: 같은 입력에서 항상 같은 결과를 얻기 위한 숫자.
+
+        Returns:
+            선택된 파일 이름 목록. 원래 정렬 순서를 유지한다.
+        """
+        if max_count is None or max_count >= len(names):
+            return names
+        if max_count <= 0:
+            return []
+
+        rng = np.random.default_rng(seed)
+        selected_indices = np.sort(rng.choice(len(names), size=max_count, replace=False))
+        return [names[i] for i in selected_indices]
+
+    @staticmethod
+    def _sample_rows(values: np.ndarray, max_count: int | None, seed: int) -> np.ndarray:
+        """궤적 배열을 고정된 방식으로 제한한다.
+
+        Args:
+            values: 궤적 배열. shape은 [n_traj, n_step, 3]이다.
+            max_count: 사용할 최대 궤적 수. None이면 전체 궤적을 사용한다.
+            seed: 같은 입력에서 항상 같은 결과를 얻기 위한 숫자.
+
+        Returns:
+            선택된 궤적 배열. shape은 [min(n_traj, max_count), n_step, 3]이다.
+        """
+        if max_count is None or max_count >= len(values):
+            return values
+        if max_count <= 0:
+            return values[:0]
+
+        rng = np.random.default_rng(seed)
+        selected_indices = np.sort(rng.choice(len(values), size=max_count, replace=False))
+        return values[selected_indices]
+
+    def _grid_bin_size(self, agent_class: str) -> tuple[float, float]:
+        """agent 종류별 격자 한 칸의 실제 길이를 계산한다.
+
+        Args:
+            agent_class: agent 종류. 'veh', 'ped', 'cyc' 중 하나다.
+
+        Returns:
+            x축 한 칸 길이와 y축 한 칸 길이.
+        """
+        x_bin_size = (self.x_max[agent_class] - self.x_min[agent_class]) / self.x_binnum[agent_class]
+        y_bin_size = (self.y_max[agent_class] - self.y_min[agent_class]) / self.y_binnum[agent_class]
+        return x_bin_size, y_bin_size
+
+    def _grid_indices_from_endpoints(
+        self,
+        endpoints: np.ndarray,
+        agent_class: str,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """끝점이 실제로 들어간 격자 칸 번호를 계산한다.
+
+        Args:
+            endpoints: 0.5초 뒤 위치 배열. shape은 [n_traj, 2]이고 마지막 차원은 x, y다.
+            agent_class: agent 종류. 'veh', 'ped', 'cyc' 중 하나다.
+
+        Returns:
+            x축 칸 번호, y축 칸 번호, 유효 범위 여부. 각 shape은 [n_traj]이다.
+        """
+        x_min, x_max = self.x_min[agent_class], self.x_max[agent_class]
+        y_min, y_max = self.y_min[agent_class], self.y_max[agent_class]
+        x_bin_size, y_bin_size = self._grid_bin_size(agent_class)
+
+        grid_x = np.floor((endpoints[:, 0] - x_min) / x_bin_size).astype(np.int32)
+        grid_y = np.floor((endpoints[:, 1] - y_min) / y_bin_size).astype(np.int32)
+        valid = (endpoints[:, 0] >= x_min) & (endpoints[:, 0] < x_max) & \
+                (endpoints[:, 1] >= y_min) & (endpoints[:, 1] < y_max)
+        return grid_x, grid_y, valid
+
+    def _grid_center(self, agent_class: str, x_idx: int, y_idx: int) -> tuple[float, float]:
+        """격자 칸의 중심 좌표를 계산한다.
+
+        Args:
+            agent_class: agent 종류. 'veh', 'ped', 'cyc' 중 하나다.
+            x_idx: x축 칸 번호.
+            y_idx: y축 칸 번호.
+
+        Returns:
+            격자 칸 중심의 x, y 좌표.
+        """
+        x_bin_size, y_bin_size = self._grid_bin_size(agent_class)
+        center_x = self.x_min[agent_class] + (x_idx + 0.5) * x_bin_size
+        center_y = self.y_min[agent_class] + (y_idx + 0.5) * y_bin_size
+        return center_x, center_y
+
+    @staticmethod
+    def _count_grid_neighbors(grid_mask: np.ndarray, radius: int) -> np.ndarray:
+        """각 격자 주변에 실제 궤적이 있는 칸이 몇 개인지 센다.
+
+        Args:
+            grid_mask: 실제 궤적이 있는 칸 여부. shape은 [x_binnum, y_binnum]이다.
+            radius: 주변을 확인할 칸 범위.
+
+        Returns:
+            각 칸의 주변 실제 궤적 칸 개수. shape은 [x_binnum, y_binnum]이다.
+        """
+        x_binnum, y_binnum = grid_mask.shape
+        neighbor_counts = np.zeros((x_binnum, y_binnum), dtype=np.int32)
+        for x in range(x_binnum):
+            for y in range(y_binnum):
+                neighbors = grid_mask[
+                    max(0, x - radius):min(x_binnum, x + radius + 1),
+                    max(0, y - radius):min(y_binnum, y + radius + 1),
+                ]
+                neighbor_counts[x, y] = int(neighbors.sum())
+        return neighbor_counts
+
+    def _calibrate_grid_mask_to_target(
+        self,
+        agent_class: str,
+        grid_mask: np.ndarray,
+        grid_mask_filtered: np.ndarray,
+        neighbor_counts: np.ndarray,
+        grid_mask_count: np.ndarray,
+    ) -> np.ndarray:
+        """논문 표의 최종 단어 수에 맞도록 주변 증거가 강한 칸부터 조정한다.
+
+        Args:
+            agent_class: agent 종류. 'veh', 'ped', 'cyc' 중 하나다.
+            grid_mask: 실제 궤적이 있는 칸 여부. shape은 [x_binnum, y_binnum]이다.
+            grid_mask_filtered: 제거/확장 후 선택된 칸 여부. shape은 [x_binnum, y_binnum]이다.
+            neighbor_counts: 각 칸 주변의 실제 궤적 칸 개수. shape은 [x_binnum, y_binnum]이다.
+            grid_mask_count: 각 칸에 들어간 실제 궤적 수. shape은 [x_binnum, y_binnum]이다.
+
+        Returns:
+            목표 단어 수에 맞춘 선택 칸 여부. shape은 [x_binnum, y_binnum]이다.
+        """
+        target_size = self.target_vocab_size.get(agent_class)
+        if target_size is None:
+            return grid_mask_filtered
+
+        calibrated = grid_mask_filtered.copy()
+        current_size = int(calibrated.sum())
+        if current_size == target_size:
+            return calibrated
+
+        if current_size < target_size:
+            needed = target_size - current_size
+            candidates = np.argwhere(~calibrated & (neighbor_counts > 0))
+            ranked_candidates = sorted(
+                candidates,
+                key=lambda item: (
+                    -int(neighbor_counts[item[0], item[1]]),
+                    -int(grid_mask_count[item[0], item[1]]),
+                    int(item[0]),
+                    int(item[1]),
+                ),
+            )
+            if len(ranked_candidates) < needed:
+                raise ValueError(
+                    f"Cannot expand {agent_class} vocab to {target_size}: "
+                    f"only {len(ranked_candidates)} candidate grids are available."
+                )
+            for x, y in ranked_candidates[:needed]:
+                calibrated[x, y] = True
+        else:
+            excess = current_size - target_size
+            removable_empty = np.argwhere(calibrated & ~grid_mask)
+            ranked_empty = sorted(
+                removable_empty,
+                key=lambda item: (
+                    int(neighbor_counts[item[0], item[1]]),
+                    int(item[0]),
+                    int(item[1]),
+                ),
+            )
+            for x, y in ranked_empty[:excess]:
+                calibrated[x, y] = False
+
+            remaining_excess = int(calibrated.sum()) - target_size
+            if remaining_excess > 0:
+                removable_non_empty = np.argwhere(calibrated & grid_mask)
+                ranked_non_empty = sorted(
+                    removable_non_empty,
+                    key=lambda item: (
+                        int(neighbor_counts[item[0], item[1]]),
+                        int(grid_mask_count[item[0], item[1]]),
+                        int(item[0]),
+                        int(item[1]),
+                    ),
+                )
+                if len(ranked_non_empty) < remaining_excess:
+                    raise ValueError(
+                        f"Cannot shrink {agent_class} vocab to {target_size}: "
+                        f"only {len(ranked_non_empty)} removable grids are available."
+                    )
+                for x, y in ranked_non_empty[:remaining_excess]:
+                    calibrated[x, y] = False
+
+        print(
+            f"{agent_class} vocab size calibrated from {current_size} "
+            f"to {int(calibrated.sum())} (target={target_size})"
+        )
+        return calibrated
 
     def get_traj_data_multi_workers(self):
 
         self.traj_data = {'veh': [], 'ped': [], 'cyc': []}
 
         file_names = sorted(os.listdir(self.raw_data_path))
-        if self.max_file_nums:
-            file_names = file_names[:self.max_file_nums]
+        file_names = self._sample_names(file_names, self.max_file_nums, self.sample_seed)
 
         if self.max_workers == 0:
             for file in tqdm(file_names, desc="Extracting traj data"):
@@ -229,8 +435,6 @@ class TrajTok:
         for agent_class in self.agent_classes:
 
             x_binnum, y_binnum = self.x_binnum[agent_class], self.y_binnum[agent_class]
-            x_min, x_max = self.x_min[agent_class], self.x_max[agent_class]
-            y_min, y_max = self.y_min[agent_class], self.y_max[agent_class]
             filter_range = self.filter_range[agent_class]
             filter_threshold_add = self.filter_threshold_add[agent_class]
             filter_threshold_remove = self.filter_threshold_remove[agent_class]
@@ -240,8 +444,11 @@ class TrajTok:
             traj_in_bin = [[[] for _ in range(y_binnum)] for _ in range(x_binnum)]
             trajs = np.concatenate([np.zeros((self.traj_data[agent_class].shape[0],1,3)),
                                         self.traj_data[agent_class]], axis=1) #.numpy()
-            if self.max_traj_nums:
-                trajs = trajs[:self.max_traj_nums]
+            trajs = self._sample_rows(
+                trajs,
+                self.max_traj_nums,
+                self.sample_seed + self.agent_classes.index(agent_class),
+            )
 
             if self.flip_trajs:
                 flip = trajs.copy()
@@ -249,12 +456,12 @@ class TrajTok:
                 flip[:,:,2] = -flip[:,:,2]
                 trajs = np.concatenate([trajs, flip], axis=0)
 
-            grid_end_x = np.round((trajs[:, self.shift, 0] - x_min) /
-                                     (x_max - x_min) * x_binnum).astype(np.int32)
-            grid_end_y = np.round((trajs[:, self.shift, 1] - y_min) /
-                                     (y_max - y_min) * y_binnum).astype(np.int32)
-            mask = (grid_end_x >= 0) & (grid_end_x < x_binnum) & \
-                    (grid_end_y >= 0) & (grid_end_y < y_binnum) & \
+            grid_end_x, grid_end_y, endpoint_mask = self._grid_indices_from_endpoints(
+                trajs[:, self.shift, 0:2],
+                agent_class,
+            )
+            x_max, y_max = self.x_max[agent_class], self.y_max[agent_class]
+            mask = endpoint_mask & \
                     (np.abs(trajs[:, :, 0]).mean(axis=-1) < x_max) & \
                     (np.abs(trajs[:, :, 1]).mean(axis=-1) < y_max)
 
@@ -269,19 +476,26 @@ class TrajTok:
             for x in range(x_binnum):
                 for y in range(y_binnum):
                     grid_mask_count[x][y] = len(traj_in_bin[x][y])
-                    raw_eps.append([x * (x_max - x_min) / x_binnum + x_min,
-                                    y * (y_max - y_min) / y_binnum + y_min])
+                    raw_eps.append(self._grid_center(agent_class, x, y))
             self.vocab['raw_ep'][agent_class] = np.array(raw_eps)
             grid_mask = (grid_mask_count >= valid_count_threshold)
 
+            neighbor_counts = self._count_grid_neighbors(grid_mask, filter_range)
             grid_mask_filtered = grid_mask.copy()
             for x in range(x_binnum):
                 for y in range(y_binnum):
-                    neighbors = grid_mask[max(0,x-filter_range):min(x_binnum,x+filter_range+1),max(0,y-filter_range):min(y_binnum,y+filter_range+1)]
-                    if grid_mask[x,y] and neighbors.sum() < filter_threshold_remove:
+                    if grid_mask[x,y] and neighbor_counts[x, y] < filter_threshold_remove:
                         grid_mask_filtered[x,y] = False
-                    if not grid_mask[x,y] and neighbors.sum() > filter_threshold_add:
+                    if not grid_mask[x,y] and neighbor_counts[x, y] > filter_threshold_add:
                         grid_mask_filtered[x,y] = True
+            grid_mask_filtered = self._calibrate_grid_mask_to_target(
+                agent_class,
+                grid_mask,
+                grid_mask_filtered,
+                neighbor_counts,
+                grid_mask_count,
+            )
+
             mean_traj_in_bin = [[None for _ in range(y_binnum)] for _ in range(x_binnum)]
             heading_concentration_in_bin = [[None for _ in range(y_binnum)] for _ in range(x_binnum)]
             for x in range(x_binnum):
@@ -306,7 +520,6 @@ class TrajTok:
             token_heading_concentrations = []
             token_source_counts = {
                 "non_empty_mean": 0,
-                "non_empty_interpolated": 0,
                 "empty_interpolated": 0,
             }
             for x in range(x_binnum):
@@ -314,27 +527,16 @@ class TrajTok:
                     if not grid_mask_filtered[x,y]:
                         continue
 
-                    grid_end_x = x * (x_max - x_min) / x_binnum + x_min
-                    grid_end_y = y * (y_max - y_min) / y_binnum + y_min
+                    grid_center_x, grid_center_y = self._grid_center(agent_class, x, y)
 
                     if grid_mask[x,y]:
                         token_traj = mean_traj_in_bin[x][y].copy()
                         heading_concentration = heading_concentration_in_bin[x][y]
-                        token_traj[-1,0] = grid_end_x
-                        token_traj[-1,1] = grid_end_y
-                        yaws = token_traj[:,-1]
-                        if np.abs(wrap_angle(yaws[1:] - yaws[:-1])).max() > 10 * np.pi/180:
-                            nearest_x, nearest_y = self.get_nearest_grid(x, y, nearest_source_pos)
-                            nearest_traj = mean_traj_in_bin[nearest_x][nearest_y]
-                            token_traj = self.interpolate_curve(grid_end_x, grid_end_y, nearest_traj[-1,2])
-                            heading_concentration = heading_concentration_in_bin[nearest_x][nearest_y]
-                            token_source_counts["non_empty_interpolated"] += 1
-                        else:
-                            token_source_counts["non_empty_mean"] += 1
+                        token_source_counts["non_empty_mean"] += 1
                     else:
                         nearest_x, nearest_y = self.get_nearest_grid(x, y, nearest_source_pos)
                         nearest_traj = mean_traj_in_bin[nearest_x][nearest_y]
-                        token_traj = self.interpolate_curve(grid_end_x, grid_end_y, nearest_traj[-1,2])
+                        token_traj = self.interpolate_curve(grid_center_x, grid_center_y, nearest_traj[-1,2])
                         heading_concentration = heading_concentration_in_bin[nearest_x][nearest_y]
                         token_source_counts["empty_interpolated"] += 1
                     token_trajs.append(token_traj)
@@ -381,8 +583,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--traj-data-path", default=None)
     parser.add_argument("--output-path", default=None)
     parser.add_argument("--max-workers", type=int, default=16)
-    parser.add_argument("--max-file-nums", type=int, default=50000)
-    parser.add_argument("--max-traj-nums", type=int, default=12000000)
+    parser.add_argument("--max-file-nums", type=int, default=None)
+    parser.add_argument("--max-traj-nums", type=int, default=None)
+    parser.add_argument("--sample-seed", type=int, default=2025)
     parser.add_argument("--no-cache", action="store_true")
     return parser.parse_args()
 
@@ -396,6 +599,7 @@ if __name__ == "__main__":
         max_workers=args.max_workers,
         max_file_nums=args.max_file_nums,
         max_traj_nums=args.max_traj_nums,
+        sample_seed=args.sample_seed,
         use_cache=not args.no_cache,
     )
     generator.get_trajtok_vocab()
