@@ -32,7 +32,7 @@ model_config:
     agent_token_file: "agent_vocab_555_s2.pkl"
   validation_rollout_sampling:
     criterium: topk_prob
-    num_k: 5 # for k most likely
+    num_k: 32 # for k most likely
     temp: 1.0
   training_rollout_sampling:
     criterium: topk_prob # {topk_dist_sampled_with_prob, topk_prob, topk_prob_sampled_with_dist}

@@ -5,7 +5,7 @@ export HYDRA_FULL_ERROR=1
 export TF_CPP_MIN_LOG_LEVEL=2
 
 MY_EXPERIMENT="local_val"
-VAL_K=48
+VAL_K="${VAL_K:-32}"
 MY_TASK_NAME=$MY_EXPERIMENT-K$VAL_K"-debug"
 
 source "$(dirname "$0")/setup_runtime_env.sh"
