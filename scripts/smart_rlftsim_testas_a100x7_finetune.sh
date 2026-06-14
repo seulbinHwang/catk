@@ -62,6 +62,31 @@ PY
   esac
 }
 
+download_wandb_ckpt() {
+  local artifact="$1"
+  local output_dir="$2"
+  mkdir -p "$output_dir"
+  CKPT_ARTIFACT="$artifact" CKPT_DOWNLOAD_DIR="$output_dir" python - <<'PY'
+import os
+from pathlib import Path
+
+import wandb
+
+artifact_name = os.environ["CKPT_ARTIFACT"]
+download_dir = Path(os.environ["CKPT_DOWNLOAD_DIR"])
+api = wandb.Api()
+artifact = api.artifact(artifact_name, type="model")
+path = Path(artifact.download(root=download_dir.as_posix()))
+ckpt = path / "epoch_last.ckpt"
+if not ckpt.exists():
+    candidates = sorted(path.rglob("*.ckpt"))
+    if not candidates:
+        raise FileNotFoundError(f"No .ckpt file found under {path}")
+    ckpt = candidates[0]
+print(ckpt.as_posix())
+PY
+}
+
 main() {
   export LOGLEVEL="${LOGLEVEL:-INFO}"
   export HYDRA_FULL_ERROR="${HYDRA_FULL_ERROR:-1}"
@@ -93,6 +118,8 @@ main() {
   local task_name="${TASK_NAME:-smart_rlftsim_testas_a100x7}"
   local run_id="${CATK_RUN_ID:-}"
   local ckpt_path="${CATK_CKPT_PATH:-${CKPT_PATH:-}}"
+  local ckpt_artifact="${CATK_CKPT_ARTIFACT:-${CKPT_ARTIFACT:-}}"
+  local ckpt_download_dir="${CATK_CKPT_DOWNLOAD_DIR:-${CKPT_DOWNLOAD_DIR:-/workspace/checkpoints/smart_rlftsim_testas_a100x7}}"
 
   case "$action" in
     rlftsim_finetune|validate|test) ;;
@@ -102,8 +129,12 @@ main() {
       ;;
   esac
   if [[ -z "$ckpt_path" ]]; then
-    log "ERROR: CATK_CKPT_PATH or CKPT_PATH is required for RLFTSim runs."
-    exit 2
+    if [[ -z "$ckpt_artifact" ]]; then
+      log "ERROR: CATK_CKPT_PATH/CKPT_PATH or CATK_CKPT_ARTIFACT/CKPT_ARTIFACT is required for RLFTSim runs."
+      exit 2
+    fi
+    log "downloading checkpoint artifact: $ckpt_artifact"
+    ckpt_path="$(download_wandb_ckpt "$ckpt_artifact" "$ckpt_download_dir" | tail -1)"
   fi
   if [[ ! -f "$ckpt_path" ]]; then
     log "ERROR: checkpoint does not exist: $ckpt_path"
@@ -145,6 +176,7 @@ main() {
   log "  master_port:      $master_port"
   log "  cache_root:       $cache_root"
   log "  ckpt_path:        $ckpt_path"
+  log "  ckpt_artifact:    ${ckpt_artifact:-none}"
   log "  train_batch_size: ${TRAIN_BATCH_SIZE:-8}"
   log "  rlftsim_accum:    1"
 

@@ -67,6 +67,8 @@ def render_env_file(*, args: argparse.Namespace, task_name: str, run_id: str) ->
         export_line("MAX_EPOCHS", args.max_epochs),
         export_line("CATK_LR", args.learning_rate),
         export_line("CATK_CKPT_PATH", args.ckpt_path),
+        export_line("CATK_CKPT_ARTIFACT", args.ckpt_artifact),
+        export_line("CATK_CKPT_DOWNLOAD_DIR", args.ckpt_download_dir),
         export_line("CATK_HYDRA_OVERRIDES", args.extra_hydra_overrides),
         export_line("CATK_ATTENTION_GRAPH_FP32", args.graph_attn_fp32),
         export_line("WANDB_GROUP", args.wandb_group),
@@ -242,6 +244,25 @@ def exec_in_pod(args: argparse.Namespace, script: str) -> None:
     run_kubectl(cmd)
 
 
+def assert_gpu_idle(args: argparse.Namespace) -> None:
+    script = """
+set -Eeuo pipefail
+if ! command -v nvidia-smi >/dev/null 2>&1; then
+  echo "[launcher] nvidia-smi not found; cannot prove GPUs are idle." >&2
+  exit 5
+fi
+gpu_processes="$(nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 2>/dev/null || true)"
+if [[ -n "${gpu_processes//[[:space:]]/}" ]]; then
+  echo "[launcher] refusing to start because testas has active GPU processes:" >&2
+  printf '%s\n' "$gpu_processes" >&2
+  echo "[launcher] wait for the current experiment to finish, or set ALLOW_BUSY_TESTAS=1 in the preset wrapper." >&2
+  exit 4
+fi
+echo "[launcher] GPU idle guard passed."
+"""
+    exec_in_pod(args, script)
+
+
 def prepare_project_root(args: argparse.Namespace) -> None:
     script = f"""
 set -Eeuo pipefail
@@ -285,6 +306,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--experiment", default=os.environ.get("CATK_EXPERIMENT", DEFAULT_EXPERIMENT))
     parser.add_argument("--ckpt-path", default=os.environ.get("CKPT_PATH", ""))
+    parser.add_argument("--ckpt-artifact", default=os.environ.get("CKPT_ARTIFACT", ""))
+    parser.add_argument("--ckpt-download-dir", default=os.environ.get("CKPT_DOWNLOAD_DIR", ""))
     parser.add_argument("--task-name", default="")
     parser.add_argument("--run-id", default=os.environ.get("CATK_RUN_ID", ""))
     parser.add_argument("--session", default=os.environ.get("SESSION", "catk-smart-rlftsim-testas-a100x7"))
@@ -304,13 +327,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--extra-hydra-overrides", default=os.environ.get("EXTRA_HYDRA_OVERRIDES", ""))
     parser.add_argument("--monitor-interval", type=int, default=int(os.environ.get("MONITOR_INTERVAL", "30")))
     parser.add_argument("--no-monitor-pane", action="store_true")
+    parser.add_argument(
+        "--require-idle-gpu",
+        action="store_true",
+        help="Refuse to start if nvidia-smi reports any active compute process.",
+    )
     parser.add_argument("--replace", action="store_true")
     parser.add_argument("--stop", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    if not args.stop and not args.ckpt_path:
-        parser.error("--ckpt-path or CKPT_PATH is required")
+    if not args.stop and not args.ckpt_path and not args.ckpt_artifact:
+        parser.error("--ckpt-path/CKPT_PATH or --ckpt-artifact/CKPT_ARTIFACT is required")
     if not args.nproc_per_node.isdigit() or int(args.nproc_per_node) != 7:
         parser.error("--nproc-per-node must be 7 for the testas A100x7 preset")
     if args.monitor_interval < 1:
@@ -331,6 +359,9 @@ def main() -> None:
         exec_in_pod(args, render_stop_command(args.session, args.task_name))
         return
 
+    if args.require_idle_gpu:
+        assert_gpu_idle(args)
+
     if args.prepare:
         prepare_project_root(args)
 
@@ -340,6 +371,7 @@ def main() -> None:
     print(f"[launcher] session:   {args.session}")
     print(f"[launcher] cache root: {args.cache_root}")
     print(f"[launcher] ckpt_path:  {args.ckpt_path}")
+    print(f"[launcher] ckpt artifact: {args.ckpt_artifact}")
     print(f"[launcher] GPUs:       {args.nproc_per_node}")
 
     script = render_start_command(args=args, task_name=args.task_name, run_id=args.run_id)
