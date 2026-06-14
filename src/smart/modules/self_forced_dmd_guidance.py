@@ -1,16 +1,164 @@
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import Tensor
+
+from src.smart.modules.kinematic_control import CONTROL_FLOW_DIM, PEDESTRIAN_TYPE_ID, POSE_FLOW_DIM
+
+
+def build_active_control_mask(
+    *,
+    agent_type: Tensor | None,
+    flow_dim: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    use_kinematic_control_flow: bool,
+    use_holonomic_model_only: bool,
+) -> Tensor:
+    """self-forced DMD가 실제 실행에 쓰는 control 축만 고릅니다.
+
+    Args:
+        agent_type: packed agent type입니다. shape은 ``[n_valid_agent]`` 입니다.
+            control-space non-holonomic DMD일 때만 필요합니다.
+        flow_dim: flow state 마지막 차원입니다.
+        device: 반환 tensor device입니다.
+        dtype: 반환 tensor dtype입니다.
+        use_kinematic_control_flow: control-space flow 여부입니다.
+        use_holonomic_model_only: 모든 agent를 holonomic control로 복원하는지 여부입니다.
+
+    Returns:
+        Tensor: ``[n_valid_agent, 1, flow_dim]`` active mask입니다.
+    """
+    num_agent = int(agent_type.shape[0]) if agent_type is not None else 0
+    if (
+        not use_kinematic_control_flow
+        or use_holonomic_model_only
+        or int(flow_dim) != CONTROL_FLOW_DIM
+    ):
+        return torch.ones((num_agent, 1, int(flow_dim)), device=device, dtype=dtype)
+    if agent_type is None:
+        raise ValueError("agent_type is required for non-holonomic control-space DMD.")
+    if agent_type.ndim != 1:
+        raise ValueError(f"agent_type must have shape [n_valid_agent], got {tuple(agent_type.shape)}.")
+
+    active_mask = torch.ones((agent_type.shape[0], 1, CONTROL_FLOW_DIM), device=device, dtype=dtype)
+    non_holonomic = agent_type.to(device=device) != PEDESTRIAN_TYPE_ID
+    active_mask[non_holonomic, :, 1] = 0.0
+    return active_mask
+
+
+def active_control_dmd_surrogate_loss(
+    committed_path_norm: Tensor,
+    dmd_direction: Tensor,
+    active_mask: Tensor | None = None,
+    dmd_injection_scale: float | Tensor = 1.0,
+    eps: float = 1.0e-6,
+) -> tuple[Tensor, Tensor]:
+    """DMD 방향을 detached target으로 주입하는 active-axis surrogate loss입니다.
+
+    Args:
+        committed_path_norm: Generator가 self-rollout으로 실행한 path/control ``X`` 입니다.
+        dmd_direction: teacher와 generated estimator 차이로 만든 방향 ``D`` 입니다.
+        active_mask: 실행에 영향을 주는 축 mask입니다. ``None`` 이면 모든 축을 씁니다.
+        dmd_injection_scale: detached target에 주입할 DMD 방향 계수입니다.
+        eps: 분모 안정화 값입니다.
+
+    Returns:
+        tuple[Tensor, Tensor]: ``(loss, detached_target)`` 입니다.
+    """
+    expected_shape = tuple(committed_path_norm.shape)
+    if tuple(dmd_direction.shape) != expected_shape:
+        raise ValueError(
+            "dmd_direction shape must match committed_path_norm shape: "
+            f"expected={expected_shape}, actual={tuple(dmd_direction.shape)}."
+        )
+    if committed_path_norm.ndim != 3:
+        raise ValueError(
+            "committed_path_norm must have shape [n_valid_agent, path_steps, flow_dim], "
+            f"got {expected_shape}."
+        )
+
+    if isinstance(dmd_injection_scale, Tensor):
+        injection_scale = dmd_injection_scale.to(
+            device=committed_path_norm.device,
+            dtype=committed_path_norm.dtype,
+        )
+    else:
+        injection_scale = torch.as_tensor(
+            float(dmd_injection_scale),
+            device=committed_path_norm.device,
+            dtype=committed_path_norm.dtype,
+        )
+    target_path_norm = (committed_path_norm + dmd_direction * injection_scale).detach()
+    if committed_path_norm.shape[0] == 0:
+        return committed_path_norm.sum() * 0.0, target_path_norm
+
+    diff_square = (committed_path_norm.float() - target_path_norm.float()).square()
+    if active_mask is None:
+        loss = 0.5 * diff_square.flatten(1).mean(dim=1).mean()
+        return loss, target_path_norm
+
+    active = active_mask.to(device=committed_path_norm.device, dtype=diff_square.dtype)
+    try:
+        active = active.expand_as(diff_square)
+    except RuntimeError as exc:
+        raise ValueError(
+            "active_mask must be broadcastable to committed_path_norm shape: "
+            f"mask={tuple(active_mask.shape)}, path={expected_shape}."
+        ) from exc
+
+    denom = active.flatten(1).sum(dim=1).clamp_min(float(eps))
+    per_agent_loss = (diff_square * active).flatten(1).sum(dim=1) / denom
+    return 0.5 * per_agent_loss.mean(), target_path_norm
+
+
+def normalize_pose_heading_vector(pose_norm: Tensor, eps: float = 1.0e-6) -> Tensor:
+    """pose-space target의 heading 벡터를 단위 길이로 되돌립니다.
+
+    Args:
+        pose_norm: ``[N, T, 4]`` pose-space tensor입니다. 마지막 차원은
+            ``[x / scale, y / scale, cos(yaw), sin(yaw)]`` 입니다.
+        eps: heading norm 분모 안정화 값입니다.
+
+    Returns:
+        Tensor: 위치는 유지하고 heading ``cos/sin`` 벡터만 정규화한 tensor입니다.
+    """
+    if pose_norm.ndim != 3 or pose_norm.shape[-1] != POSE_FLOW_DIM:
+        raise ValueError(f"pose_norm must have shape [N, T, 4], got {tuple(pose_norm.shape)}.")
+    heading = pose_norm[..., 2:4]
+    heading_norm = heading.float().norm(dim=-1, keepdim=True).clamp_min(float(eps))
+    normalized_heading = (heading.float() / heading_norm).to(dtype=pose_norm.dtype)
+    return torch.cat([pose_norm[..., :2], normalized_heading], dim=-1)
+
+
+def compute_self_forced_dmd_injection_scale(
+    *,
+    current_epoch: int,
+    dmd_start_epoch: int,
+    use_ramp: bool = False,
+) -> float:
+    """self-forced DMD 시작 후 2 epoch 동안 target 주입량을 완만히 키웁니다."""
+    if not bool(use_ramp):
+        return 1.0
+    elapsed_epoch = max(0, int(current_epoch) - int(dmd_start_epoch))
+    return 0.25 + 0.75 * min(1.0, float(elapsed_epoch) / 2.0)
 
 
 def build_clean_dmd_direction(
     committed_path_norm: Tensor,
     target_clean_norm: Tensor,
     generated_clean_norm: Tensor,
-    normalizer_eps: float = 1.0e-3,
+    active_mask: Tensor | None = None,
+    stable_scale_group_index: Tensor | None = None,
+    normalizer_eps: float = 0.05,
+    beta: float = 1.0,
+    use_stable_scale_filter: bool = True,
+    use_teacher_alignment_filter: bool = False,
+    use_trust_region_filter: bool = False,
 ) -> Tensor:
-    """teacher와 generated estimator의 clean path 차이로 DMD 방향을 만듭니다.
+    """configurable clean-DMD 방향을 active 축에서만 만듭니다.
 
     Args:
         committed_path_norm: Generator가 closed-loop로 실제 실행한 path입니다.
@@ -19,19 +167,38 @@ def build_clean_dmd_direction(
             shape은 ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
         generated_clean_norm: generated estimator가 같은 noisy path에서 추정한 clean path입니다.
             shape은 ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
-        normalizer_eps: agent별 정규화 분모의 최소값입니다.
+        active_mask: 선택적 active 축 mask입니다. shape은 ``[n_valid_agent, 1, C]``
+            처럼 ``committed_path_norm`` 에 broadcast 가능해야 합니다.
+        stable_scale_group_index: stable scale을 공유할 non-negative group id입니다.
+            ``None``이면 agent별로 ``mean(abs(G))`` 를 계산합니다. shape은
+            ``[n_valid_agent]`` 입니다.
+        normalizer_eps: absolute-mean stable scale의 최소값입니다.
+        beta: teacher score 방향 tempering 계수입니다. ``1.0`` 이면 기존 DMD,
+            ``0 < beta < 1`` 이면 teacher 방향만 약하게 만든 tempered-DMD입니다.
+        use_stable_scale_filter: True이면 teacher-estimator 차이를
+            group별 ``max(mean(abs(G)), eps)`` 로 나눕니다.
+        use_teacher_alignment_filter: True이면 teacher 방향과 정렬된 agent만 남깁니다.
+        use_trust_region_filter: True이면 DMD RMS가 Generator-teacher RMS보다
+            커지지 않도록 agent별로 제한합니다.
 
     Returns:
-        Tensor: 현재 committed path에 더할 정규화된 DMD 방향입니다.
+        Tensor: 현재 committed path에 더할 bounded DMD 방향입니다.
         shape은 ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
 
     설명:
-        이 함수는 raw velocity 차이나 시간/노이즈 계수가 섞인 값을 그대로 쓰지 않습니다.
-        먼저 ``target_clean_norm - generated_clean_norm`` 방향을 만들고, 각 agent의 전체
-        미래 path 기준으로 ``committed_path_norm``과 ``target_clean_norm`` 사이의 평균
-        거리로 나눕니다. 이렇게 하면 teacher가 보는 방향은 유지하면서도 특정 tau 구간에서
-        target path가 과하게 커지는 문제를 줄일 수 있습니다.
+        이 함수는 ``beta=1`` 에서 teacher-estimator clean 추정 차이 ``R`` 을
+        기본 DMD 방향으로 둡니다. ``beta<1`` 에서는 noisy/committed state 기준
+        teacher score 방향만 tempering해 ``beta * (T - X) - (G - X)`` 를 씁니다.
+        세 안정화 필터는 config로 독립적으로 켜고 끌 수 있습니다. control-space
+        non-holonomic DMD에서는 vehicle/cyclist의 lateral 축을 active mask로 제거합니다.
     """
+    beta_value = float(beta)
+    if not math.isfinite(beta_value) or beta_value <= 0.0 or beta_value > 1.0:
+        raise ValueError(
+            "self-forced DMD beta must be finite and in the interval (0, 1], "
+            f"got {beta!r}."
+        )
+
     expected_shape = tuple(committed_path_norm.shape)
     if tuple(target_clean_norm.shape) != expected_shape:
         raise ValueError(
@@ -53,19 +220,112 @@ def build_clean_dmd_direction(
     target_clean = target_clean_norm.float()
     generated_clean = generated_clean_norm.float()
 
-    clean_dmd_direction = target_clean - generated_clean
-    reduce_dims = tuple(range(1, committed.dim()))
-    agent_distance = (committed - target_clean).abs().mean(
-        dim=reduce_dims,
-        keepdim=True,
-    )
-    normalizer = agent_distance.clamp_min(float(normalizer_eps))
+    if committed.shape[0] == 0:
+        return torch.zeros_like(committed_path_norm)
 
-    normalized_direction = clean_dmd_direction / normalizer
-    normalized_direction = torch.nan_to_num(
-        normalized_direction,
+    reduce_dims = tuple(range(1, committed.dim()))
+    if active_mask is None:
+        active = None
+        active_count = torch.full(
+            (committed.shape[0],) + (1,) * (committed.dim() - 1),
+            float(committed[0].numel()),
+            device=committed.device,
+            dtype=committed.dtype,
+        )
+    else:
+        active = active_mask.to(device=committed.device, dtype=committed.dtype)
+        try:
+            active = active.expand_as(committed)
+        except RuntimeError as exc:
+            raise ValueError(
+                "active_mask must be broadcastable to committed_path_norm shape: "
+                f"mask={tuple(active_mask.shape)}, path={expected_shape}."
+            ) from exc
+        active_count = active.sum(dim=reduce_dims, keepdim=True).clamp_min(1.0)
+
+    if beta_value == 1.0:
+        teacher_estimator_delta = target_clean - generated_clean
+    else:
+        teacher_estimator_delta = (
+            beta_value * (target_clean - committed)
+            - (generated_clean - committed)
+        )
+    generator_teacher_delta = committed - target_clean
+    if active is not None:
+        teacher_estimator_delta = teacher_estimator_delta * active
+        generator_teacher_delta = generator_teacher_delta * active
+
+    if use_stable_scale_filter:
+        per_agent_abs_sum = generator_teacher_delta.abs().sum(dim=reduce_dims, keepdim=False)
+        per_agent_active_count = active_count.reshape(-1)
+        if stable_scale_group_index is None:
+            generator_teacher_abs_mean = per_agent_abs_sum / per_agent_active_count
+        else:
+            group_index = stable_scale_group_index.to(device=committed.device, dtype=torch.long)
+            if group_index.ndim != 1 or group_index.shape[0] != committed.shape[0]:
+                raise ValueError(
+                    "stable_scale_group_index must have shape [n_valid_agent], "
+                    f"got {tuple(group_index.shape)} for path shape {expected_shape}."
+                )
+            if group_index.numel() == 0:
+                generator_teacher_abs_mean = per_agent_abs_sum / per_agent_active_count
+            else:
+                num_group = int(group_index.max().item()) + 1
+                group_abs_sum = torch.zeros(num_group, device=committed.device, dtype=committed.dtype)
+                group_count = torch.zeros(num_group, device=committed.device, dtype=committed.dtype)
+                group_abs_sum.scatter_add_(0, group_index, per_agent_abs_sum)
+                group_count.scatter_add_(0, group_index, per_agent_active_count)
+                generator_teacher_abs_mean = (
+                    group_abs_sum[group_index] / group_count[group_index].clamp_min(1.0)
+                )
+        generator_teacher_abs_mean = generator_teacher_abs_mean.reshape(
+            (committed.shape[0],) + (1,) * (committed.dim() - 1)
+        )
+        min_scale = torch.as_tensor(
+            float(normalizer_eps),
+            device=committed.device,
+            dtype=committed.dtype,
+        )
+        stable_scale = torch.maximum(
+            generator_teacher_abs_mean,
+            min_scale,
+        )
+        direction = teacher_estimator_delta / stable_scale
+    else:
+        direction = teacher_estimator_delta
+
+    if use_teacher_alignment_filter:
+        teacher_direction = target_clean - committed
+        if active is not None:
+            teacher_direction = teacher_direction * active
+        alignment = (teacher_direction * teacher_estimator_delta).sum(
+            dim=reduce_dims,
+            keepdim=True,
+        )
+        aligned_gate = (alignment > 0.0).to(dtype=direction.dtype)
+        direction = direction * aligned_gate
+
+    if use_trust_region_filter:
+        rms_eps = 1.0e-6
+        scale_denom = active_count + rms_eps
+        generator_teacher_rms = (
+            generator_teacher_delta.square().sum(dim=reduce_dims, keepdim=True) / scale_denom
+        ).sqrt()
+        direction_rms = (
+            direction.square().sum(dim=reduce_dims, keepdim=True) / scale_denom
+        ).sqrt()
+        trust_scale = torch.minimum(
+            torch.ones_like(direction_rms),
+            generator_teacher_rms / (direction_rms + rms_eps),
+        )
+        direction = direction * trust_scale
+
+    if active is not None:
+        direction = direction * active
+    direction = torch.nan_to_num(
+        direction,
         nan=0.0,
         posinf=0.0,
         neginf=0.0,
     )
-    return normalized_direction.to(dtype=committed_path_norm.dtype)
+    return direction.to(dtype=committed_path_norm.dtype)

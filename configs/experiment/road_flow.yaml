@@ -19,8 +19,8 @@ road:
   rollout_steps: 80
   commit_steps: 5
   selection_horizon_steps: 20
-  generation_batch_size: 1
-  candidate_micro_batch_size: 4
+  generation_batch_size: 8
+  candidate_micro_batch_size: 8
   selected_variant_seed: ${seed}
   cleanup_used_cache: true
   overwrite_cache: false
@@ -35,6 +35,13 @@ model:
     n_rollout_closed_val: 32
     val_open_loop: false
     val_closed_loop: true
+    decoder:
+      # RoaD fine-tuning starts from control-space flow pretrain
+      # x5f9g0ce:v57. Pin the model geometry to that checkpoint instead of
+      # relying on branch defaults that may target newer flow variants.
+      flow_window_steps: 20
+      num_freq_bands: 64
+      head_dim: 15
     self_forced:
       enabled: false
     draft:

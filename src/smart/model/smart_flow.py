@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import gc
 import hashlib
+import json
 import math
 from pathlib import Path
 from typing import Any, Dict, Sequence
@@ -30,37 +31,83 @@ from src.smart.metrics.flow_metrics import (
     yaw_ade_future,
     yaw_fde_future,
 )
-from src.smart.modules.draft_physics import (
-    DRAFT_PHYSICS_ACTUAL_UNIT_KEYS,
-    DRAFT_PHYSICS_COMPONENT_KEYS,
-    DraftPhysicsRegularizer,
-)
 from src.smart.modules.self_forced_path_flow import (
+    build_anchor0_normalized_committed_control,
     build_anchor0_normalized_committed_path,
-    build_anchor0_physics_inputs,
     get_anchor0_valid_mask,
-    masked_mean_square_loss,
 )
-from src.smart.modules.self_forced_dmd_guidance import build_clean_dmd_direction
+from src.smart.modules.self_forced_dmd_guidance import (
+    active_control_dmd_surrogate_loss,
+    build_active_control_mask,
+    build_clean_dmd_direction,
+    compute_self_forced_dmd_injection_scale,
+    normalize_pose_heading_vector,
+)
 from src.smart.modules.self_forced_sid_loss import compute_clean_sid_loss
 from src.smart.modules.self_forced_update_separation import (
     assert_no_module_gradients,
     clear_module_gradients,
+    detach_tensor_tree,
+    module_gradients_disabled,
 )
 from src.smart.modules.self_forced_estimator_warmup import (
     is_self_forced_estimator_warmup_epoch,
     resolve_self_forced_estimator_warmup_epochs,
+    should_compute_anchor_flow_matching_loss,
+    should_run_self_forced_validation_after_epoch,
 )
 from src.smart.modules.self_forced_trainable_range import (
     apply_self_forced_unfrozen_range,
     resolve_self_forced_unfrozen_range,
 )
+from src.smart.modules.kinematic_control import CYCLIST_TYPE_ID
 from src.smart.modules.smart_flow_decoder import SMARTFlowDecoder
 from src.smart.tokens.flow_token_processor import FlowTokenProcessor
 from src.smart.utils.finetune import set_model_for_finetuning
 from src.smart.utils.flow_horizon import format_flow_horizon_tag
 from src.utils.vis_waymo import VisWaymo
 from src.utils.sim_agents_utils import get_scenario_id_int_tensor, get_scenario_rollouts
+
+
+_TOKEN_PROCESSOR_DECODER_SHARED_KEYS = (
+    "use_kinematic_control_flow",
+    "use_holonomic_model_only",
+    "use_rolling_supervision",
+    "control_pos_scale_m",
+    "control_vehicle_no_slip_point_ratio",
+    "control_cyclist_no_slip_point_ratio",
+    "control_vehicle_yaw_scale_rad",
+    "control_pedestrian_yaw_scale_rad",
+    "control_cyclist_yaw_scale_rad",
+)
+
+
+def _values_match(left: Any, right: Any) -> bool:
+    if isinstance(left, bool) or isinstance(right, bool):
+        return bool(left) == bool(right)
+    if left is None or right is None:
+        return left is right
+    if isinstance(left, (int, float)) or isinstance(right, (int, float)):
+        return math.isclose(float(left), float(right), rel_tol=0.0, abs_tol=1.0e-12)
+    return left == right
+
+
+def _build_decoder_config_from_token_processor(decoder_config: Any, token_processor: FlowTokenProcessor) -> Dict[str, Any]:
+    """token_processor와 decoder가 공유하는 control-space 설정을 한 곳에서 고정합니다."""
+    synced_config = dict(decoder_config)
+    for key in _TOKEN_PROCESSOR_DECODER_SHARED_KEYS:
+        token_value = getattr(token_processor, key)
+        if key in synced_config:
+            decoder_value = decoder_config[key]
+            if not _values_match(decoder_value, token_value):
+                raise ValueError(
+                    f"model_config.decoder.{key} must match "
+                    f"model_config.token_processor.{key}. "
+                    "Set the token_processor value only; decoder uses it as the single source of truth. "
+                    f"got decoder={decoder_value!r}, token_processor={token_value!r}."
+                )
+        synced_config[key] = token_value
+    return synced_config
 
 
 class SMARTFlow(LightningModule):
@@ -78,10 +125,21 @@ class SMARTFlow(LightningModule):
         self.log_epoch = -1
         self.val_open_loop = model_config.val_open_loop
         self.val_closed_loop = model_config.val_closed_loop
+        self.train_open_loop_metrics = bool(
+            getattr(model_config, "train_open_loop_metrics", True)
+        )
+        self.skip_empty_open_loop_optimizer_guard = bool(
+            getattr(model_config, "skip_empty_open_loop_optimizer_guard", False)
+        )
         self.token_processor = FlowTokenProcessor(**model_config.token_processor)
+        self.use_kinematic_control_flow = bool(self.token_processor.use_kinematic_control_flow)
+        decoder_config = _build_decoder_config_from_token_processor(
+            decoder_config=model_config.decoder,
+            token_processor=self.token_processor,
+        )
 
         self.encoder = SMARTFlowDecoder(
-            **model_config.decoder,
+            **decoder_config,
             n_token_agent=self.token_processor.n_token_agent,
         )
         if self.flow_window_steps != int(self.token_processor.flow_window_steps):
@@ -99,13 +157,20 @@ class SMARTFlow(LightningModule):
         )
         self.sim_agents_submission = SimAgentsSubmission(**model_config.sim_agents_submission)
         wosac_cpd_reference = getattr(model_config, "wosac_cpd_reference", None)
+        wosac_distribution_type_scale = getattr(
+            model_config,
+            "wosac_distribution_type_scale",
+            None,
+        )
         self.wosac_distribution_metrics = WOSACDistributionMetrics(
             prefix="val_closed",
             cpd_reference=wosac_cpd_reference,
+            type_scale=wosac_distribution_type_scale,
         )
         self.test_wosac_distribution_metrics = WOSACDistributionMetrics(
             prefix="test",
             cpd_reference=wosac_cpd_reference,
+            type_scale=wosac_distribution_type_scale,
         )
 
         self.n_rollout_closed_val = model_config.n_rollout_closed_val
@@ -130,6 +195,7 @@ class SMARTFlow(LightningModule):
         self.n_batch_sim_agents_metric = model_config.n_batch_sim_agents_metric
         self.scorer_scene_num = getattr(model_config, "scorer_scene_num", None)
         self._scorer_scene_num_last_key: tuple[int, int, int] | None = None
+        self._scorer_val_limit_last_key: tuple[int, int | float, int] | None = None
         self._fit_time_original_limit_val_batches: int | float | None = None
         self._fit_time_checkpoint_only_validation_enabled = False
         self.open_metric_names = {
@@ -144,79 +210,29 @@ class SMARTFlow(LightningModule):
             "yaw_ade": f"ADEyaw{self.flow_horizon_tag}",
             "yaw_fde": f"FDEyaw{self.flow_horizon_tag}",
         }
+        self._train_open_epoch_log_names = (
+            "train/loss",
+            "train/loss_fm",
+            f"train/{self.train_open_metric_names['ade']}",
+            f"train/{self.train_open_metric_names['fde']}",
+            f"train/{self.train_open_metric_names['yaw_ade']}",
+            f"train/{self.train_open_metric_names['yaw_fde']}",
+        )
+        self.register_buffer(
+            "_train_open_epoch_metric_sums",
+            torch.zeros(len(self._train_open_epoch_log_names), dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_train_open_epoch_metric_counts",
+            torch.zeros(len(self._train_open_epoch_log_names), dtype=torch.float32),
+            persistent=False,
+        )
 
         self.video_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
         self.video_dir = Path(self.video_dir) / "videos"
 
         self.validation_rollout_sampling = model_config.validation_rollout_sampling
-
-        draft_config = getattr(model_config, "draft", None)
-        self.draft_enabled = bool(draft_config is not None and getattr(draft_config, "enabled", False))
-        self.draft_sampling = getattr(draft_config, "sampling", None)
-        self.draft_start_epoch = int(getattr(draft_config, "start_epoch", 0)) if draft_config is not None else 0
-        self.draft_ramp_epochs = int(getattr(draft_config, "ramp_epochs", 1)) if draft_config is not None else 1
-        self.draft_max_weight = float(getattr(draft_config, "max_weight", 0.0)) if draft_config is not None else 0.0
-        self.draft_physics_force_fp32 = False
-
-        if self.draft_enabled:
-            draft_physics = getattr(draft_config, "physics")
-            self.draft_physics_force_fp32 = bool(getattr(draft_physics, "force_fp32", True))
-            self.draft_regularizer = DraftPhysicsRegularizer(
-                dt=float(getattr(draft_physics, "dt", 0.1)),
-                pos_scale_m=float(getattr(draft_physics, "pos_scale_m", 20.0)),
-                speed_floor_mps=float(getattr(draft_physics, "speed_floor_mps", 0.5)),
-                vehicle_v_max_mps=float(getattr(draft_physics, "vehicle_v_max_mps", 35.0)),
-                vehicle_a_max_mps2=float(getattr(draft_physics, "vehicle_a_max_mps2", 8.0)),
-                vehicle_lat_accel_max_mps2=float(
-                    getattr(draft_physics, "vehicle_lat_accel_max_mps2", 4.2)
-                ),
-                bicycle_v_max_mps=float(getattr(draft_physics, "bicycle_v_max_mps", 22.0)),
-                bicycle_a_max_mps2=float(getattr(draft_physics, "bicycle_a_max_mps2", 5.5)),
-                bicycle_lat_accel_max_mps2=float(
-                    getattr(draft_physics, "bicycle_lat_accel_max_mps2", 4.4)
-                ),
-                pedestrian_v_max_mps=float(getattr(draft_physics, "pedestrian_v_max_mps", 5.0)),
-                pedestrian_a_max_mps2=float(getattr(draft_physics, "pedestrian_a_max_mps2", 4.7)),
-                vehicle_wheelbase_scale=float(
-                    getattr(draft_physics, "vehicle_wheelbase_scale", 0.60)
-                ),
-                bicycle_wheelbase_scale=float(
-                    getattr(draft_physics, "bicycle_wheelbase_scale", 0.85)
-                ),
-                vehicle_steer_max_rad=float(getattr(draft_physics, "vehicle_steer_max_rad", 0.55)),
-                bicycle_steer_max_rad=float(getattr(draft_physics, "bicycle_steer_max_rad", 1.00)),
-                vehicle_steer_rate_max_radps=float(
-                    getattr(draft_physics, "vehicle_steer_rate_max_radps", 0.8)
-                ),
-                bicycle_steer_rate_max_radps=float(
-                    getattr(draft_physics, "bicycle_steer_rate_max_radps", 1.5)
-                ),
-                soft_weight=float(
-                    getattr(
-                        draft_physics,
-                        "soft_weight",
-                        getattr(
-                            draft_physics,
-                            "vehicle_soft_weight",
-                            getattr(
-                                draft_physics,
-                                "bicycle_soft_weight",
-                                getattr(draft_physics, "pedestrian_soft_weight", 0.25),
-                            ),
-                        ),
-                    )
-                ),
-                compare_softness_to_gt=bool(getattr(draft_physics, "compare_softness_to_gt", True)),
-                pedestrian_heading_weight=float(
-                    getattr(draft_physics, "pedestrian_heading_weight", 0.05)
-                ),
-                pedestrian_heading_speed_threshold_mps=float(
-                    getattr(draft_physics, "pedestrian_heading_speed_threshold_mps", 0.5)
-                ),
-                eps=float(getattr(draft_physics, "eps", 1e-6)),
-            )
-        else:
-            self.draft_regularizer = None
 
         self.self_forced_config = getattr(model_config, "self_forced", None)
         self.self_forced_enabled = bool(
@@ -233,16 +249,25 @@ class SMARTFlow(LightningModule):
             if self.self_forced_config is not None
             else 0.0
         )
-        self.self_forced_path_step_size = (
-            float(getattr(self.self_forced_config, "path_step_size", 0.05))
+        self.self_forced_direction_normalizer_eps = (
+            float(getattr(self.self_forced_config, "clean_dmd_normalizer_eps", 0.05))
             if self.self_forced_config is not None
             else 0.05
         )
-        self.self_forced_direction_normalizer_eps = (
-            float(getattr(self.self_forced_config, "clean_dmd_normalizer_eps", 1.0e-3))
+        self.self_forced_dmd_beta = (
+            float(getattr(self.self_forced_config, "beta", 1.0))
             if self.self_forced_config is not None
-            else 1.0e-3
+            else 1.0
         )
+        if (
+            not math.isfinite(self.self_forced_dmd_beta)
+            or self.self_forced_dmd_beta <= 0.0
+            or self.self_forced_dmd_beta > 1.0
+        ):
+            raise ValueError(
+                "self_forced.beta must be finite and in the interval (0, 1], "
+                f"got {self.self_forced_dmd_beta!r}."
+            )
         self.self_forced_distribution_matching_objective = (
             str(getattr(self.self_forced_config, "distribution_matching_objective", "dmd")).lower()
             if self.self_forced_config is not None
@@ -253,6 +278,42 @@ class SMARTFlow(LightningModule):
                 "self_forced.distribution_matching_objective must be 'dmd' or 'sid', "
                 f"got {self.self_forced_distribution_matching_objective}."
             )
+        self.self_forced_project_dmd_to_pose_space = (
+            bool(getattr(self.self_forced_config, "project_dmd_to_pose_space", False))
+            if self.self_forced_config is not None
+            else False
+        )
+        self.self_forced_dmd_use_stable_scale_filter = (
+            bool(getattr(self.self_forced_config, "dmd_use_stable_scale_filter", True))
+            if self.self_forced_config is not None
+            else True
+        )
+        self.self_forced_dmd_stable_scale_scope = (
+            str(getattr(self.self_forced_config, "dmd_stable_scale_scope", "agent")).lower()
+            if self.self_forced_config is not None
+            else "agent"
+        )
+        if self.self_forced_dmd_stable_scale_scope not in {"agent", "type", "scene"}:
+            raise ValueError(
+                "self_forced.dmd_stable_scale_scope must be one of "
+                "'agent', 'type', or 'scene', "
+                f"got {self.self_forced_dmd_stable_scale_scope!r}."
+            )
+        self.self_forced_dmd_use_teacher_alignment_filter = (
+            bool(getattr(self.self_forced_config, "dmd_use_teacher_alignment_filter", False))
+            if self.self_forced_config is not None
+            else False
+        )
+        self.self_forced_dmd_use_trust_region_filter = (
+            bool(getattr(self.self_forced_config, "dmd_use_trust_region_filter", False))
+            if self.self_forced_config is not None
+            else False
+        )
+        self.self_forced_dmd_use_injection_ramp = (
+            bool(getattr(self.self_forced_config, "dmd_use_injection_ramp", False))
+            if self.self_forced_config is not None
+            else False
+        )
         self.self_forced_sid_alpha = (
             float(getattr(self.self_forced_config, "sid_alpha", 1.0))
             if self.self_forced_config is not None
@@ -263,22 +324,20 @@ class SMARTFlow(LightningModule):
                 getattr(
                     self.self_forced_config,
                     "sid_normalizer_eps",
-                    self.self_forced_direction_normalizer_eps,
+                    1.0e-3,
                 )
             )
             if self.self_forced_config is not None
-            else self.self_forced_direction_normalizer_eps
+            else 1.0e-3
         )
         self.self_forced_detach_block_transition = (
             bool(getattr(self.self_forced_config, "detach_block_transition", False))
             if self.self_forced_config is not None
             else False
         )
-        self.self_forced_use_stop_motion = (
-            bool(getattr(self.self_forced_config, "use_stop_motion", False))
-            if self.self_forced_config is not None
-            else False
-        )
+        # Stop-motion gating is disabled for both inference and self-forced
+        # training rollouts in this branch, regardless of config overrides.
+        self.self_forced_use_stop_motion = False
         self.self_forced_guidance_tau_low = (
             float(getattr(self.self_forced_config, "clean_dmd_tau_low", 0.02))
             if self.self_forced_config is not None
@@ -299,17 +358,71 @@ class SMARTFlow(LightningModule):
             if self.self_forced_config is not None
             else True
         )
+        self.self_forced_use_distribution_matching_loss = (
+            bool(getattr(self.self_forced_config, "use_distribution_matching_loss", True))
+            if self.self_forced_config is not None
+            else True
+        )
         self.self_forced_estimator_updates_per_step = (
             max(1, int(getattr(self.self_forced_config, "estimator_updates_per_step", 1)))
             if self.self_forced_config is not None
             else 1
         )
-        self.self_forced_estimator_lr = self.lr / float(
-            self.self_forced_estimator_updates_per_step
+        self.self_forced_generated_estimator_lr = (
+            float(getattr(self.self_forced_config, "generated_estimator_lr", self.lr))
+            if self.self_forced_config is not None
+            else self.lr
+        )
+        self.self_forced_cache_frozen_map_features = (
+            bool(getattr(self.self_forced_config, "cache_frozen_map_features", True))
+            if self.self_forced_config is not None
+            else False
         )
         self.self_forced_estimator_warmup_epochs = (
             resolve_self_forced_estimator_warmup_epochs(self.self_forced_config)
         )
+        self.self_forced_generated_estimator_init_path = (
+            str(getattr(self.self_forced_config, "generated_estimator_init_path", "") or "")
+            if self.self_forced_config is not None
+            else ""
+        )
+        self.self_forced_generated_estimator_init_strict = (
+            bool(getattr(self.self_forced_config, "generated_estimator_init_strict", True))
+            if self.self_forced_config is not None
+            else True
+        )
+        self.self_forced_generated_estimator_skip_warmup_on_load = (
+            bool(getattr(self.self_forced_config, "generated_estimator_skip_warmup_on_load", True))
+            if self.self_forced_config is not None
+            else True
+        )
+        self.self_forced_generated_estimator_bank_snapshot_path = (
+            str(getattr(self.self_forced_config, "generated_estimator_bank_snapshot_path", "") or "")
+            if self.self_forced_config is not None
+            else ""
+        )
+        self.self_forced_generated_estimator_bank_target_warmup_epochs = (
+            int(getattr(self.self_forced_config, "generated_estimator_bank_target_warmup_epochs", 0) or 0)
+            if self.self_forced_config is not None
+            else 0
+        )
+        self.self_forced_generated_estimator_bank_loaded_warmup_epochs = (
+            int(getattr(self.self_forced_config, "generated_estimator_bank_loaded_warmup_epochs", 0) or 0)
+            if self.self_forced_config is not None
+            else 0
+        )
+        self.self_forced_generated_estimator_bank_upload_artifact = (
+            str(getattr(self.self_forced_config, "generated_estimator_bank_upload_artifact", "") or "")
+            if self.self_forced_config is not None
+            else ""
+        )
+        self.self_forced_generated_estimator_bank_upload_on_warmup_end = (
+            bool(getattr(self.self_forced_config, "generated_estimator_bank_upload_on_warmup_end", False))
+            if self.self_forced_config is not None
+            else False
+        )
+        self._self_forced_generated_estimator_bank_loaded = False
+        self._self_forced_generated_estimator_bank_snapshot_saved = False
         self.self_forced_initialize_aux_on_fit_start = (
             bool(getattr(self.self_forced_config, "initialize_aux_from_generator_on_fit_start", True))
             if self.self_forced_config is not None
@@ -338,23 +451,17 @@ class SMARTFlow(LightningModule):
             if self.self_forced_config is not None
             else self.validation_rollout_sampling
         )
-        self.self_forced_use_physics = (
-            bool(getattr(self.self_forced_config, "use_control_space_physics_regularization", False))
-            if self.self_forced_config is not None
-            else False
-        )
-        self.self_forced_physics_weight = (
-            float(getattr(self.self_forced_config, "physics_weight", 0.0))
-            if self.self_forced_config is not None
-            else 0.0
-        )
-        self.self_forced_physics_force_fp32 = False
         self.self_forced_target_teacher = None
         self.self_forced_generated_estimator = None
         self.self_forced_generator_ema = None
         self._self_forced_aux_loaded_from_checkpoint = False
         self._self_forced_generator_ema_loaded_from_checkpoint = False
         self._self_forced_backward_context: Dict[str, Tensor] | None = None
+        self._self_forced_original_check_val_every_n_epoch: int | None = None
+        self._self_forced_validation_schedule_captured = False
+        self._automatic_open_loop_has_target_since_step = False
+        self._automatic_open_loop_has_target_pending: list[tuple[Tensor, Any | None]] = []
+        self._skip_next_automatic_optimizer_step = False
         if self.self_forced_enabled:
             if not (0.0 <= self.self_forced_ema_weight < 1.0):
                 raise ValueError(
@@ -379,65 +486,6 @@ class SMARTFlow(LightningModule):
                 torch.zeros((), dtype=torch.bool),
                 persistent=True,
             )
-            physics_config = getattr(
-                self.self_forced_config,
-                "physics",
-                getattr(draft_config, "physics", None),
-            )
-            if self.self_forced_use_physics and physics_config is not None:
-                self.self_forced_physics_force_fp32 = bool(getattr(physics_config, "force_fp32", True))
-                self.self_forced_regularizer = DraftPhysicsRegularizer(
-                    dt=float(getattr(physics_config, "dt", 0.1)),
-                    pos_scale_m=float(getattr(physics_config, "pos_scale_m", 20.0)),
-                    speed_floor_mps=float(getattr(physics_config, "speed_floor_mps", 0.5)),
-                    vehicle_v_max_mps=float(getattr(physics_config, "vehicle_v_max_mps", 35.0)),
-                    vehicle_a_max_mps2=float(getattr(physics_config, "vehicle_a_max_mps2", 8.0)),
-                    vehicle_lat_accel_max_mps2=float(
-                        getattr(physics_config, "vehicle_lat_accel_max_mps2", 4.2)
-                    ),
-                    bicycle_v_max_mps=float(getattr(physics_config, "bicycle_v_max_mps", 22.0)),
-                    bicycle_a_max_mps2=float(getattr(physics_config, "bicycle_a_max_mps2", 5.5)),
-                    bicycle_lat_accel_max_mps2=float(
-                        getattr(physics_config, "bicycle_lat_accel_max_mps2", 4.4)
-                    ),
-                    pedestrian_v_max_mps=float(getattr(physics_config, "pedestrian_v_max_mps", 5.0)),
-                    pedestrian_a_max_mps2=float(getattr(physics_config, "pedestrian_a_max_mps2", 4.7)),
-                    vehicle_wheelbase_scale=float(getattr(physics_config, "vehicle_wheelbase_scale", 0.60)),
-                    bicycle_wheelbase_scale=float(getattr(physics_config, "bicycle_wheelbase_scale", 0.85)),
-                    vehicle_steer_max_rad=float(getattr(physics_config, "vehicle_steer_max_rad", 0.55)),
-                    bicycle_steer_max_rad=float(getattr(physics_config, "bicycle_steer_max_rad", 1.00)),
-                    vehicle_steer_rate_max_radps=float(
-                        getattr(physics_config, "vehicle_steer_rate_max_radps", 0.8)
-                    ),
-                    bicycle_steer_rate_max_radps=float(
-                        getattr(physics_config, "bicycle_steer_rate_max_radps", 1.5)
-                    ),
-                    soft_weight=float(
-                        getattr(
-                            physics_config,
-                            "soft_weight",
-                            getattr(
-                                physics_config,
-                                "vehicle_soft_weight",
-                                getattr(
-                                    physics_config,
-                                    "bicycle_soft_weight",
-                                    getattr(physics_config, "pedestrian_soft_weight", 0.25),
-                                ),
-                            ),
-                        )
-                    ),
-                    compare_softness_to_gt=bool(getattr(physics_config, "compare_softness_to_gt", False)),
-                    pedestrian_heading_weight=float(getattr(physics_config, "pedestrian_heading_weight", 0.05)),
-                    pedestrian_heading_speed_threshold_mps=float(
-                        getattr(physics_config, "pedestrian_heading_speed_threshold_mps", 0.5)
-                    ),
-                    eps=float(getattr(physics_config, "eps", 1e-6)),
-                )
-            else:
-                self.self_forced_regularizer = None
-        else:
-            self.self_forced_regularizer = None
         self._apply_self_forced_unfrozen_range()
 
         self.val_open_epoch_metrics = nn.ModuleDict(
@@ -458,7 +506,7 @@ class SMARTFlow(LightningModule):
                 1) closed-loop validation을 사용함
                 2) open-loop validation을 같이 쓰지 않음
                 3) submission 저장 모드가 아님
-                4) official 점수에 사용할 batch 개수가 1 이상임
+                4) Fast WOSAC 점수에 사용할 batch 개수가 1 이상임
         """
         return (
             self.val_closed_loop
@@ -484,7 +532,7 @@ class SMARTFlow(LightningModule):
         """GPU 수와 validation batch size에 맞춰 scorer batch 수를 자동 조정합니다.
 
         ``scorer_scene_num`` 이 양의 정수이면 전역 기준으로 그 정도의 scene을
-        official scorer에 넣을 수 있도록 ``n_batch_sim_agents_metric`` 을 per-rank
+        Fast WOSAC scorer에 넣을 수 있도록 ``n_batch_sim_agents_metric`` 을 per-rank
         batch 수로 덮어씁니다. 별도의 scenario-level cap은 두지 않습니다.
         """
         scorer_scene_num = self.scorer_scene_num
@@ -519,12 +567,96 @@ class SMARTFlow(LightningModule):
         self._scorer_scene_num_last_key = current_key
         if getattr(trainer, "is_global_zero", True):
             print(
-                "[scorer_scene_num] 공식 sim_agents_2025 scorer batch 수를 "
+                "[scorer_scene_num] Fast WOSAC sim_agents_2025 scorer batch 수를 "
                 f"n_batch_sim_agents_metric={self.n_batch_sim_agents_metric} 으로 설정합니다 "
                 f"(requested_scenes={scorer_scene_num}, world_size={world_size}, "
                 f"val_batch_size={val_batch_size}).",
                 flush=True,
             )
+
+    def _estimate_val_batches_per_rank(self) -> int | None:
+        """현재 rank에서 실행 가능한 validation batch 수를 추정합니다."""
+        trainer = getattr(self, "trainer", None)
+        if trainer is None:
+            return None
+        datamodule = getattr(trainer, "datamodule", None)
+        if datamodule is None:
+            return None
+        val_dataset = getattr(datamodule, "val_dataset", None)
+        if val_dataset is None:
+            return None
+        try:
+            dataset_len = int(len(val_dataset))
+        except (TypeError, ValueError):
+            return None
+        if dataset_len <= 0:
+            return None
+        val_batch_size = self._resolve_val_batch_size()
+        if val_batch_size is None:
+            return None
+
+        world_size = int(getattr(trainer, "world_size", 1) or 1)
+        if world_size <= 0:
+            world_size = 1
+        global_rank = int(getattr(trainer, "global_rank", 0) or 0)
+        shard_size, remainder = divmod(dataset_len, world_size)
+        rank_samples = shard_size + int(global_rank < remainder)
+        return max(1, math.ceil(rank_samples / val_batch_size))
+
+    def _ensure_validation_limit_reaches_scorer_batches(self) -> None:
+        """Fast WOSAC scorer가 요청 scene 수까지 도달하도록 val loop cap을 보정합니다."""
+        trainer = getattr(self, "trainer", None)
+        if trainer is None:
+            return
+        try:
+            target_batches = int(self.n_batch_sim_agents_metric)
+        except (TypeError, ValueError):
+            return
+        if target_batches <= 0:
+            return
+
+        limit_val_batches = getattr(trainer, "limit_val_batches", None)
+        if isinstance(limit_val_batches, bool) or limit_val_batches is None:
+            return
+
+        resolved_batches: int | None = None
+        if isinstance(limit_val_batches, int):
+            if limit_val_batches <= 0:
+                return
+            resolved_batches = int(limit_val_batches)
+        elif isinstance(limit_val_batches, float):
+            if limit_val_batches <= 0.0:
+                return
+            if limit_val_batches >= 1.0:
+                return
+            total_batches = self._estimate_val_batches_per_rank()
+            if total_batches is None:
+                return
+            resolved_batches = int(total_batches * limit_val_batches)
+        else:
+            return
+
+        if resolved_batches >= target_batches:
+            return
+
+        old_limit = limit_val_batches
+        trainer.limit_val_batches = target_batches
+        current_key = (target_batches, old_limit, resolved_batches)
+        if self._scorer_val_limit_last_key == current_key:
+            return
+        self._scorer_val_limit_last_key = current_key
+        if getattr(trainer, "is_global_zero", True):
+            print(
+                "[scorer_scene_num] Fast WOSAC scorer가 요청 scene 수까지 평가하도록 "
+                f"trainer.limit_val_batches를 {old_limit}에서 {target_batches}로 늘립니다 "
+                f"(기존 resolved_val_batches={resolved_batches}).",
+                flush=True,
+            )
+
+    def _configure_fast_wosac_validation_scope(self) -> None:
+        """scorer scene 수와 validation loop cap을 함께 정렬합니다."""
+        self._apply_scorer_scene_num_overrides()
+        self._ensure_validation_limit_reaches_scorer_batches()
 
     def _apply_fit_time_validation_batch_limit(self) -> None:
         """학습 중 validation에서 앞쪽 일부 batch만 돌도록 trainer 값을 바꿉니다.
@@ -566,10 +698,69 @@ class SMARTFlow(LightningModule):
         self._fit_time_original_limit_val_batches = None
         self._fit_time_checkpoint_only_validation_enabled = False
 
+    def _capture_self_forced_validation_interval(self) -> None:
+        """self-forced warmup이 trainer validation 주기를 바꾸기 전 원래 값을 저장합니다."""
+        if self.trainer is None:
+            return
+        if self._self_forced_validation_schedule_captured:
+            return
+        self._self_forced_original_check_val_every_n_epoch = self.trainer.check_val_every_n_epoch
+        self._self_forced_validation_schedule_captured = True
+
+    def _restore_self_forced_validation_interval(self) -> None:
+        """fit 종료 시 trainer의 epoch validation 주기를 원래 값으로 복원합니다."""
+        if self.trainer is not None and self._self_forced_validation_schedule_captured:
+            self.trainer.check_val_every_n_epoch = (
+                self._self_forced_original_check_val_every_n_epoch
+            )
+        self._self_forced_original_check_val_every_n_epoch = None
+        self._self_forced_validation_schedule_captured = False
+
+    def _self_forced_skip_validation_interval_for_current_epoch(self) -> int:
+        """현재 epoch 끝 validation이 실행되지 않게 하는 임시 interval을 반환합니다."""
+        return int(self.current_epoch) + 2
+
+    def _apply_self_forced_validation_schedule_for_current_epoch(self) -> None:
+        """estimator warmup 이후부터 validation 주기를 다시 세도록 trainer 값을 조정합니다."""
+        if self.trainer is None:
+            return
+        if not self.self_forced_enabled:
+            return
+        if not self.self_forced_use_distribution_matching_loss:
+            return
+        if int(self.self_forced_estimator_warmup_epochs) <= 0:
+            return
+
+        self._capture_self_forced_validation_interval()
+        original_interval = self._self_forced_original_check_val_every_n_epoch
+        if original_interval is None:
+            return
+        check_interval = int(original_interval)
+        if check_interval <= 0:
+            return
+
+        current_epoch = int(self.current_epoch)
+        if current_epoch < int(self.self_forced_start_epoch):
+            self.trainer.check_val_every_n_epoch = check_interval
+            return
+
+        should_validate = should_run_self_forced_validation_after_epoch(
+            current_epoch=current_epoch,
+            self_forced_start_epoch=int(self.self_forced_start_epoch),
+            estimator_warmup_epochs=int(self.self_forced_estimator_warmup_epochs),
+            check_val_every_n_epoch=check_interval,
+        )
+        if should_validate:
+            self.trainer.check_val_every_n_epoch = 1
+        else:
+            self.trainer.check_val_every_n_epoch = (
+                self._self_forced_skip_validation_interval_for_current_epoch()
+            )
+
     def _should_compute_closed_loop_minade(self) -> bool:
         """현재 validation에서 closed-loop minADE를 계산할지 판단합니다.
 
-        학습 중 빠른 validation에서는 checkpoint 선택에 쓰는 official 점수만
+        학습 중 빠른 validation에서는 checkpoint 선택에 쓰는 Fast WOSAC 점수만
         남기고 minADE 계산은 끕니다.
 
         Returns:
@@ -666,10 +857,198 @@ class SMARTFlow(LightningModule):
                 ),
             }
 
+    @staticmethod
+    def _has_open_loop_loss_targets(pred_dict: Dict[str, Tensor]) -> bool:
+        """open-loop FM loss에 실제로 들어갈 미래 target이 있는지 확인합니다."""
+        pred_norm = pred_dict["flow_pred_norm"]
+        target_norm = pred_dict["flow_target_norm"]
+        if pred_norm.numel() == 0 or target_norm.numel() == 0:
+            return False
+        loss_mask = pred_dict.get("flow_loss_mask")
+        if loss_mask is None:
+            return True
+        return bool(loss_mask.to(device=pred_norm.device, dtype=torch.bool).any().item())
+
+    def _build_trainable_connected_zero_loss(self, module: nn.Module | None = None) -> Tensor:
+        """trainable parameter graph에 연결된 scalar 0 loss를 만듭니다."""
+        zero_loss: Tensor | None = None
+        parameter_source = module if module is not None else self
+        for param in parameter_source.parameters():
+            if not param.requires_grad:
+                continue
+            term = param.sum() * 0.0
+            zero_loss = term if zero_loss is None else zero_loss + term
+        if zero_loss is None:
+            return torch.zeros((), device=self.device, requires_grad=True)
+        return zero_loss
+
+    @staticmethod
+    def _first_parameter_device(module: nn.Module) -> torch.device:
+        """module 안 첫 parameter device를 반환합니다."""
+        for param in module.parameters():
+            return param.device
+        return torch.device("cpu")
+
+    def _optimizer_parameter_device(self, optimizer) -> torch.device:
+        """optimizer가 관리하는 첫 parameter device를 반환합니다."""
+        raw_optimizer = getattr(optimizer, "optimizer", optimizer)
+        for group in getattr(raw_optimizer, "param_groups", []):
+            for param in group.get("params", []):
+                return param.device
+        return self._first_parameter_device(self)
+
+    @staticmethod
+    def _distributed_available_and_initialized() -> bool:
+        """torch.distributed all-reduce를 사용할 수 있는지 확인합니다."""
+        distributed = getattr(torch, "distributed", None)
+        return bool(
+            distributed is not None
+            and distributed.is_available()
+            and distributed.is_initialized()
+        )
+
+    def _sync_distributed_bool_any(
+        self,
+        value: bool,
+        *,
+        device: torch.device | None = None,
+    ) -> bool:
+        """DDP 전체 rank 중 하나라도 True인지 동기화해 반환합니다."""
+        sync_device = device if device is not None else self._first_parameter_device(self)
+        flag = torch.tensor(int(bool(value)), device=sync_device, dtype=torch.long)
+        if self._distributed_available_and_initialized():
+            torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX)
+        return bool(flag.item())
+
+    def _start_distributed_bool_any(
+        self,
+        value: bool,
+        *,
+        device: torch.device | None = None,
+    ) -> tuple[Tensor, Any | None]:
+        """DDP any bool sync를 시작하고, 가능하면 backward와 겹치도록 async work를 반환합니다."""
+        sync_device = device if device is not None else self._first_parameter_device(self)
+        flag = torch.tensor(int(bool(value)), device=sync_device, dtype=torch.long)
+        if self._distributed_available_and_initialized():
+            work = torch.distributed.all_reduce(
+                flag,
+                op=torch.distributed.ReduceOp.MAX,
+                async_op=True,
+            )
+            return flag, work
+        return flag, None
+
+    @staticmethod
+    def _finish_distributed_bool_any(pending: tuple[Tensor, Any | None]) -> bool:
+        """_start_distributed_bool_any 결과를 기다린 뒤 Python bool로 반환합니다."""
+        flag, work = pending
+        if work is not None:
+            work.wait()
+        return bool(flag.item())
+
+    def _accumulate_open_loop_train_epoch_metrics(
+        self,
+        *,
+        total_loss: Tensor,
+        fm_loss: Tensor,
+        open_metric_dict: Dict[str, Tensor],
+        sample_count: int,
+    ) -> None:
+        """Open-loop train metric을 epoch 말 global 평균용으로 local 누적합니다.
+
+        Train step마다 logging metric 전체를 DDP 동기화하면 작은 collective가
+        매 batch 발생합니다. 학습 loss/backward 경로는 그대로 두고, detached scalar
+        값만 buffer에 누적한 뒤 epoch 끝에서 한 번만 동기화합니다.
+        """
+        weight = float(max(int(sample_count), 0))
+        if weight <= 0.0:
+            return
+        values = [
+            total_loss.detach(),
+            fm_loss.detach(),
+        ]
+        if open_metric_dict:
+            values.extend(
+                [
+                    open_metric_dict[self.open_metric_names["ade"]].detach(),
+                    open_metric_dict[self.open_metric_names["fde"]].detach(),
+                    open_metric_dict[self.open_metric_names["yaw_ade"]].detach(),
+                    open_metric_dict[self.open_metric_names["yaw_fde"]].detach(),
+                ]
+            )
+        else:
+            zero = total_loss.detach().new_zeros(())
+            values.extend([zero, zero, zero, zero])
+        value_tensor = torch.stack(
+            [
+                value.to(
+                    device=self._train_open_epoch_metric_sums.device,
+                    dtype=torch.float32,
+                ).reshape(())
+                for value in values
+            ]
+        )
+        weight_tensor = value_tensor.new_full(value_tensor.shape, weight)
+        if not open_metric_dict:
+            weight_tensor[2:] = 0.0
+        self._train_open_epoch_metric_sums += value_tensor * weight_tensor
+        self._train_open_epoch_metric_counts += weight_tensor
+
+    def _reset_open_loop_train_epoch_metrics(self) -> None:
+        self._train_open_epoch_metric_sums.zero_()
+        self._train_open_epoch_metric_counts.zero_()
+
+    def _compute_and_reset_open_loop_train_epoch_metrics(self) -> Dict[str, Tensor]:
+        """누적 train metric을 DDP 전체에서 합산한 뒤 epoch 평균으로 반환합니다."""
+        packed = torch.cat(
+            [
+                self._train_open_epoch_metric_sums.detach().clone(),
+                self._train_open_epoch_metric_counts.detach().clone(),
+            ],
+            dim=0,
+        )
+        self._reset_open_loop_train_epoch_metrics()
+        if self._distributed_available_and_initialized():
+            torch.distributed.all_reduce(packed, op=torch.distributed.ReduceOp.SUM)
+
+        n_metric = len(self._train_open_epoch_log_names)
+        sums = packed[:n_metric]
+        counts = packed[n_metric:]
+        metrics: Dict[str, Tensor] = {}
+        for idx, name in enumerate(self._train_open_epoch_log_names):
+            count = counts[idx]
+            if bool((count > 0).item()):
+                metrics[name] = sums[idx] / count.clamp_min(1.0)
+        return metrics
+
+    def _log_open_loop_train_epoch_metrics(self) -> None:
+        """W&B에는 step별 global sync 없이 epoch 말 train metric만 정확히 남깁니다."""
+        if self.self_forced_enabled and self.current_epoch >= self.self_forced_start_epoch:
+            # Self-forced epochs do not use the open-loop pretrain metric
+            # accumulator for optimization. Avoid an extra epoch-boundary DDP
+            # collective here; Lightning handles the self-forced train logs.
+            self._reset_open_loop_train_epoch_metrics()
+            return
+        metrics = self._compute_and_reset_open_loop_train_epoch_metrics()
+        if not metrics or not self.trainer.is_global_zero:
+            return
+        loggers = getattr(self.trainer, "loggers", None)
+        if loggers is None:
+            logger = getattr(self.trainer, "logger", None)
+            loggers = [logger] if logger is not None else []
+        metrics_to_log = {
+            name: float(value.detach().cpu().item())
+            for name, value in metrics.items()
+        }
+        for logger in loggers:
+            if logger is not None:
+                logger.log_metrics(metrics_to_log, step=self.global_step)
+
     def _open_loop_denoise_metrics(
         self,
         pred_dict: Dict[str, Tensor],
-    ) -> tuple[Tensor, Dict[str, Tensor], int]:
+        zero_loss_module: nn.Module | None = None,
+    ) -> tuple[Tensor, Dict[str, Tensor], int, bool]:
         """잡음 제거 방식 검증 점수와 유효 표본 수를 계산합니다.
 
         Args:
@@ -678,25 +1057,42 @@ class SMARTFlow(LightningModule):
                 ``[n_valid_anchor, flow_window_steps, 4]`` 입니다.
                 ``flow_loss_mask`` 가 있으면 shape은
                 ``[n_valid_anchor, flow_window_steps]`` 입니다.
+            zero_loss_module: 유효 target이 없을 때 0 loss를 연결할 trainable
+                parameter 소스입니다. 값이 없으면 flow generator에 연결합니다.
 
         Returns:
-            tuple[Tensor, Dict[str, Tensor], int]:
+            tuple[Tensor, Dict[str, Tensor], int, bool]:
                 flow matching loss, meter/degree 단위 지표 사전,
-                그리고 유효 anchor 개수입니다.
+                유효 anchor 개수, 그리고 loss에 실제 target이 있는지 여부입니다.
         """
         loss_mask = pred_dict.get("flow_loss_mask")
-        loss = flow_matching_loss(
-            pred_dict["flow_pred_norm"],
-            pred_dict["flow_target_norm"],
-            valid_mask=loss_mask,
+        has_loss_targets = self._has_open_loop_loss_targets(pred_dict)
+        if has_loss_targets:
+            loss = flow_matching_loss(
+                pred_dict["flow_pred_norm"],
+                pred_dict["flow_target_norm"],
+                valid_mask=loss_mask,
+            )
+        else:
+            loss = self._build_trainable_connected_zero_loss(zero_loss_module or self.encoder)
+        if not self.train_open_loop_metrics and self.training:
+            sample_count = int(pred_dict["flow_clean_norm"].shape[0])
+            return loss, {}, sample_count, has_loss_targets
+        metric_pred_clean_norm = pred_dict.get(
+            "flow_pred_clean_metric_norm",
+            pred_dict["flow_pred_clean_norm"],
+        )
+        metric_target_clean_norm = pred_dict.get(
+            "flow_clean_metric_norm",
+            pred_dict["flow_clean_norm"],
         )
         metric_dict = self._build_open_loop_metric_dict(
-            pred_clean_norm=pred_dict["flow_pred_clean_norm"],
-            target_clean_norm=pred_dict["flow_clean_norm"],
+            pred_clean_norm=metric_pred_clean_norm,
+            target_clean_norm=metric_target_clean_norm,
             valid_mask=loss_mask,
         )
         sample_count = int(pred_dict["flow_clean_norm"].shape[0])
-        return loss, metric_dict, sample_count
+        return loss, metric_dict, sample_count, has_loss_targets
 
     def _update_weighted_validation_metrics(
         self,
@@ -780,8 +1176,90 @@ class SMARTFlow(LightningModule):
                 시나리오별 고정 seed입니다.
                 shape은 ``[n_scenario]`` 입니다.
         """
+        seed_rollout_idx, _ = self._get_closed_loop_antithetic_base_and_sign(rollout_idx)
         scenario_seeds = [
-            self._make_closed_loop_seed(scenario_id=scenario_id, rollout_idx=rollout_idx)
+            self._make_closed_loop_seed(scenario_id=scenario_id, rollout_idx=seed_rollout_idx)
+            for scenario_id in scenario_ids
+        ]
+        return torch.tensor(scenario_seeds, dtype=torch.long, device=device)
+
+    def _use_closed_loop_antithetic_pairs(self) -> bool:
+        """validation closed-loop rollout에서 antithetic noise pair를 쓸지 반환합니다."""
+        return bool(getattr(self.validation_rollout_sampling, "antithetic_pairs", False))
+
+    def _use_closed_loop_stratified_gaussian_noise(self) -> bool:
+        """validation closed-loop rollout에서 stratified Gaussian noise를 쓸지 반환합니다."""
+        return bool(
+            getattr(self.validation_rollout_sampling, "stratified_gaussian_noise", False)
+        )
+
+    def _closed_loop_stratified_noise_num_strata(self) -> int:
+        """stratified Gaussian base rollout bin 개수를 반환합니다."""
+        if not self._use_closed_loop_stratified_gaussian_noise():
+            return 0
+        n_rollout = int(self.n_rollout_closed_val)
+        if not self._use_closed_loop_antithetic_pairs():
+            raise ValueError(
+                "validation_rollout_sampling.stratified_gaussian_noise=true requires "
+                "validation_rollout_sampling.antithetic_pairs=true."
+            )
+        if n_rollout % 2 != 0:
+            raise ValueError(
+                "validation_rollout_sampling.stratified_gaussian_noise=true requires an "
+                f"even n_rollout_closed_val, got {n_rollout}."
+            )
+        return n_rollout // 2
+
+    def _get_closed_loop_antithetic_base_and_sign(self, rollout_idx: int) -> tuple[int, float]:
+        """rollout 번호를 antithetic pair용 base 번호와 noise 부호로 바꿉니다."""
+        rollout_idx = int(rollout_idx)
+        if not self._use_closed_loop_antithetic_pairs():
+            return rollout_idx, 1.0
+
+        n_rollout = int(self.n_rollout_closed_val)
+        if n_rollout % 2 != 0:
+            raise ValueError(
+                "validation_rollout_sampling.antithetic_pairs=true requires an even "
+                f"n_rollout_closed_val, got {n_rollout}."
+            )
+        pair_offset = n_rollout // 2
+        if rollout_idx < pair_offset:
+            return rollout_idx, 1.0
+        return rollout_idx - pair_offset, -1.0
+
+    def _get_closed_loop_scenario_noise_signs(
+        self,
+        scenario_ids: Sequence[str],
+        rollout_idx: int,
+        device: torch.device,
+    ) -> Tensor:
+        """배치 안 각 시나리오용 closed-loop noise 부호를 만듭니다."""
+        _, noise_sign = self._get_closed_loop_antithetic_base_and_sign(rollout_idx)
+        return torch.full(
+            (len(scenario_ids),),
+            float(noise_sign),
+            dtype=torch.float32,
+            device=device,
+        )
+
+    def _make_closed_loop_stratification_seed(self, scenario_id: str) -> int:
+        """scenario별 stratified noise bin permutation seed를 만듭니다."""
+        seed_payload = (
+            f"{self.validation_closed_seed}:{scenario_id}:stratified_gaussian_noise".encode(
+                "utf-8"
+            )
+        )
+        digest = hashlib.blake2b(seed_payload, digest_size=8).digest()
+        return int.from_bytes(digest, byteorder="little", signed=False) & 0x7FFF_FFFF_FFFF_FFFF
+
+    def _get_closed_loop_scenario_stratification_seeds(
+        self,
+        scenario_ids: Sequence[str],
+        device: torch.device,
+    ) -> Tensor:
+        """배치 안 각 시나리오용 stratified noise permutation seed를 만듭니다."""
+        scenario_seeds = [
+            self._make_closed_loop_stratification_seed(scenario_id=scenario_id)
             for scenario_id in scenario_ids
         ]
         return torch.tensor(scenario_seeds, dtype=torch.long, device=device)
@@ -817,6 +1295,74 @@ class SMARTFlow(LightningModule):
         if len(seed_rows) == 0:
             return torch.zeros((0, len(scenario_ids)), dtype=torch.long, device=device)
         return torch.stack(seed_rows, dim=0)
+
+    def _build_closed_loop_noise_sign_table(
+        self,
+        scenario_ids: Sequence[str],
+        rollout_indices: Sequence[int],
+        device: torch.device,
+    ) -> Tensor | None:
+        """여러 rollout의 scenario별 noise 부호를 한 번에 모읍니다."""
+        if not self._use_closed_loop_antithetic_pairs():
+            return None
+        sign_rows = [
+            self._get_closed_loop_scenario_noise_signs(
+                scenario_ids=scenario_ids,
+                rollout_idx=rollout_idx,
+                device=device,
+            )
+            for rollout_idx in rollout_indices
+        ]
+        if len(sign_rows) == 0:
+            return torch.zeros((0, len(scenario_ids)), dtype=torch.float32, device=device)
+        return torch.stack(sign_rows, dim=0)
+
+    def _build_closed_loop_noise_strata_table(
+        self,
+        scenario_ids: Sequence[str],
+        rollout_indices: Sequence[int],
+        device: torch.device,
+    ) -> Tensor | None:
+        """여러 rollout의 scenario별 stratified noise bin offset을 모읍니다."""
+        num_strata = self._closed_loop_stratified_noise_num_strata()
+        if num_strata <= 0:
+            return None
+        stratum_rows = []
+        for rollout_idx in rollout_indices:
+            base_idx, _ = self._get_closed_loop_antithetic_base_and_sign(int(rollout_idx))
+            if base_idx < 0 or base_idx >= num_strata:
+                raise ValueError(
+                    f"stratified Gaussian base rollout index must be in [0, {num_strata}), "
+                    f"got {base_idx} for rollout_idx={rollout_idx}."
+                )
+            stratum_rows.append(
+                torch.full(
+                    (len(scenario_ids),),
+                    int(base_idx),
+                    dtype=torch.long,
+                    device=device,
+                )
+            )
+        if len(stratum_rows) == 0:
+            return torch.zeros((0, len(scenario_ids)), dtype=torch.long, device=device)
+        return torch.stack(stratum_rows, dim=0)
+
+    def _build_closed_loop_stratification_seed_table(
+        self,
+        scenario_ids: Sequence[str],
+        rollout_indices: Sequence[int],
+        device: torch.device,
+    ) -> Tensor | None:
+        """여러 rollout의 scenario별 stratified noise permutation seed를 모읍니다."""
+        if not self._use_closed_loop_stratified_gaussian_noise():
+            return None
+        scenario_seed_row = self._get_closed_loop_scenario_stratification_seeds(
+            scenario_ids=scenario_ids,
+            device=device,
+        )
+        if len(rollout_indices) == 0:
+            return torch.zeros((0, len(scenario_ids)), dtype=torch.long, device=device)
+        return scenario_seed_row.unsqueeze(0).repeat(len(rollout_indices), 1)
 
     def _repeat_tensor_on_first_dim(self, tensor: Tensor, repeat_count: int) -> Tensor:
         """첫 번째 축을 rollout 수만큼 반복합니다.
@@ -885,7 +1431,7 @@ class SMARTFlow(LightningModule):
         """
         if repeat_count == 1:
             return map_feature
-        return {
+        expanded_map_feature = {
             "pt_token": self._repeat_tensor_on_first_dim(map_feature["pt_token"], repeat_count),
             "position": self._repeat_tensor_on_first_dim(map_feature["position"], repeat_count),
             "orientation": self._repeat_tensor_on_first_dim(
@@ -897,6 +1443,12 @@ class SMARTFlow(LightningModule):
                 num_graphs=num_graphs,
             ),
         }
+        if "light_type" in map_feature:
+            expanded_map_feature["light_type"] = self._repeat_tensor_on_first_dim(
+                map_feature["light_type"],
+                repeat_count,
+            )
+        return expanded_map_feature
 
     def _build_parallel_rollout_tokenized_agent(
         self,
@@ -1105,12 +1657,41 @@ class SMARTFlow(LightningModule):
                 rollout_idx=int(rollout_indices[0]),
                 device=scenario_device,
             )
+            scenario_sampling_signs = self._build_closed_loop_noise_sign_table(
+                scenario_ids=data["scenario_id"],
+                rollout_indices=rollout_indices,
+                device=scenario_device,
+            )
+            if scenario_sampling_signs is not None:
+                scenario_sampling_signs = scenario_sampling_signs.reshape(-1).contiguous()
+            scenario_sampling_strata = self._build_closed_loop_noise_strata_table(
+                scenario_ids=data["scenario_id"],
+                rollout_indices=rollout_indices,
+                device=scenario_device,
+            )
+            if scenario_sampling_strata is not None:
+                scenario_sampling_strata = scenario_sampling_strata.reshape(-1).contiguous()
+            scenario_sampling_stratification_seeds = (
+                self._build_closed_loop_stratification_seed_table(
+                    scenario_ids=data["scenario_id"],
+                    rollout_indices=rollout_indices,
+                    device=scenario_device,
+                )
+            )
+            if scenario_sampling_stratification_seeds is not None:
+                scenario_sampling_stratification_seeds = (
+                    scenario_sampling_stratification_seeds.reshape(-1).contiguous()
+                )
             pred = rollout_encoder.rollout_from_cache(
                 rollout_cache=rollout_cache,
                 tokenized_agent=tokenized_agent,
                 map_feature=map_feature,
                 sampling_scheme=self.validation_rollout_sampling,
                 scenario_sampling_seeds=scenario_sampling_seeds,
+                scenario_sampling_signs=scenario_sampling_signs,
+                scenario_sampling_strata=scenario_sampling_strata,
+                scenario_sampling_stratification_seeds=scenario_sampling_stratification_seeds,
+                scenario_sampling_num_strata=self._closed_loop_stratified_noise_num_strata(),
                 return_flow_2s_preview=return_flow_2s_preview,
             )
             flow_preview = None
@@ -1129,6 +1710,21 @@ class SMARTFlow(LightningModule):
         num_agent = int(tokenized_agent["batch"].shape[0])
         num_graphs = len(data["scenario_id"])
         scenario_seed_table = self._build_closed_loop_seed_table(
+            scenario_ids=data["scenario_id"],
+            rollout_indices=rollout_indices,
+            device=scenario_device,
+        )
+        scenario_sign_table = self._build_closed_loop_noise_sign_table(
+            scenario_ids=data["scenario_id"],
+            rollout_indices=rollout_indices,
+            device=scenario_device,
+        )
+        scenario_strata_table = self._build_closed_loop_noise_strata_table(
+            scenario_ids=data["scenario_id"],
+            rollout_indices=rollout_indices,
+            device=scenario_device,
+        )
+        scenario_stratification_seed_table = self._build_closed_loop_stratification_seed_table(
             scenario_ids=data["scenario_id"],
             rollout_indices=rollout_indices,
             device=scenario_device,
@@ -1153,6 +1749,22 @@ class SMARTFlow(LightningModule):
             map_feature=expanded_map_feature,
             sampling_scheme=self.validation_rollout_sampling,
             scenario_sampling_seeds=scenario_seed_table.reshape(-1).contiguous(),
+            scenario_sampling_signs=(
+                scenario_sign_table.reshape(-1).contiguous()
+                if scenario_sign_table is not None
+                else None
+            ),
+            scenario_sampling_strata=(
+                scenario_strata_table.reshape(-1).contiguous()
+                if scenario_strata_table is not None
+                else None
+            ),
+            scenario_sampling_stratification_seeds=(
+                scenario_stratification_seed_table.reshape(-1).contiguous()
+                if scenario_stratification_seed_table is not None
+                else None
+            ),
+            scenario_sampling_num_strata=self._closed_loop_stratified_noise_num_strata(),
             return_flow_2s_preview=return_flow_2s_preview,
         )
         flow_preview = None
@@ -1368,6 +1980,8 @@ class SMARTFlow(LightningModule):
 
     def _is_self_forced_estimator_warmup_active(self) -> bool:
         """현재 epoch에서 generated estimator만 먼저 적응시킬지 판단합니다."""
+        if not self.self_forced_use_distribution_matching_loss:
+            return False
         return is_self_forced_estimator_warmup_epoch(
             current_epoch=int(self.current_epoch),
             self_forced_start_epoch=int(self.self_forced_start_epoch),
@@ -1435,8 +2049,7 @@ class SMARTFlow(LightningModule):
         설명:
             ``except_map_encoder`` 는 기존 ``freeze_map_encoder=true`` 와 같은 의도입니다.
             ``middle`` 은 마지막 flow decoder와 생성부 바로 앞의 마지막 agent 문맥 블록만 엽니다.
-            ``full_flow_decoder`` 는 draft fine-tuning의 ``train_full_flow_decoder_only=true`` 처럼
-            마지막 궤적 생성부만 엽니다.
+            ``full_flow_decoder`` 는 마지막 궤적 생성부만 엽니다.
         """
         if not self.self_forced_enabled:
             return
@@ -1590,6 +2203,170 @@ class SMARTFlow(LightningModule):
         self.self_forced_generated_estimator.load_state_dict(encoder_state)
         self._set_self_forced_auxiliary_modes()
 
+    @staticmethod
+    def _extract_self_forced_generated_estimator_state_dict(
+        checkpoint: object,
+    ) -> Dict[str, Tensor]:
+        """generated estimator state만 다양한 checkpoint 포맷에서 꺼냅니다."""
+        if not isinstance(checkpoint, dict):
+            raise TypeError(
+                "generated-estimator checkpoint must be a dict saved by torch.save()."
+            )
+        raw_state = checkpoint.get("state_dict", checkpoint)
+        if not isinstance(raw_state, dict):
+            raise TypeError("generated-estimator checkpoint state_dict must be a dict.")
+
+        prefix = "self_forced_generated_estimator."
+        if any(isinstance(key, str) and key.startswith(prefix) for key in raw_state.keys()):
+            return {
+                key[len(prefix) :]: value
+                for key, value in raw_state.items()
+                if isinstance(key, str) and key.startswith(prefix)
+            }
+
+        return {
+            key: value
+            for key, value in raw_state.items()
+            if isinstance(key, str) and torch.is_tensor(value)
+        }
+
+    def _load_self_forced_generated_estimator_bank(self) -> None:
+        """W&B bank 등에서 받은 generated estimator state를 보조 모델에 주입합니다."""
+        if not self.self_forced_enabled:
+            return
+        if self.self_forced_generated_estimator is None:
+            return
+        if not self.self_forced_generated_estimator_init_path:
+            return
+
+        init_path = Path(self.self_forced_generated_estimator_init_path)
+        if not init_path.is_file():
+            raise FileNotFoundError(
+                "self_forced.generated_estimator_init_path does not exist: "
+                f"{init_path}"
+            )
+
+        checkpoint = torch.load(init_path, map_location="cpu", weights_only=False)
+        state_dict = self._extract_self_forced_generated_estimator_state_dict(checkpoint)
+        incompatible = self.self_forced_generated_estimator.load_state_dict(
+            state_dict,
+            strict=bool(self.self_forced_generated_estimator_init_strict),
+        )
+        if not self.self_forced_generated_estimator_init_strict:
+            missing = getattr(incompatible, "missing_keys", [])
+            unexpected = getattr(incompatible, "unexpected_keys", [])
+            if missing or unexpected:
+                print(
+                    "[self-forced-estimator-bank] non-strict load "
+                    f"missing={missing} unexpected={unexpected}"
+                )
+        self._self_forced_generated_estimator_bank_loaded = True
+        if self.self_forced_generated_estimator_skip_warmup_on_load:
+            self.self_forced_estimator_warmup_epochs = 0
+        self._set_self_forced_auxiliary_modes()
+        print(
+            "[self-forced-estimator-bank] loaded generated estimator from "
+            f"{init_path}; skip_warmup={self.self_forced_generated_estimator_skip_warmup_on_load}"
+        )
+
+    def _build_self_forced_generated_estimator_bank_metadata(self) -> Dict[str, Any]:
+        """저장/업로드할 generated estimator bank metadata를 구성합니다."""
+        target_warmup_epochs = int(
+            self.self_forced_generated_estimator_bank_target_warmup_epochs
+            or self.self_forced_estimator_warmup_epochs
+        )
+        return {
+            "format_version": 1,
+            "state_dict_kind": "self_forced_generated_estimator",
+            "state_dict_prefix": "",
+            "source_epoch": int(self.current_epoch),
+            "global_step": int(getattr(self, "global_step", 0)),
+            "self_forced_start_epoch": int(self.self_forced_start_epoch),
+            "estimator_warmup_epochs": target_warmup_epochs,
+            "remaining_warmup_epochs": int(self.self_forced_estimator_warmup_epochs),
+            "loaded_warmup_epochs": int(self.self_forced_generated_estimator_bank_loaded_warmup_epochs),
+            "lr": float(self.lr),
+            "generated_estimator_lr": float(self.self_forced_generated_estimator_lr),
+            "unfrozen_range": str(self.self_forced_unfrozen_range),
+            "control_flow": bool(self.use_kinematic_control_flow),
+            "flow_window_steps": int(self.flow_window_steps),
+        }
+
+    def _save_self_forced_generated_estimator_bank_snapshot(self) -> Path | None:
+        """warmup 종료 시점의 generated estimator만 별도 파일로 저장합니다."""
+        if not self.self_forced_enabled:
+            return None
+        if self.self_forced_generated_estimator is None:
+            return None
+        if self._self_forced_generated_estimator_bank_snapshot_saved:
+            return None
+        if not self.self_forced_generated_estimator_bank_snapshot_path:
+            return None
+        if self.trainer is not None and not self.trainer.is_global_zero:
+            return None
+
+        snapshot_path = Path(self.self_forced_generated_estimator_bank_snapshot_path)
+        snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "state_dict": {
+                key: value.detach().cpu()
+                for key, value in self.self_forced_generated_estimator.state_dict().items()
+            },
+            "metadata": self._build_self_forced_generated_estimator_bank_metadata(),
+        }
+        torch.save(payload, snapshot_path)
+        metadata_path = snapshot_path.with_suffix(snapshot_path.suffix + ".metadata.json")
+        metadata_path.write_text(
+            json.dumps(payload["metadata"], indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        self._self_forced_generated_estimator_bank_snapshot_saved = True
+        print(f"[self-forced-estimator-bank] saved snapshot: {snapshot_path}")
+        return snapshot_path
+
+    def _upload_self_forced_generated_estimator_bank_snapshot(self, snapshot_path: Path) -> None:
+        """현재 W&B run에 generated estimator bank artifact를 업로드합니다."""
+        if not self.self_forced_generated_estimator_bank_upload_on_warmup_end:
+            return
+        artifact_name = self.self_forced_generated_estimator_bank_upload_artifact
+        if not artifact_name:
+            return
+        logger = getattr(self, "logger", None)
+        experiment = getattr(logger, "experiment", None)
+        if experiment is None or not hasattr(experiment, "log_artifact"):
+            print(
+                "[self-forced-estimator-bank] skip artifact upload: "
+                "current logger does not expose W&B log_artifact()."
+            )
+            return
+
+        try:
+            import wandb
+        except Exception as exc:  # pragma: no cover - depends on runtime env.
+            print(f"[self-forced-estimator-bank] skip artifact upload: {exc}")
+            return
+
+        metadata = self._build_self_forced_generated_estimator_bank_metadata()
+        artifact = wandb.Artifact(
+            name=artifact_name,
+            type="generated_estimator_bank",
+            metadata=metadata,
+        )
+        artifact.add_file(snapshot_path.as_posix(), name=snapshot_path.name)
+        metadata_path = snapshot_path.with_suffix(snapshot_path.suffix + ".metadata.json")
+        if metadata_path.is_file():
+            artifact.add_file(metadata_path.as_posix(), name=metadata_path.name)
+        aliases = [
+            "latest",
+            f"warmup{int(metadata['estimator_warmup_epochs'])}",
+            f"lr{float(metadata['generated_estimator_lr']):.0e}",
+        ]
+        experiment.log_artifact(artifact, aliases=aliases)
+        print(
+            "[self-forced-estimator-bank] logged W&B artifact "
+            f"{artifact_name} aliases={aliases}"
+        )
+
     def on_load_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
         """self-forced resume 여부를 기록합니다.
 
@@ -1599,6 +2376,7 @@ class SMARTFlow(LightningModule):
         Returns:
             None
         """
+        self._assert_motion_missingness_checkpoint_compatible(checkpoint)
         state_dict = checkpoint.get("state_dict", {})
         has_target_teacher = any(
             key.startswith("self_forced_target_teacher.") for key in state_dict
@@ -1615,6 +2393,34 @@ class SMARTFlow(LightningModule):
         self._self_forced_generator_ema_loaded_from_checkpoint = bool(
             self.self_forced_enabled and has_generator_ema
         )
+
+    def _assert_motion_missingness_checkpoint_compatible(self, checkpoint: Dict[str, Any]) -> None:
+        """motion missingness 입력 차원과 맞지 않는 예전 checkpoint를 명확히 거부합니다."""
+        state_dict = checkpoint.get("state_dict", {})
+        if not isinstance(state_dict, dict):
+            return
+        current_state = self.state_dict()
+        guarded_keys = [
+            "encoder.agent_encoder.x_a_emb.freqs.weight",
+            "encoder.agent_encoder.r_a2a_emb.freqs.weight",
+        ]
+        mismatches: list[str] = []
+        for key in guarded_keys:
+            checkpoint_value = state_dict.get(key)
+            current_value = current_state.get(key)
+            if checkpoint_value is None or current_value is None:
+                continue
+            if tuple(checkpoint_value.shape) != tuple(current_value.shape):
+                mismatches.append(
+                    f"{key}: checkpoint={tuple(checkpoint_value.shape)}, "
+                    f"current={tuple(current_value.shape)}"
+                )
+        if mismatches:
+            raise RuntimeError(
+                "Motion Missingness Feature changes flow context input dimensions and "
+                "requires a fresh pretrain checkpoint. Incompatible checkpoint tensors: "
+                + "; ".join(mismatches)
+            )
 
     def _manual_backward_without_autocast(self, loss: Tensor) -> None:
         """manual optimization의 backward만 autocast 밖에서 실행합니다.
@@ -1866,6 +2672,25 @@ class SMARTFlow(LightningModule):
             target_type="velocity",
         )
 
+    def _can_cache_self_forced_map_feature(self, decoder: SMARTFlowDecoder) -> bool:
+        """self-forced step 안에서 decoder map feature를 재사용해도 되는지 확인합니다."""
+        if not self.self_forced_cache_frozen_map_features:
+            return False
+        map_encoder = getattr(decoder, "map_encoder", None)
+        if map_encoder is None:
+            return False
+        return not any(parameter.requires_grad for parameter in map_encoder.parameters())
+
+    def _encode_self_forced_map_feature(
+        self,
+        decoder: SMARTFlowDecoder,
+        tokenized_map: Dict[str, Tensor],
+    ) -> Dict[str, Tensor]:
+        """frozen map encoder 출력을 self-forced step cache용으로 만듭니다."""
+        with torch.no_grad():
+            map_feature = decoder.encode_map(tokenized_map)
+        return detach_tensor_tree(map_feature)
+
     def _predict_path_flow_clean_estimate(
         self,
         decoder: SMARTFlowDecoder,
@@ -1874,6 +2699,7 @@ class SMARTFlow(LightningModule):
         noisy_path_norm: Tensor,
         tau: Tensor,
         anchor_mask: Tensor,
+        map_feature: Dict[str, Tensor] | None = None,
     ) -> Dict[str, Tensor]:
         """주어진 decoder가 noisy N초 path를 어떻게 clean path로 보는지 계산합니다.
 
@@ -1884,11 +2710,14 @@ class SMARTFlow(LightningModule):
             noisy_path_norm: noisy path입니다. shape은 ``[n_valid_agent, F_win, 4]`` 입니다.
             tau: flow interpolation time입니다. shape은 ``[n_valid_agent]`` 입니다.
             anchor_mask: 첫 anchor에서 사용할 agent mask입니다. shape은 ``[n_agent]`` 입니다.
+            map_feature: 이미 계산한 지도 특징입니다. 값이 있으면 ``tokenized_map`` 으로
+                다시 map encoder를 호출하지 않습니다.
 
         Returns:
             Dict[str, Tensor]: ``velocity`` 와 ``clean`` 을 담은 사전입니다.
         """
-        map_feature = decoder.encode_map(tokenized_map)
+        if map_feature is None:
+            map_feature = decoder.encode_map(tokenized_map)
         return decoder.path_flow_velocity_for_anchor0(
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
@@ -1910,11 +2739,9 @@ class SMARTFlow(LightningModule):
         metric_dict = {
             "sf_loss": zero,
             "gen_estimator_loss": zero,
-            "physics_loss": zero,
             "anchor_loss": zero,
             "total_loss": zero,
         }
-        metric_dict.update(self._build_zero_draft_metrics(reference))
         return metric_dict
 
     def _run_self_forced_rollout(
@@ -1955,15 +2782,16 @@ class SMARTFlow(LightningModule):
         rollout: Dict[str, Tensor],
         tokenized_agent: Dict[str, Tensor],
     ) -> tuple[Tensor, Tensor]:
-        """committed rollout을 첫 anchor 기준 packed N초 path로 변환합니다.
+        """committed rollout을 첫 anchor 기준 packed N초 flow state로 변환합니다.
 
         Args:
             rollout: ``_run_self_forced_rollout`` 의 출력입니다.
             tokenized_agent: 평가 모드 agent token 사전입니다.
 
         Returns:
-            tuple[Tensor, Tensor]: packed path와 agent mask입니다.
-                packed path shape은 ``[n_valid_agent, F_win, 4]`` 이고,
+            tuple[Tensor, Tensor]: packed flow state와 agent mask입니다.
+                pose-space shape은 ``[n_valid_agent, F_win, 4]`` 이고,
+                control-space shape은 ``[n_valid_agent, F_win, 3]`` 이며,
                 mask shape은 ``[n_agent]`` 입니다.
 
         Notes:
@@ -1978,7 +2806,22 @@ class SMARTFlow(LightningModule):
             tokenized_agent=tokenized_agent,
             flow_window_steps=self.flow_window_steps,
         )
-        return committed_path_norm[anchor_mask], anchor_mask
+        packed_path_norm = committed_path_norm[anchor_mask]
+        if self.use_kinematic_control_flow:
+            packed_path_norm = build_anchor0_normalized_committed_control(
+                committed_path_norm=packed_path_norm,
+                tokenized_agent=tokenized_agent,
+                anchor_mask=anchor_mask,
+                pos_scale_m=self.encoder.agent_encoder.control_pos_scale_m,
+                vehicle_yaw_scale_rad=self.encoder.agent_encoder.control_vehicle_yaw_scale_rad,
+                pedestrian_yaw_scale_rad=self.encoder.agent_encoder.control_pedestrian_yaw_scale_rad,
+                cyclist_yaw_scale_rad=self.encoder.agent_encoder.control_cyclist_yaw_scale_rad,
+                use_holonomic_model_only=self.encoder.agent_encoder.use_holonomic_model_only,
+                use_rolling_supervision=self.encoder.agent_encoder.use_rolling_supervision,
+                vehicle_no_slip_point_ratio=self.encoder.agent_encoder.control_vehicle_no_slip_point_ratio,
+                cyclist_no_slip_point_ratio=self.encoder.agent_encoder.control_cyclist_no_slip_point_ratio,
+            )
+        return packed_path_norm, anchor_mask
 
     def _update_generated_path_flow_estimator(
         self,
@@ -1986,16 +2829,21 @@ class SMARTFlow(LightningModule):
         tokenized_agent: Dict[str, Tensor],
         committed_path_norm: Tensor,
         anchor_mask: Tensor,
+        *,
+        has_committed_path_global: bool | None = None,
     ) -> Tensor:
         """detached self-rollout으로 generated estimator F_psi를 online 업데이트합니다.
 
         Args:
             tokenized_map: 평가 모드 map token 사전입니다.
             tokenized_agent: 평가 모드 agent token 사전입니다.
-            committed_path_norm: Generator가 실제로 실행한 N초 path입니다.
-                shape은 ``[n_valid_agent, F_win, 4]`` 입니다.
+            committed_path_norm: Generator가 실제로 실행한 N초 self-forced flow state입니다.
+                pose-space에서는 ``[n_valid_agent, F_win, 4]`` 이고,
+                control-space에서는 ``[n_valid_agent, F_win, 3]`` 입니다.
             anchor_mask: 첫 anchor에서 사용할 agent mask입니다.
                 shape은 ``[n_agent]`` 입니다.
+            has_committed_path_global: DDP 전체 rank 기준으로 self-forced path가 하나라도
+                있는지입니다. 값이 없으면 이 함수 안에서 동기화합니다.
 
         Returns:
             Tensor: 마지막 estimator update의 flow matching loss입니다.
@@ -2005,41 +2853,76 @@ class SMARTFlow(LightningModule):
         """
         if self.self_forced_generated_estimator is None:
             raise RuntimeError("self_forced_generated_estimator is not initialized.")
+        if self.self_forced_target_teacher is None:
+            raise RuntimeError("self_forced_target_teacher is not initialized.")
 
         optimizer = self.optimizers()[1]
         last_loss = committed_path_norm.new_zeros(())
+        has_committed_path_local = committed_path_norm.numel() > 0
+        if has_committed_path_global is None:
+            has_committed_path_global = self._sync_distributed_bool_any(
+                has_committed_path_local,
+                device=committed_path_norm.device,
+            )
+        if not has_committed_path_global:
+            return last_loss.detach()
+
+        clean_path = committed_path_norm.detach().clone()
+        estimator_tokenized_map = detach_tensor_tree(tokenized_map)
+        estimator_tokenized_agent = detach_tensor_tree(tokenized_agent)
+        estimator_anchor_mask = anchor_mask.detach()
 
         self.toggle_optimizer(optimizer)
         self.self_forced_target_teacher.eval()
         self.self_forced_generated_estimator.train()
         try:
-            for _ in range(self.self_forced_estimator_updates_per_step):
-                optimizer.zero_grad(set_to_none=True)
-                self._prepare_self_forced_estimator_backward_boundary()
-                clean_path = committed_path_norm.detach()
-                flow_sample = self.self_forced_generated_estimator.agent_encoder.flow_ode.sample(
-                    clean_path,
-                    target_type="velocity",
-                )
-                pred_dict = self._predict_path_flow_clean_estimate(
-                    decoder=self.self_forced_generated_estimator,
-                    tokenized_map=tokenized_map,
-                    tokenized_agent=tokenized_agent,
-                    noisy_path_norm=flow_sample.x_t,
-                    tau=flow_sample.tau,
-                    anchor_mask=anchor_mask,
-                )
-                last_loss = flow_matching_loss(pred_dict["velocity"], flow_sample.target)
-                self._manual_backward_without_autocast(last_loss)
-                self._assert_self_forced_estimator_update_isolated()
-                self._clip_and_step_with_optional_scaler(
-                    optimizer,
-                    gradient_clip_val=self.self_forced_gradient_clip_val,
-                    gradient_clip_algorithm="norm",
-                )
-                self._clear_self_forced_auxiliary_gradients()
-                self._clear_self_forced_generator_gradients()
+            with module_gradients_disabled(self.encoder, self.self_forced_target_teacher):
+                estimator_map_feature = None
+                if has_committed_path_local and self._can_cache_self_forced_map_feature(
+                    self.self_forced_generated_estimator,
+                ):
+                    estimator_map_feature = self._encode_self_forced_map_feature(
+                        decoder=self.self_forced_generated_estimator,
+                        tokenized_map=estimator_tokenized_map,
+                    )
+                for _ in range(self.self_forced_estimator_updates_per_step):
+                    optimizer.zero_grad(set_to_none=True)
+                    self._prepare_self_forced_estimator_backward_boundary()
+                    if has_committed_path_local:
+                        with torch.no_grad():
+                            flow_sample = self.self_forced_generated_estimator.agent_encoder.flow_ode.sample(
+                                clean_path,
+                                target_type="velocity",
+                            )
+                        noisy_path_norm = flow_sample.x_t.detach()
+                        tau = flow_sample.tau.detach()
+                        flow_target = flow_sample.target.detach()
+                        pred_dict = self._predict_path_flow_clean_estimate(
+                            decoder=self.self_forced_generated_estimator,
+                            tokenized_map=estimator_tokenized_map,
+                            tokenized_agent=estimator_tokenized_agent,
+                            noisy_path_norm=noisy_path_norm,
+                            tau=tau,
+                            anchor_mask=estimator_anchor_mask,
+                            map_feature=estimator_map_feature,
+                        )
+                        last_loss = flow_matching_loss(pred_dict["velocity"], flow_target)
+                    else:
+                        last_loss = self._build_trainable_connected_zero_loss(
+                            self.self_forced_generated_estimator,
+                        )
+                    self._manual_backward_without_autocast(last_loss)
+                    self._assert_self_forced_estimator_update_isolated()
+                    self._clip_and_step_with_optional_scaler(
+                        optimizer,
+                        gradient_clip_val=self.self_forced_gradient_clip_val,
+                        gradient_clip_algorithm="norm",
+                    )
+                    self._clear_self_forced_auxiliary_gradients()
+                    self._clear_self_forced_generator_gradients()
         finally:
+            self._clear_self_forced_auxiliary_gradients()
+            self._clear_self_forced_generator_gradients()
             self.untoggle_optimizer(optimizer)
             self._set_self_forced_auxiliary_modes()
         return last_loss.detach()
@@ -2050,20 +2933,27 @@ class SMARTFlow(LightningModule):
         tokenized_agent: Dict[str, Tensor],
         committed_path_norm: Tensor,
         anchor_mask: Tensor,
+        active_control_mask: Tensor | None = None,
+        dmd_injection_scale: float | Tensor = 1.0,
     ) -> Tensor:
         """clean-DMD 방향을 고정된 평가자 출력으로 계산합니다.
 
         Args:
             tokenized_map: map token 사전입니다.
             tokenized_agent: agent token 사전입니다.
-            committed_path_norm: Generator가 closed-loop로 실제 실행한 path입니다.
-                shape은 ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
+            committed_path_norm: Generator가 closed-loop로 실제 실행한 self-forced flow state입니다.
+                pose-space에서는 ``[n_valid_agent, flow_window_steps, 4]`` 이고,
+                control-space에서는 ``[n_valid_agent, flow_window_steps, 3]`` 입니다.
             anchor_mask: 첫 anchor 기준으로 유효한 agent mask입니다.
                 shape은 ``[n_agent]`` 입니다.
+            active_control_mask: DMD에 사용할 active 축 mask입니다. shape은
+                ``[n_valid_agent, 1, flow_dim]`` 입니다.
+            dmd_injection_scale: detached target에 주입할 DMD 방향 계수입니다. pose-projected
+                DMD에서는 pose target을 만든 뒤 control target으로 되돌리는 데 사용합니다.
 
         Returns:
             Tensor: 현재 committed path에 더할 정규화된 DMD 방향입니다.
-            shape은 ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
+            shape은 ``committed_path_norm`` 과 같습니다.
 
         설명:
             Generator update에서 target teacher와 generated estimator는 학습 대상이 아닙니다.
@@ -2073,6 +2963,11 @@ class SMARTFlow(LightningModule):
         if self.self_forced_target_teacher is None or self.self_forced_generated_estimator is None:
             raise RuntimeError("self-forced auxiliary models are not initialized.")
 
+        stable_scale_group_index = self._build_self_forced_dmd_stable_scale_group_index(
+            tokenized_agent=tokenized_agent,
+            anchor_mask=anchor_mask,
+            device=committed_path_norm.device,
+        )
         self.self_forced_target_teacher.eval()
         self.self_forced_generated_estimator.eval()
         self._clear_self_forced_auxiliary_gradients()
@@ -2100,23 +2995,235 @@ class SMARTFlow(LightningModule):
                 tau=flow_sample.tau,
                 anchor_mask=anchor_mask,
             )
-            path_delta = build_clean_dmd_direction(
-                committed_path_norm=clean_for_guidance,
-                target_clean_norm=target_pred["clean"],
-                generated_clean_norm=generated_pred["clean"],
-                normalizer_eps=self.self_forced_direction_normalizer_eps,
-            )
+            if self._should_project_self_forced_dmd_to_pose_space(committed_path_norm):
+                path_delta = self._compute_pose_projected_self_forced_control_delta(
+                    tokenized_agent=tokenized_agent,
+                    committed_control_norm=clean_for_guidance,
+                    target_clean_control_norm=target_pred["clean"],
+                    generated_clean_control_norm=generated_pred["clean"],
+                    anchor_mask=anchor_mask,
+                    stable_scale_group_index=stable_scale_group_index,
+                    dmd_injection_scale=dmd_injection_scale,
+                )
+            else:
+                path_delta = build_clean_dmd_direction(
+                    committed_path_norm=clean_for_guidance,
+                    target_clean_norm=target_pred["clean"],
+                    generated_clean_norm=generated_pred["clean"],
+                    active_mask=active_control_mask,
+                    stable_scale_group_index=stable_scale_group_index,
+                    normalizer_eps=self.self_forced_direction_normalizer_eps,
+                    beta=self.self_forced_dmd_beta,
+                    use_stable_scale_filter=self.self_forced_dmd_use_stable_scale_filter,
+                    use_teacher_alignment_filter=self.self_forced_dmd_use_teacher_alignment_filter,
+                    use_trust_region_filter=self.self_forced_dmd_use_trust_region_filter,
+                )
 
         self._assert_self_forced_generator_update_isolated()
         return path_delta.to(dtype=committed_path_norm.dtype).detach()
+
+    def _should_project_self_forced_dmd_to_pose_space(self, committed_path_norm: Tensor) -> bool:
+        """현재 self-forced DMD를 pose-space에서 판단해야 하는지 확인합니다."""
+        return (
+            bool(self.self_forced_project_dmd_to_pose_space)
+            and bool(self.use_kinematic_control_flow)
+            and committed_path_norm.ndim == 3
+            and int(committed_path_norm.shape[-1]) == 3
+        )
+
+    def _get_anchor0_agent_type_and_length(
+        self,
+        tokenized_agent: Dict[str, Tensor],
+        anchor_mask: Tensor,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[Tensor, Tensor | None]:
+        """첫 anchor에 남은 agent의 type/length metadata를 가져옵니다."""
+        if anchor_mask.ndim != 1:
+            raise ValueError(f"anchor_mask must have shape [n_agent], got {tuple(anchor_mask.shape)}.")
+        if "type" not in tokenized_agent:
+            raise KeyError("tokenized_agent must contain type for self-forced control metadata.")
+        agent_type = tokenized_agent["type"][anchor_mask].to(device=device)
+        agent_length = (
+            tokenized_agent["shape"][anchor_mask, 0].to(device=device, dtype=dtype)
+            if "shape" in tokenized_agent
+            else None
+        )
+        return agent_type, agent_length
+
+    def _build_self_forced_dmd_stable_scale_group_index(
+        self,
+        tokenized_agent: Dict[str, Tensor],
+        anchor_mask: Tensor,
+        *,
+        device: torch.device,
+    ) -> Tensor | None:
+        """config에 따라 DMD stable scale을 공유할 agent group id를 만듭니다."""
+        scope = str(self.self_forced_dmd_stable_scale_scope)
+        if scope == "agent":
+            return None
+        if anchor_mask.ndim != 1:
+            raise ValueError(f"anchor_mask must have shape [n_agent], got {tuple(anchor_mask.shape)}.")
+        if "batch" not in tokenized_agent:
+            raise KeyError("tokenized_agent must contain batch for grouped DMD stable scale.")
+        selected_batch = tokenized_agent["batch"][anchor_mask].to(device=device, dtype=torch.long)
+        if scope == "scene":
+            return selected_batch
+        if scope == "type":
+            if "type" not in tokenized_agent:
+                raise KeyError("tokenized_agent must contain type for type-grouped DMD stable scale.")
+            selected_type = tokenized_agent["type"][anchor_mask].to(device=device, dtype=torch.long)
+            return selected_batch * int(CYCLIST_TYPE_ID + 1) + selected_type
+        raise ValueError(
+            "self_forced.dmd_stable_scale_scope must be one of 'agent', 'type', or 'scene', "
+            f"got {scope!r}."
+        )
+
+    def _control_norm_to_self_forced_pose_norm(
+        self,
+        control_norm: Tensor,
+        tokenized_agent: Dict[str, Tensor],
+        anchor_mask: Tensor,
+    ) -> Tensor:
+        """self-forced control state를 closed-loop metric과 같은 pose-space 표현으로 복원합니다."""
+        agent_type, agent_length = self._get_anchor0_agent_type_and_length(
+            tokenized_agent,
+            anchor_mask,
+            device=control_norm.device,
+            dtype=control_norm.dtype,
+        )
+        if agent_type.shape[0] != control_norm.shape[0]:
+            raise ValueError(
+                "anchor_mask selected agent count must match control batch: "
+                f"got {agent_type.shape[0]} and {control_norm.shape[0]}."
+            )
+        return self.encoder.flow_norm_to_pose_metric_norm(
+            value=control_norm,
+            agent_type=agent_type,
+            agent_length=agent_length,
+        )
+
+    def _pose_norm_to_self_forced_control_norm(
+        self,
+        pose_norm: Tensor,
+        tokenized_agent: Dict[str, Tensor],
+        anchor_mask: Tensor,
+    ) -> Tensor:
+        """pose-space DMD target을 기존 rolling control target으로 되돌립니다."""
+        return build_anchor0_normalized_committed_control(
+            committed_path_norm=pose_norm,
+            tokenized_agent=tokenized_agent,
+            anchor_mask=anchor_mask,
+            pos_scale_m=self.encoder.agent_encoder.control_pos_scale_m,
+            vehicle_yaw_scale_rad=self.encoder.agent_encoder.control_vehicle_yaw_scale_rad,
+            pedestrian_yaw_scale_rad=self.encoder.agent_encoder.control_pedestrian_yaw_scale_rad,
+            cyclist_yaw_scale_rad=self.encoder.agent_encoder.control_cyclist_yaw_scale_rad,
+            use_holonomic_model_only=self.encoder.agent_encoder.use_holonomic_model_only,
+            use_rolling_supervision=self.encoder.agent_encoder.use_rolling_supervision,
+            vehicle_no_slip_point_ratio=self.encoder.agent_encoder.control_vehicle_no_slip_point_ratio,
+            cyclist_no_slip_point_ratio=self.encoder.agent_encoder.control_cyclist_no_slip_point_ratio,
+        )
+
+    def _compute_pose_projected_self_forced_control_delta(
+        self,
+        *,
+        tokenized_agent: Dict[str, Tensor],
+        committed_control_norm: Tensor,
+        target_clean_control_norm: Tensor,
+        generated_clean_control_norm: Tensor,
+        anchor_mask: Tensor,
+        stable_scale_group_index: Tensor | None,
+        dmd_injection_scale: float | Tensor,
+    ) -> Tensor:
+        """pose-space에서 DMD target을 만들고 rolling control delta로 되돌립니다."""
+        committed_pose_norm = self._control_norm_to_self_forced_pose_norm(
+            committed_control_norm,
+            tokenized_agent,
+            anchor_mask,
+        )
+        target_pose_norm = self._control_norm_to_self_forced_pose_norm(
+            target_clean_control_norm,
+            tokenized_agent,
+            anchor_mask,
+        )
+        generated_pose_norm = self._control_norm_to_self_forced_pose_norm(
+            generated_clean_control_norm,
+            tokenized_agent,
+            anchor_mask,
+        )
+        pose_delta = build_clean_dmd_direction(
+            committed_path_norm=committed_pose_norm,
+            target_clean_norm=target_pose_norm,
+            generated_clean_norm=generated_pose_norm,
+            active_mask=None,
+            stable_scale_group_index=stable_scale_group_index,
+            normalizer_eps=self.self_forced_direction_normalizer_eps,
+            beta=self.self_forced_dmd_beta,
+            use_stable_scale_filter=self.self_forced_dmd_use_stable_scale_filter,
+            use_teacher_alignment_filter=self.self_forced_dmd_use_teacher_alignment_filter,
+            use_trust_region_filter=self.self_forced_dmd_use_trust_region_filter,
+        )
+        if isinstance(dmd_injection_scale, Tensor):
+            injection_scale = dmd_injection_scale.to(
+                device=pose_delta.device,
+                dtype=pose_delta.dtype,
+            )
+        else:
+            injection_scale = torch.as_tensor(
+                float(dmd_injection_scale),
+                device=pose_delta.device,
+                dtype=pose_delta.dtype,
+            )
+        pose_target_norm = normalize_pose_heading_vector(
+            committed_pose_norm + pose_delta * injection_scale,
+        )
+        control_target_norm = self._pose_norm_to_self_forced_control_norm(
+            pose_target_norm,
+            tokenized_agent,
+            anchor_mask,
+        )
+        if tuple(control_target_norm.shape) != tuple(committed_control_norm.shape):
+            raise ValueError(
+                "pose-projected DMD control target shape must match committed control shape: "
+                f"target={tuple(control_target_norm.shape)}, committed={tuple(committed_control_norm.shape)}."
+            )
+        return control_target_norm - committed_control_norm
+
+    def _build_self_forced_active_control_mask(
+        self,
+        tokenized_agent: Dict[str, Tensor],
+        committed_path_norm: Tensor,
+        anchor_mask: Tensor,
+    ) -> Tensor:
+        """self-forced DMD가 실행 가능한 control 축에만 작동하도록 mask를 만듭니다."""
+        if anchor_mask.ndim != 1:
+            raise ValueError(f"anchor_mask must have shape [n_agent], got {tuple(anchor_mask.shape)}.")
+        if "type" not in tokenized_agent:
+            raise KeyError("tokenized_agent must contain type for self-forced active-control DMD.")
+        agent_type = tokenized_agent["type"][anchor_mask].to(device=committed_path_norm.device)
+        if agent_type.shape[0] != committed_path_norm.shape[0]:
+            raise ValueError(
+                "anchor_mask selected agent count must match committed_path_norm batch: "
+                f"got {agent_type.shape[0]} and {committed_path_norm.shape[0]}."
+            )
+        return build_active_control_mask(
+            agent_type=agent_type,
+            flow_dim=int(committed_path_norm.shape[-1]),
+            device=committed_path_norm.device,
+            dtype=committed_path_norm.dtype,
+            use_kinematic_control_flow=bool(self.use_kinematic_control_flow),
+            use_holonomic_model_only=bool(self.encoder.agent_encoder.use_holonomic_model_only),
+        )
 
 
     def _sample_self_forced_guidance_flow_state(self, clean_path_norm: Tensor):
         """SiD/DMD teacher query에 쓸 noisy path를 샘플링합니다.
 
         Args:
-            clean_path_norm: Generator가 만든 clean path입니다.
-                shape은 ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
+            clean_path_norm: Generator가 만든 clean flow state입니다.
+                pose-space에서는 ``[n_valid_agent, flow_window_steps, 4]`` 이고,
+                control-space에서는 ``[n_valid_agent, flow_window_steps, 3]`` 입니다.
 
         Returns:
             object: ``x_t`` 와 ``tau`` 를 가진 flow sample입니다.
@@ -2146,14 +3253,15 @@ class SMARTFlow(LightningModule):
         Args:
             tokenized_map: 평가 모드 map token 사전입니다.
             tokenized_agent: 평가 모드 agent token 사전입니다.
-            committed_path_norm: Generator가 실제로 실행한 path입니다.
-                shape은 ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
+            committed_path_norm: Generator가 실제로 실행한 self-forced flow state입니다.
+                pose-space에서는 ``[n_valid_agent, flow_window_steps, 4]`` 이고,
+                control-space에서는 ``[n_valid_agent, flow_window_steps, 3]`` 입니다.
             anchor_mask: 첫 anchor에서 사용할 agent mask입니다.
                 shape은 ``[n_agent]`` 입니다.
 
         Returns:
             tuple[Tensor, Tensor]: ``target_clean_norm`` 과 ``generated_clean_norm`` 입니다.
-                각 shape은 ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
+                각 shape은 ``committed_path_norm`` 과 같습니다.
         """
         if self.self_forced_target_teacher is None or self.self_forced_generated_estimator is None:
             raise RuntimeError("self-forced auxiliary models are not initialized.")
@@ -2199,8 +3307,9 @@ class SMARTFlow(LightningModule):
         Args:
             tokenized_map: 평가 모드 map token 사전입니다.
             tokenized_agent: 평가 모드 agent token 사전입니다.
-            committed_path_norm: Generator가 실제로 실행한 path ``X`` 입니다.
-                shape은 ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
+            committed_path_norm: Generator가 실제로 실행한 self-forced flow state ``X`` 입니다.
+                pose-space에서는 ``[n_valid_agent, flow_window_steps, 4]`` 이고,
+                control-space에서는 ``[n_valid_agent, flow_window_steps, 3]`` 입니다.
             anchor_mask: 첫 anchor에서 사용할 agent mask입니다.
                 shape은 ``[n_agent]`` 입니다.
 
@@ -2238,8 +3347,9 @@ class SMARTFlow(LightningModule):
         Args:
             tokenized_map: 평가 모드 map token 사전입니다.
             tokenized_agent: 평가 모드 agent token 사전입니다.
-            committed_path_norm: Generator가 실제로 실행한 path입니다.
-                shape은 ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
+            committed_path_norm: Generator가 실제로 실행한 self-forced flow state입니다.
+                pose-space에서는 ``[n_valid_agent, flow_window_steps, 4]`` 이고,
+                control-space에서는 ``[n_valid_agent, flow_window_steps, 3]`` 입니다.
             anchor_mask: 첫 anchor에서 사용할 agent mask입니다.
                 shape은 ``[n_agent]`` 입니다.
 
@@ -2254,73 +3364,42 @@ class SMARTFlow(LightningModule):
                 anchor_mask=anchor_mask,
             )
 
+        active_control_mask = self._build_self_forced_active_control_mask(
+            tokenized_agent=tokenized_agent,
+            committed_path_norm=committed_path_norm,
+            anchor_mask=anchor_mask,
+        )
+        dmd_start_epoch = int(self.self_forced_start_epoch) + int(self.self_forced_estimator_warmup_epochs)
+        dmd_injection_scale = compute_self_forced_dmd_injection_scale(
+            current_epoch=int(self.current_epoch),
+            dmd_start_epoch=dmd_start_epoch,
+            use_ramp=self.self_forced_dmd_use_injection_ramp,
+        )
+        pose_projected_dmd = self._should_project_self_forced_dmd_to_pose_space(committed_path_norm)
         path_delta = self._compute_self_forced_direction(
             tokenized_map=tokenized_map,
             tokenized_agent=tokenized_agent,
             committed_path_norm=committed_path_norm,
             anchor_mask=anchor_mask,
+            active_control_mask=active_control_mask,
+            dmd_injection_scale=dmd_injection_scale,
         )
-        target_path_norm = (committed_path_norm + self.self_forced_path_step_size * path_delta).detach()
+        surrogate_injection_scale = 1.0 if pose_projected_dmd else dmd_injection_scale
+        sf_loss, target_path_norm = active_control_dmd_surrogate_loss(
+            committed_path_norm=committed_path_norm,
+            dmd_direction=path_delta,
+            active_mask=active_control_mask,
+            dmd_injection_scale=surrogate_injection_scale,
+        )
         self._set_self_forced_backward_context(
             committed_path_norm=committed_path_norm,
             path_delta=path_delta,
             target_path_norm=target_path_norm,
+            active_control_mask=active_control_mask,
+            dmd_injection_scale=committed_path_norm.new_tensor(dmd_injection_scale),
+            pose_projected_dmd=committed_path_norm.new_tensor(float(pose_projected_dmd)),
         )
-        return masked_mean_square_loss(committed_path_norm, target_path_norm)
-
-    def _compute_self_forced_physics_loss(
-        self,
-        committed_path_norm: Tensor,
-        tokenized_agent: Dict[str, Tensor],
-        anchor_mask: Tensor,
-    ) -> Dict[str, Tensor]:
-        """실제로 실행된 committed N초 self-rollout에만 physics loss를 겁니다.
-
-        Args:
-            committed_path_norm: packed committed rollout입니다. shape은
-                ``[n_valid_agent, F_win, 4]`` 입니다.
-            tokenized_agent: 평가 모드 agent token 사전입니다.
-            anchor_mask: 첫 anchor에서 사용할 agent mask입니다. shape은 ``[n_agent]`` 입니다.
-
-        Returns:
-            Dict[str, Tensor]: physics loss와 세부 항입니다.
-        """
-        if (
-            not self.self_forced_use_physics
-            or self.self_forced_regularizer is None
-            or committed_path_norm.numel() == 0
-        ):
-            return self._build_zero_draft_metrics(committed_path_norm)
-
-        physics_inputs = build_anchor0_physics_inputs(
-            tokenized_agent=tokenized_agent,
-            anchor_mask=anchor_mask,
-        )
-        if not self.self_forced_physics_force_fp32:
-            physics_dict = self.self_forced_regularizer(
-                pred_future_norm=committed_path_norm,
-                target_future_norm=committed_path_norm.detach(),
-                packed_agent_type=physics_inputs["agent_type"],
-                packed_agent_length=physics_inputs["agent_length"],
-                packed_prev_control=physics_inputs["prev_control"],
-                packed_prev_control_valid=physics_inputs["prev_control_valid"],
-            )
-            if not all(torch.isfinite(value).all() for value in physics_dict.values()):
-                return self._build_zero_draft_metrics(committed_path_norm)
-            return physics_dict
-
-        with torch.autocast(device_type=committed_path_norm.device.type, enabled=False):
-            physics_dict = self.self_forced_regularizer(
-                pred_future_norm=committed_path_norm.float(),
-                target_future_norm=committed_path_norm.detach().float(),
-                packed_agent_type=physics_inputs["agent_type"],
-                packed_agent_length=physics_inputs["agent_length"].float(),
-                packed_prev_control=physics_inputs["prev_control"].float(),
-                packed_prev_control_valid=physics_inputs["prev_control_valid"],
-            )
-        if not all(torch.isfinite(value).all() for value in physics_dict.values()):
-            return self._build_zero_draft_metrics(committed_path_norm)
-        return physics_dict
+        return sf_loss
 
     def on_fit_start(self) -> None:
         """학습 시작 전에 빠른 closed-loop validation 모드를 켭니다.
@@ -2332,14 +3411,26 @@ class SMARTFlow(LightningModule):
         Returns:
             None
         """
-        self._apply_scorer_scene_num_overrides()
+        self._configure_fast_wosac_validation_scope()
         self._apply_fit_time_validation_batch_limit()
+        if (
+            self.self_forced_enabled
+            and self.self_forced_use_distribution_matching_loss
+            and int(self.self_forced_estimator_warmup_epochs) > 0
+        ):
+            self._capture_self_forced_validation_interval()
         self._sync_self_forced_auxiliary_models()
+        self._load_self_forced_generated_estimator_bank()
         self._prepare_self_forced_generator_ema()
 
     def on_validation_start(self) -> None:
         """validation 시작 직전에 scorer batch 수 자동 조정을 다시 시도합니다."""
-        self._apply_scorer_scene_num_overrides()
+        self._configure_fast_wosac_validation_scope()
+
+    def setup(self, stage: str) -> None:
+        """validation dataloader cap이 scorer scene 수보다 작지 않도록 미리 맞춥니다."""
+        if stage in {"fit", "validate"}:
+            self._configure_fast_wosac_validation_scope()
 
     def on_fit_end(self) -> None:
         """학습이 끝나면 임시로 바꾼 validation 제한 값을 정리합니다.
@@ -2348,62 +3439,7 @@ class SMARTFlow(LightningModule):
             None
         """
         self._restore_fit_time_validation_batch_limit()
-
-
-    def _get_draft_loss_weight(self) -> float:
-        """현재 epoch에서 사용할 DRaFT physics 가중치를 계산합니다.
-
-        Returns:
-            float:
-                warm-up 이전이면 ``0.0`` 이고,
-                그 뒤에는 설정한 최대값까지 선형으로 올라갑니다.
-        """
-        if not self.draft_enabled or self.draft_max_weight <= 0.0:
-            return 0.0
-
-        current_epoch = int(self.current_epoch)
-        if current_epoch < self.draft_start_epoch:
-            return 0.0
-
-        if self.draft_ramp_epochs <= 1:
-            return self.draft_max_weight
-
-        progress = (current_epoch - self.draft_start_epoch + 1) / float(self.draft_ramp_epochs)
-        progress = min(max(progress, 0.0), 1.0)
-        return self.draft_max_weight * progress
-
-    def _build_zero_draft_metrics(self, reference: Tensor) -> Dict[str, Tensor]:
-        """DRaFT logging에 필요한 0 metric 사전을 만듭니다."""
-        zero = reference.new_zeros(())
-        metric_dict = {
-            "loss": zero,
-            "raw_pred_loss": zero,
-        }
-        for key in DRAFT_PHYSICS_COMPONENT_KEYS:
-            metric_dict[key] = zero
-        for key in DRAFT_PHYSICS_ACTUAL_UNIT_KEYS:
-            metric_dict[key] = zero
-            metric_dict[f"pred_{key}"] = zero
-            metric_dict[f"gt_{key}"] = zero
-        return metric_dict
-
-    def _find_first_nonfinite_parameter(self) -> tuple[str, Tensor] | None:
-        """처음 발견한 non-finite trainable parameter를 반환합니다."""
-        for name, param in self.named_parameters():
-            if not param.requires_grad:
-                continue
-            if not torch.isfinite(param).all():
-                return name, param
-        return None
-
-    def _find_first_nonfinite_gradient(self) -> tuple[str, Tensor] | None:
-        """처음 발견한 non-finite gradient를 반환합니다."""
-        for name, param in self.named_parameters():
-            if not param.requires_grad or param.grad is None:
-                continue
-            if not torch.isfinite(param.grad).all():
-                return name, param.grad
-        return None
+        self._restore_self_forced_validation_interval()
 
     @staticmethod
     def _summarize_nonfinite_tensor(tensor: Tensor) -> str:
@@ -2435,182 +3471,6 @@ class SMARTFlow(LightningModule):
         ]
         return " Self-forced backward context: " + "; ".join(summaries)
 
-    def _sample_draft_eval_future(
-        self,
-        tokenized_map: Dict[str, Tensor],
-        tokenized_agent: Dict[str, Tensor],
-    ) -> tuple[Tensor, Dict[str, Tensor]]:
-        """DRaFT physics target trajectory를 inference와 같은 eval mode에서 생성합니다."""
-        encoder_modes = self._switch_module_to_eval_preserving_modes(self.encoder)
-        try:
-            draft_context = self.encoder.build_anchor_context(
-                tokenized_map=tokenized_map,
-                tokenized_agent=tokenized_agent,
-                anchor_mask_key="flow_train_mask",
-            )
-            pred_sample_norm = self.encoder.sample_open_loop_future(
-                anchor_hidden=draft_context["anchor_hidden"],
-                anchor_mask=draft_context["anchor_mask"],
-                sampling_scheme=self.draft_sampling,
-            )
-        finally:
-            self._restore_module_training_modes(encoder_modes)
-        return pred_sample_norm, draft_context
-
-    def _compute_draft_training_loss(
-        self,
-        pred_dict: Dict[str, Tensor],
-        tokenized_map: Dict[str, Tensor],
-        tokenized_agent: Dict[str, Tensor],
-    ) -> Dict[str, Tensor]:
-        """실제 샘플러를 돌린 최종 미래에 physics loss를 계산합니다.
-
-        Args:
-            pred_dict: flow decoder 출력 사전입니다.
-                ``anchor_hidden`` 은 ``[n_agent, 13, hidden_dim]`` 이고,
-                ``flow_clean_norm`` 은 ``[n_valid_anchor, 20, 4]`` 입니다.
-            tokenized_map: 학습용 맵 토큰 사전입니다.
-            tokenized_agent: 학습용 에이전트 토큰 사전입니다.
-                DRaFT용 packed 메타데이터가 들어 있어야 합니다.
-
-        Returns:
-            Dict[str, Tensor]:
-                총 physics loss와 세부 항을 담은 사전입니다.
-        """
-        if (
-            not self.draft_enabled
-            or self.draft_regularizer is None
-            or pred_dict["flow_clean_norm"].numel() == 0
-        ):
-            return self._build_zero_draft_metrics(pred_dict["flow_clean_norm"])
-
-        # pred_sample_norm : [n_valid_anchor, 20, 4]
-        pred_sample_norm, draft_pred = self._sample_draft_eval_future(
-            tokenized_map=tokenized_map,
-            tokenized_agent=tokenized_agent,
-        )
-        draft_target_norm = draft_pred["flow_clean_norm"]
-        draft_loss_mask = draft_pred.get("flow_loss_mask")
-        if not torch.isfinite(pred_sample_norm).all():
-            return self._build_zero_draft_metrics(draft_target_norm)
-
-        if pred_sample_norm.shape[0] != tokenized_agent["flow_train_agent_type"].shape[0]:
-            raise ValueError(
-                "DRaFT 샘플 개수와 packed anchor 메타데이터 개수가 다릅니다. "
-                f"got {pred_sample_norm.shape[0]} and {tokenized_agent['flow_train_agent_type'].shape[0]}"
-            )
-
-        if not self.draft_physics_force_fp32:
-            physics_dict = self.draft_regularizer(
-                pred_future_norm=pred_sample_norm,
-                target_future_norm=draft_target_norm,
-                packed_agent_type=tokenized_agent["flow_train_agent_type"],
-                packed_agent_length=tokenized_agent["flow_train_agent_length"],
-                packed_prev_control=tokenized_agent["flow_train_prev_control"],
-                packed_prev_control_valid=tokenized_agent["flow_train_prev_control_valid"],
-                future_valid_mask=draft_loss_mask,
-            )
-            if not all(torch.isfinite(value).all() for value in physics_dict.values()):
-                return self._build_zero_draft_metrics(draft_target_norm)
-            return physics_dict
-
-        # Keep the threshold-heavy physics penalty in fp32 even when the trainer
-        # runs with bf16 autocast, while preserving gradients to pred_sample_norm.
-        with torch.autocast(device_type=pred_sample_norm.device.type, enabled=False):
-            physics_dict = self.draft_regularizer(
-                pred_future_norm=pred_sample_norm.float(),
-                target_future_norm=draft_target_norm.float(),
-                packed_agent_type=tokenized_agent["flow_train_agent_type"],
-                packed_agent_length=tokenized_agent["flow_train_agent_length"].float(),
-                packed_prev_control=tokenized_agent["flow_train_prev_control"].float(),
-                packed_prev_control_valid=tokenized_agent["flow_train_prev_control_valid"],
-                future_valid_mask=draft_loss_mask,
-            )
-        if not all(torch.isfinite(value).all() for value in physics_dict.values()):
-            return self._build_zero_draft_metrics(draft_target_norm)
-        return physics_dict
-
-    def _log_draft_training_metrics(
-        self,
-        draft_weight: float,
-        physics_dict: Dict[str, Tensor],
-    ) -> None:
-        """DRaFT fine-tuning용 학습 로그를 기록합니다.
-
-        Args:
-            draft_weight: 현재 batch에 적용한 physics loss 가중치입니다.
-            physics_dict: physics loss 계산 결과 사전입니다.
-
-        Returns:
-            None
-        """
-        self.log(
-            "train/draft_weight",
-            float(draft_weight),
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=1,
-        )
-        self.log(
-            "train/loss_phys",
-            physics_dict["loss"],
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=1,
-        )
-        self.log(
-            "train/loss_if",
-            physics_dict["loss"],
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=1,
-        )
-        self.log(
-            "train/loss_phys_raw",
-            physics_dict["raw_pred_loss"],
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=1,
-        )
-        self.log(
-            "train/loss_if_raw",
-            physics_dict["raw_pred_loss"],
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=1,
-        )
-        for metric_name in DRAFT_PHYSICS_COMPONENT_KEYS:
-            self.log(
-                f"draft_component/{metric_name}",
-                physics_dict[metric_name],
-                on_step=False,
-                on_epoch=True,
-                sync_dist=True,
-                batch_size=1,
-            )
-        for metric_name in DRAFT_PHYSICS_ACTUAL_UNIT_KEYS:
-            self.log(
-                f"draft_actual_pred/{metric_name}",
-                physics_dict[f"pred_{metric_name}"],
-                on_step=False,
-                on_epoch=True,
-                sync_dist=True,
-                batch_size=1,
-            )
-            self.log(
-                f"draft_actual_gt/{metric_name}",
-                physics_dict[f"gt_{metric_name}"],
-                on_step=False,
-                on_epoch=True,
-                sync_dist=True,
-                batch_size=1,
-            )
-
     def _training_step_manual_open_loop(self, data, batch_idx):
         """self-forced 시작 전 epoch에서 기존 open-loop loss를 manual optimizer로 학습합니다.
 
@@ -2626,72 +3486,133 @@ class SMARTFlow(LightningModule):
             tokenized_map,
             tokenized_agent,
             anchor_mask_key="flow_train_mask",
+            compute_metric_outputs=self.train_open_loop_metrics,
         )
-        fm_loss, open_metric_dict, _ = self._open_loop_denoise_metrics(pred)
-        draft_weight = self._get_draft_loss_weight()
-        physics_dict = self._build_zero_draft_metrics(fm_loss)
+        fm_loss, open_metric_dict, sample_count, has_open_loop_targets = self._open_loop_denoise_metrics(
+            pred,
+            zero_loss_module=self.encoder,
+        )
         total_loss = fm_loss
-        if draft_weight > 0.0:
-            physics_dict = self._compute_draft_training_loss(
-                pred_dict=pred,
-                tokenized_map=tokenized_map,
-                tokenized_agent=tokenized_agent,
-            )
-            total_loss = total_loss + draft_weight * 0.005 * physics_dict["loss"]
+        self._accumulate_open_loop_train_epoch_metrics(
+            total_loss=total_loss,
+            fm_loss=fm_loss,
+            open_metric_dict=open_metric_dict,
+            sample_count=sample_count,
+        )
+        has_open_loop_targets_pending = self._start_distributed_bool_any(
+            has_open_loop_targets,
+            device=total_loss.device,
+        )
 
         generator_optimizer = self.optimizers()[0]
         self.toggle_optimizer(generator_optimizer)
-        generator_optimizer.zero_grad(set_to_none=True)
-        self._prepare_self_forced_generator_backward_boundary()
-        self._manual_backward_without_autocast(total_loss)
-        self._assert_self_forced_generator_update_isolated()
-        self._clip_and_step_with_optional_scaler(
-            generator_optimizer,
-            gradient_clip_val=self.self_forced_gradient_clip_val,
-            gradient_clip_algorithm="norm",
-        )
-        self._update_self_forced_generator_ema_after_step()
-        self._clear_self_forced_generator_gradients()
-        self.untoggle_optimizer(generator_optimizer)
+        try:
+            generator_optimizer.zero_grad(set_to_none=True)
+            self._prepare_self_forced_generator_backward_boundary()
+            self._manual_backward_without_autocast(total_loss)
+            self._assert_self_forced_generator_update_isolated()
+            has_open_loop_targets_global = self._finish_distributed_bool_any(
+                has_open_loop_targets_pending
+            )
+            if has_open_loop_targets_global:
+                self._clip_and_step_with_optional_scaler(
+                    generator_optimizer,
+                    gradient_clip_val=self.self_forced_gradient_clip_val,
+                    gradient_clip_algorithm="norm",
+                )
+                self._update_self_forced_generator_ema_after_step()
+        finally:
+            self._clear_self_forced_generator_gradients()
+            self.untoggle_optimizer(generator_optimizer)
 
+        return total_loss.detach()
+
+    def _training_step_self_forced_anchor_only(
+        self,
+        *,
+        fm_loss: Tensor | None,
+        open_metric_dict: Dict[str, Tensor] | None,
+        has_anchor_fm_targets: bool,
+    ) -> Tensor:
+        """self-forced 보조 objective를 끄고 anchor FM loss만으로 Generator를 업데이트합니다."""
+        if fm_loss is None:
+            anchor_loss = self._build_trainable_connected_zero_loss(self.encoder)
+            has_anchor_fm_targets_global = False
+        else:
+            anchor_loss = fm_loss
+            has_anchor_fm_targets_global = self._sync_distributed_bool_any(
+                has_anchor_fm_targets,
+                device=fm_loss.device,
+            )
+        total_loss = self.self_forced_anchor_weight * anchor_loss
+        should_step = bool(
+            fm_loss is not None
+            and has_anchor_fm_targets_global
+            and float(self.self_forced_anchor_weight) != 0.0
+        )
+
+        generator_optimizer = self.optimizers()[0]
+        self.toggle_optimizer(generator_optimizer)
+        try:
+            generator_optimizer.zero_grad(set_to_none=True)
+            self._prepare_self_forced_generator_backward_boundary()
+            self._manual_backward_without_autocast(total_loss)
+            self._assert_self_forced_generator_update_isolated()
+            if should_step:
+                self._clip_and_step_with_optional_scaler(
+                    generator_optimizer,
+                    gradient_clip_val=self.self_forced_gradient_clip_val,
+                    gradient_clip_algorithm="norm",
+                )
+                self._update_self_forced_generator_ema_after_step()
+        finally:
+            self._clear_self_forced_generator_gradients()
+            self._clear_self_forced_backward_context()
+            self.untoggle_optimizer(generator_optimizer)
+
+        zero_metric = total_loss.detach().new_zeros(())
         self.log("train/loss", total_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-        self.log("train/loss_fm", fm_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
-        self.log(
-            f"train/{self.train_open_metric_names['ade']}",
-            open_metric_dict[self.open_metric_names["ade"]].detach(),
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=1,
-        )
-        self.log(
-            f"train/{self.train_open_metric_names['fde']}",
-            open_metric_dict[self.open_metric_names["fde"]].detach(),
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=1,
-        )
-        self.log(
-            f"train/{self.train_open_metric_names['yaw_ade']}",
-            open_metric_dict[self.open_metric_names["yaw_ade"]].detach(),
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=1,
-        )
-        self.log(
-            f"train/{self.train_open_metric_names['yaw_fde']}",
-            open_metric_dict[self.open_metric_names["yaw_fde"]].detach(),
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=1,
-        )
-        if self.draft_enabled:
-            self._log_draft_training_metrics(
-                draft_weight=draft_weight,
-                physics_dict=physics_dict,
+        if fm_loss is not None:
+            self.log("train/loss_fm", fm_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/sf_npfm_loss", zero_metric, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/sf_generated_estimator_loss", zero_metric, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/sf_anchor_fm_enabled", float(self.self_forced_use_anchor_fm_loss), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/sf_anchor_loss", anchor_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/sf_anchor_weight", float(self.self_forced_anchor_weight), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/sf_distribution_matching_enabled", 0.0, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/sf_pose_projected_dmd", 0.0, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        if open_metric_dict:
+            self.log(
+                f"train/{self.train_open_metric_names['ade']}",
+                open_metric_dict[self.open_metric_names["ade"]].detach(),
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=1,
+            )
+            self.log(
+                f"train/{self.train_open_metric_names['fde']}",
+                open_metric_dict[self.open_metric_names["fde"]].detach(),
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=1,
+            )
+            self.log(
+                f"train/{self.train_open_metric_names['yaw_ade']}",
+                open_metric_dict[self.open_metric_names["yaw_ade"]].detach(),
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=1,
+            )
+            self.log(
+                f"train/{self.train_open_metric_names['yaw_fde']}",
+                open_metric_dict[self.open_metric_names["yaw_fde"]].detach(),
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=1,
             )
         return total_loss.detach()
 
@@ -2707,17 +3628,33 @@ class SMARTFlow(LightningModule):
         """
         fm_loss = None
         open_metric_dict = None
-        if self.self_forced_use_anchor_fm_loss:
+        has_anchor_fm_targets = False
+        is_estimator_warmup_active = self._is_self_forced_estimator_warmup_active()
+        if should_compute_anchor_flow_matching_loss(
+            use_anchor_flow_matching_loss=self.self_forced_use_anchor_fm_loss,
+            is_estimator_warmup_active=is_estimator_warmup_active,
+        ):
             tokenized_map_train, tokenized_agent_train = self.token_processor(data)
             pred = self.encoder(
                 tokenized_map_train,
                 tokenized_agent_train,
                 anchor_mask_key="flow_train_mask",
+                compute_metric_outputs=self.train_open_loop_metrics,
             )
-            fm_loss, open_metric_dict, _ = self._open_loop_denoise_metrics(pred)
+            fm_loss, open_metric_dict, _, has_anchor_fm_targets = self._open_loop_denoise_metrics(
+                pred,
+                zero_loss_module=self.encoder,
+            )
+
+        if not self.self_forced_use_distribution_matching_loss:
+            return self._training_step_self_forced_anchor_only(
+                fm_loss=fm_loss,
+                open_metric_dict=open_metric_dict,
+                has_anchor_fm_targets=has_anchor_fm_targets,
+            )
 
         tokenized_map_eval, tokenized_agent_eval = self._build_eval_tokenized_inputs(data)
-        if self._is_self_forced_estimator_warmup_active():
+        if is_estimator_warmup_active:
             with torch.no_grad():
                 rollout = self._run_self_forced_rollout(tokenized_map_eval, tokenized_agent_eval)
         else:
@@ -2726,18 +3663,27 @@ class SMARTFlow(LightningModule):
             rollout=rollout,
             tokenized_agent=tokenized_agent_eval,
         )
-        if committed_path_norm.numel() == 0:
-            if self._is_self_forced_estimator_warmup_active():
+        has_committed_path_local = committed_path_norm.numel() > 0
+        has_committed_path_global = self._sync_distributed_bool_any(
+            has_committed_path_local,
+            device=committed_path_norm.device,
+        )
+        has_anchor_fm_targets_global = False
+        if fm_loss is not None:
+            has_anchor_fm_targets_global = self._sync_distributed_bool_any(
+                has_anchor_fm_targets,
+                device=fm_loss.device,
+            )
+
+        if not has_committed_path_global:
+            if is_estimator_warmup_active:
                 return self._finish_self_forced_estimator_warmup_step(None)
-            if fm_loss is None:
-                # DDP requires backward on every rank to participate in the
-                # gradient all-reduce. Walk Generator parameters with a
-                # zero-coefficient sum so autograd traverses the param graph
-                # and DDP completes its all-reduce; skip optimizer.step()
-                # because the gradients are deterministically zero.
-                zero_loss = sum(
-                    p.sum() for p in self.encoder.parameters() if p.requires_grad
-                ) * 0.0
+            if fm_loss is None or not has_anchor_fm_targets_global:
+                zero_loss = (
+                    fm_loss
+                    if fm_loss is not None
+                    else self._build_trainable_connected_zero_loss(self.encoder)
+                )
                 generator_optimizer = self.optimizers()[0]
                 self.toggle_optimizer(generator_optimizer)
                 try:
@@ -2749,19 +3695,39 @@ class SMARTFlow(LightningModule):
                     self._clear_self_forced_generator_gradients()
                     self.untoggle_optimizer(generator_optimizer)
                 self.log("train/loss", zero_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+                if fm_loss is not None:
+                    self.log(
+                        "train/loss_fm",
+                        fm_loss.detach(),
+                        on_step=False,
+                        on_epoch=True,
+                        sync_dist=True,
+                        batch_size=1,
+                    )
                 self.log("train/sf_anchor_fm_enabled", 0.0, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
                 self.log("train/sf_anchor_weight", float(self.self_forced_anchor_weight), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+                self.log(
+                    "train/sf_pose_projected_dmd",
+                    float(self.self_forced_project_dmd_to_pose_space and self.use_kinematic_control_flow),
+                    on_step=False,
+                    on_epoch=True,
+                    sync_dist=True,
+                    batch_size=1,
+                )
                 return zero_loss.detach()
             generator_optimizer = self.optimizers()[0]
             self.toggle_optimizer(generator_optimizer)
             generator_optimizer.zero_grad(set_to_none=True)
             self._prepare_self_forced_generator_backward_boundary()
-            self._manual_backward_without_autocast(fm_loss)
-            self._assert_self_forced_generator_update_isolated()
-            self._clip_and_step_with_optional_scaler(generator_optimizer)
-            self._update_self_forced_generator_ema_after_step()
-            self._clear_self_forced_generator_gradients()
-            self.untoggle_optimizer(generator_optimizer)
+            try:
+                self._manual_backward_without_autocast(fm_loss)
+                self._assert_self_forced_generator_update_isolated()
+                if has_anchor_fm_targets_global:
+                    self._clip_and_step_with_optional_scaler(generator_optimizer)
+                    self._update_self_forced_generator_ema_after_step()
+            finally:
+                self._clear_self_forced_generator_gradients()
+                self.untoggle_optimizer(generator_optimizer)
             self.log("train/loss", fm_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
             self.log("train/loss_fm", fm_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
             return fm_loss.detach()
@@ -2771,20 +3737,19 @@ class SMARTFlow(LightningModule):
             tokenized_agent=tokenized_agent_eval,
             committed_path_norm=committed_path_norm,
             anchor_mask=anchor_mask,
+            has_committed_path_global=has_committed_path_global,
         )
-        if self._is_self_forced_estimator_warmup_active():
+        if is_estimator_warmup_active:
             return self._finish_self_forced_estimator_warmup_step(gen_estimator_loss)
-        sf_loss = self._compute_self_forced_distribution_matching_loss(
-            tokenized_map=tokenized_map_eval,
-            tokenized_agent=tokenized_agent_eval,
-            committed_path_norm=committed_path_norm,
-            anchor_mask=anchor_mask,
-        )
-        physics_dict = self._compute_self_forced_physics_loss(
-            committed_path_norm=committed_path_norm,
-            tokenized_agent=tokenized_agent_eval,
-            anchor_mask=anchor_mask,
-        )
+        if has_committed_path_local:
+            sf_loss = self._compute_self_forced_distribution_matching_loss(
+                tokenized_map=tokenized_map_eval,
+                tokenized_agent=tokenized_agent_eval,
+                committed_path_norm=committed_path_norm,
+                anchor_mask=anchor_mask,
+            )
+        else:
+            sf_loss = self._build_trainable_connected_zero_loss(self.encoder)
         anchor_loss = (
             fm_loss
             if fm_loss is not None
@@ -2793,7 +3758,6 @@ class SMARTFlow(LightningModule):
         total_loss = (
             self.self_forced_weight * sf_loss
             + self.self_forced_anchor_weight * anchor_loss
-            + self.self_forced_physics_weight * physics_dict["loss"]
         )
         if not torch.isfinite(total_loss):
             context = self._format_self_forced_backward_context()
@@ -2829,11 +3793,18 @@ class SMARTFlow(LightningModule):
             self.log("train/loss_fm", fm_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/sf_npfm_loss", sf_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/sf_generated_estimator_loss", gen_estimator_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
-        self.log("train/sf_physics_loss", physics_dict["loss"].detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/sf_anchor_fm_enabled", float(self.self_forced_use_anchor_fm_loss), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/sf_anchor_loss", anchor_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/sf_anchor_weight", float(self.self_forced_anchor_weight), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
-        self.log("train/sf_physics_weight", float(self.self_forced_physics_weight), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/sf_distribution_matching_enabled", 1.0, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log(
+            "train/sf_pose_projected_dmd",
+            float(self._should_project_self_forced_dmd_to_pose_space(committed_path_norm)),
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=1,
+        )
         if "sf_terminal_s_by_scenario" in rollout:
             self.log(
                 "train/sf_terminal_s_mean",
@@ -2851,7 +3822,7 @@ class SMARTFlow(LightningModule):
                 sync_dist=True,
                 batch_size=1,
             )
-        if open_metric_dict is not None:
+        if open_metric_dict:
             self.log(
                 f"train/{self.train_open_metric_names['ade']}",
                 open_metric_dict[self.open_metric_names["ade"]].detach(),
@@ -2884,15 +3855,10 @@ class SMARTFlow(LightningModule):
                 sync_dist=True,
                 batch_size=1,
             )
-        if self.self_forced_use_physics:
-            self._log_draft_training_metrics(
-                draft_weight=float(self.self_forced_physics_weight),
-                physics_dict=physics_dict,
-            )
         return total_loss.detach()
 
     def training_step(self, data, batch_idx):
-        """한 batch의 FM loss와 DRaFT physics loss를 함께 계산합니다.
+        """한 batch의 Flow Matching loss를 계산합니다.
 
         Args:
             data: 학습용 장면 배치입니다.
@@ -2901,24 +3867,10 @@ class SMARTFlow(LightningModule):
         Returns:
             Tensor: 최종 학습 loss입니다.
         """
-        bad_param = self._find_first_nonfinite_parameter()
-        if bad_param is not None:
-            bad_name, bad_tensor = bad_param
-            raise RuntimeError(
-                "Detected non-finite trainable parameter before forward pass: "
-                f"{bad_name} ({self._summarize_nonfinite_tensor(bad_tensor)})"
-            )
         if self.self_forced_enabled:
             if self._is_self_forced_active():
                 return self._training_step_self_forced(data=data, batch_idx=batch_idx)
             return self._training_step_manual_open_loop(data=data, batch_idx=batch_idx)
-        """ tokenized_agent
-flow_train_agent_type [n_valid_anchor]
-flow_train_agent_length [n_valid_anchor]
-flow_train_prev_control [n_valid_anchor, 3]
-flow_train_prev_control_valid [n_valid_anchor]
-
-        """
         tokenized_map, tokenized_agent = self.token_processor(data)
         """ pred
 flow_pred_norm [n_valid_anchor, 20, 4]
@@ -2932,6 +3884,7 @@ flow_clean_norm [n_valid_anchor, 20, 4]
             tokenized_map,
             tokenized_agent,
             anchor_mask_key="flow_train_mask",
+            compute_metric_outputs=self.train_open_loop_metrics,
         )
         """
 fm_loss: 
@@ -2939,30 +3892,11 @@ fm_loss:
 open_metric_dict: 
     Dict[str, Tensor]
         """
-        fm_loss, open_metric_dict, _ = self._open_loop_denoise_metrics(pred)
-
-        draft_weight = self._get_draft_loss_weight()
-        """ physics_dict : Dict[str, Tensor] # 모든 값은 scalar tensor
-
-        loss, raw_pred_loss
-
-        vehicle_hard, vehicle_soft, vehicle_total
-        bicycle_hard, bicycle_soft, bicycle_total
-        pedestrian_hard, pedestrian_soft, pedestrian_head, pedestrian_total
-
-        pred_speed_excess_mps, pred_accel_excess_mps2,
-        pred_steer_excess_deg, pred_steer_rate_excess_degps,
-        pred_lat_accel_excess_mps2, pred_heading_error_deg
-        """
-        physics_dict = self._build_zero_draft_metrics(fm_loss)
+        fm_loss, open_metric_dict, sample_count, has_open_loop_targets = self._open_loop_denoise_metrics(
+            pred,
+            zero_loss_module=self,
+        )
         total_loss = fm_loss
-        if draft_weight > 0.0:
-            physics_dict = self._compute_draft_training_loss(
-                pred_dict=pred,
-                tokenized_map=tokenized_map,
-                tokenized_agent=tokenized_agent,
-            )
-            total_loss = total_loss + draft_weight * 0.005 * physics_dict["loss"]
         if not torch.isfinite(fm_loss):
             raise RuntimeError(f"Non-finite fm_loss detected: {self._summarize_nonfinite_tensor(fm_loss)}")
         if not torch.isfinite(total_loss):
@@ -2971,69 +3905,70 @@ open_metric_dict:
                 f"{self._summarize_nonfinite_tensor(total_loss)}"
             )
 
-        self.log("train/loss", total_loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-        self.log("train/loss_fm", fm_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
-        self.log(
-            f"train/{self.train_open_metric_names['ade']}",
-            open_metric_dict[self.open_metric_names["ade"]],
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=1,
+        self._accumulate_open_loop_train_epoch_metrics(
+            total_loss=total_loss,
+            fm_loss=fm_loss,
+            open_metric_dict=open_metric_dict,
+            sample_count=sample_count,
         )
-        self.log(
-            f"train/{self.train_open_metric_names['fde']}",
-            open_metric_dict[self.open_metric_names["fde"]],
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=1,
+        self._record_automatic_open_loop_targets(
+            has_open_loop_targets=has_open_loop_targets,
+            loss=total_loss,
         )
-        self.log(
-            f"train/{self.train_open_metric_names['yaw_ade']}",
-            open_metric_dict[self.open_metric_names["yaw_ade"]],
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=1,
-        )
-        self.log(
-            f"train/{self.train_open_metric_names['yaw_fde']}",
-            open_metric_dict[self.open_metric_names["yaw_fde"]],
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=1,
-        )
-        if self.draft_enabled:
-            self._log_draft_training_metrics(
-                draft_weight=draft_weight,
-                physics_dict=physics_dict,
-            )
         return total_loss
 
-    def on_after_backward(self) -> None:
-        """역전파 직후 non-finite gradient를 fail-fast로 잡습니다.
+    def _record_automatic_open_loop_targets(
+        self,
+        *,
+        has_open_loop_targets: bool,
+        loss: Tensor,
+    ) -> None:
+        """Record automatic-optimization target coverage, unless pre-verified."""
 
-        설명:
-            ``precision='16-mixed'`` 에서는 Lightning이 ``GradScaler`` 로 loss를 스케일해
-            backward를 수행하므로, 이 시점의 gradient는 정상적으로 scaled 상태이고
-            fp16 overflow로 인한 inf/NaN도 흔하게 발생합니다. ``GradScaler.step`` 이
-            optimizer step을 자동으로 건너뛰고 scale factor를 낮춰 회복하므로, scaler가
-            활성인 경로에서는 여기서 ``raise`` 하지 않습니다. scaler가 없는 경로
-            (bf16 / 32-true) 에서는 기존대로 fail-fast를 유지합니다.
-        """
-        if self._get_amp_grad_scaler() is not None:
+        if self.skip_empty_open_loop_optimizer_guard:
+            if not has_open_loop_targets:
+                raise RuntimeError(
+                    "skip_empty_open_loop_optimizer_guard=true requires every local "
+                    "open-loop train batch to contain at least one loss target. "
+                    "Run scripts/verify_flow_target_coverage.py on the selected "
+                    "train split, or set the guard flag back to false."
+                )
             return
-        bad_grad = self._find_first_nonfinite_gradient()
-        if bad_grad is None:
-            return
-        bad_name, bad_tensor = bad_grad
-        raise RuntimeError(
-            "Detected non-finite gradient after backward: "
-            f"{bad_name} ({self._summarize_nonfinite_tensor(bad_tensor)})"
-            f"{self._format_self_forced_backward_context()}"
+        has_open_loop_targets_pending = self._start_distributed_bool_any(
+            has_open_loop_targets,
+            device=loss.device,
         )
+        self._automatic_open_loop_has_target_pending.append(has_open_loop_targets_pending)
+
+    def on_before_optimizer_step(self, optimizer) -> None:
+        """DDP 전체에 target이 없는 automatic optimization step의 업데이트를 막습니다."""
+        if not bool(getattr(self, "automatic_optimization", True)):
+            return
+        if bool(getattr(self, "skip_empty_open_loop_optimizer_guard", False)):
+            self._automatic_open_loop_has_target_pending.clear()
+            self._automatic_open_loop_has_target_since_step = False
+            self._skip_next_automatic_optimizer_step = False
+            return
+        has_open_loop_targets_global = bool(self._automatic_open_loop_has_target_since_step)
+        if self._automatic_open_loop_has_target_pending:
+            has_open_loop_targets_global = any(
+                self._finish_distributed_bool_any(pending)
+                for pending in self._automatic_open_loop_has_target_pending
+            )
+            self._automatic_open_loop_has_target_pending.clear()
+        self._skip_next_automatic_optimizer_step = not has_open_loop_targets_global
+        if not has_open_loop_targets_global:
+            optimizer.zero_grad(set_to_none=True)
+        self._automatic_open_loop_has_target_since_step = False
+        self._skip_next_automatic_optimizer_step = False
+
+    def on_after_backward(self) -> None:
+        """Backward 이후 추가 gradient scan을 수행하지 않습니다.
+
+        Loss/parameter non-finite fail-fast는 forward 경로에 남기고, 매 step 모든
+        gradient를 순회하던 debug-only 검사는 제거해 pretrain step latency를 줄입니다.
+        """
+        return
 
     def validation_step(self, data, batch_idx):
         eval_generator = self._get_eval_generator()
@@ -3055,9 +3990,18 @@ open_metric_dict:
                 sampling_scheme=self.validation_rollout_sampling,
                 sampling_seed=self._get_validation_open_seed(batch_idx),
             )
+            open_pred_metric_norm = eval_generator.flow_norm_to_pose_metric_norm(
+                value=open_pred_clean_norm,
+                agent_type=denoise_pred.get("flow_metric_agent_type"),
+                agent_length=denoise_pred.get("flow_metric_agent_length"),
+            )
+            open_target_metric_norm = denoise_pred.get(
+                "flow_clean_metric_norm",
+                denoise_pred["flow_clean_norm"],
+            )
             open_metric_dict = self._build_open_loop_metric_dict(
-                pred_clean_norm=open_pred_clean_norm,
-                target_clean_norm=denoise_pred["flow_clean_norm"],
+                pred_clean_norm=open_pred_metric_norm,
+                target_clean_norm=open_target_metric_norm,
             )
             self._update_weighted_validation_metrics(
                 metric_store=self.val_open_epoch_metrics,
@@ -3219,7 +4163,7 @@ open_metric_dict:
                 raise RuntimeError("No trainable generated-estimator parameters found.")
             generated_estimator_optimizer = torch.optim.AdamW(
                 estimator_params,
-                lr=self.self_forced_estimator_lr,
+                lr=self.self_forced_generated_estimator_lr,
             )
             return [generator_optimizer, generated_estimator_optimizer]
 
@@ -3227,14 +4171,29 @@ open_metric_dict:
         lr_scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
         return [optimizer], [lr_scheduler]
 
+    def on_train_epoch_start(self) -> None:
+        """새 epoch의 open-loop train metric accumulator를 초기화합니다."""
+        self._reset_open_loop_train_epoch_metrics()
+        self._automatic_open_loop_has_target_pending.clear()
+        self._apply_self_forced_validation_schedule_for_current_epoch()
+
     def on_train_epoch_end(self) -> None:
         """self-forced manual optimization에서 scheduler가 있으면 epoch마다 한 번 진행합니다.
 
         Returns:
             None
         """
+        self._log_open_loop_train_epoch_metrics()
         if not self.self_forced_enabled:
             return
+        if (
+            int(self.self_forced_estimator_warmup_epochs) > 0
+            and int(self.current_epoch)
+            == int(self.self_forced_start_epoch) + int(self.self_forced_estimator_warmup_epochs) - 1
+        ):
+            snapshot_path = self._save_self_forced_generated_estimator_bank_snapshot()
+            if snapshot_path is not None:
+                self._upload_self_forced_generated_estimator_bank_snapshot(snapshot_path)
         schedulers = self.lr_schedulers()
         if schedulers is None:
             return

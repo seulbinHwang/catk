@@ -1,6 +1,38 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+from typing import Any, Iterator
+
+from torch import Tensor
 import torch.nn as nn
+from torch.nn import Parameter
+
+
+def detach_tensor_tree(value: Any) -> Any:
+    """nested container 안의 tensor들을 autograd graph에서 분리합니다.
+
+    Args:
+        value: tensor, dict, list, tuple 또는 그 밖의 값을 담은 객체입니다.
+
+    Returns:
+        Any: 원래 container 구조는 유지하되 tensor leaf만 ``detach()`` 한 값입니다.
+
+    설명:
+        generated estimator update는 현재 Generator가 만든 값들을 학습 target/context로만
+        봐야 합니다. tensor container 전체를 boundary에서 detach해 두면 estimator backward가
+        online Generator rollout graph로 되돌아가는 것을 구조적으로 막을 수 있습니다.
+    """
+    if isinstance(value, Tensor):
+        return value.detach()
+    if isinstance(value, dict):
+        return {key: detach_tensor_tree(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [detach_tensor_tree(item) for item in value]
+    if isinstance(value, tuple):
+        if hasattr(value, "_fields"):
+            return type(value)(*(detach_tensor_tree(item) for item in value))
+        return tuple(detach_tensor_tree(item) for item in value)
+    return value
 
 
 def clear_module_gradients(module: nn.Module | None) -> None:
@@ -22,6 +54,36 @@ def clear_module_gradients(module: nn.Module | None) -> None:
         return
     for parameter in module.parameters():
         parameter.grad = None
+
+
+@contextmanager
+def module_gradients_disabled(*modules: nn.Module | None) -> Iterator[None]:
+    """주어진 모듈들의 parameter gradient 누적을 잠시 비활성화합니다.
+
+    Args:
+        *modules: gradient 누적을 막을 PyTorch 모듈들입니다. 값이 ``None``이면 건너뜁니다.
+
+    Returns:
+        Iterator[None]: ``with`` 문에서 쓰는 context manager입니다.
+
+    설명:
+        ``torch.no_grad`` 는 block 안의 모든 autograd를 꺼 버리므로 generated estimator
+        자체도 학습할 수 없습니다. 이 helper는 지정한 모듈의 parameter ``requires_grad`` 만
+        잠시 꺼서, estimator update 중 online Generator / frozen teacher에 gradient가
+        누적되는 것을 구조적으로 막고 block이 끝나면 원래 trainable mask를 복원합니다.
+    """
+    previous_states: list[tuple[Parameter, bool]] = []
+    try:
+        for module in modules:
+            if module is None:
+                continue
+            for parameter in module.parameters():
+                previous_states.append((parameter, bool(parameter.requires_grad)))
+                parameter.requires_grad_(False)
+        yield
+    finally:
+        for parameter, requires_grad in reversed(previous_states):
+            parameter.requires_grad_(requires_grad)
 
 
 def find_first_gradient_name(module: nn.Module | None) -> str | None:

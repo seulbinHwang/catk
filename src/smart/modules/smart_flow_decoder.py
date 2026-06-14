@@ -37,9 +37,19 @@ class SMARTFlowDecoder(nn.Module):
         flow_solver_eps: float,
         closed_loop_rollout_mode: str = "raw_fm",
         flow_window_steps: int = 20,
+        use_kinematic_control_flow: bool = False,
+        use_holonomic_model_only: bool = False,
+        use_rolling_supervision: bool = True,
+        control_pos_scale_m: float = 1.0,
+        control_vehicle_no_slip_point_ratio: float = 0.0,
+        control_cyclist_no_slip_point_ratio: float = 0.0,
+        control_vehicle_yaw_scale_rad: float | None = None,
+        control_pedestrian_yaw_scale_rad: float | None = None,
+        control_cyclist_yaw_scale_rad: float | None = None,
         use_lqr: bool = False,
         use_stop_motion: bool = False,
         lqr_commit: DictConfig | None = None,
+        detach_train_metric_clean: bool = False,
     ) -> None:
         super().__init__()
         self.map_encoder = SMARTMapDecoder(
@@ -56,6 +66,13 @@ class SMARTFlowDecoder(nn.Module):
             num_historical_steps=num_historical_steps,
             num_future_steps=num_future_steps,
             flow_window_steps=flow_window_steps,
+            use_kinematic_control_flow=use_kinematic_control_flow,
+            control_pos_scale_m=control_pos_scale_m,
+            control_vehicle_no_slip_point_ratio=control_vehicle_no_slip_point_ratio,
+            control_cyclist_no_slip_point_ratio=control_cyclist_no_slip_point_ratio,
+            control_vehicle_yaw_scale_rad=control_vehicle_yaw_scale_rad,
+            control_pedestrian_yaw_scale_rad=control_pedestrian_yaw_scale_rad,
+            control_cyclist_yaw_scale_rad=control_cyclist_yaw_scale_rad,
             time_span=time_span,
             pl2a_radius=pl2a_radius,
             a2a_radius=a2a_radius,
@@ -74,8 +91,11 @@ class SMARTFlowDecoder(nn.Module):
             flow_solver_eps=flow_solver_eps,
             closed_loop_rollout_mode=closed_loop_rollout_mode,
             use_lqr=use_lqr,
-            use_stop_motion=use_stop_motion,
+            use_stop_motion=False,
             lqr_commit=lqr_commit,
+            use_holonomic_model_only=use_holonomic_model_only,
+            use_rolling_supervision=use_rolling_supervision,
+            detach_train_metric_clean=detach_train_metric_clean,
         )
 
     def encode_map(self, tokenized_map: Dict[str, Tensor]) -> Dict[str, Tensor]:
@@ -86,22 +106,43 @@ class SMARTFlowDecoder(nn.Module):
         map_feature: Dict[str, Tensor],
         tokenized_agent: Dict[str, Tensor],
         anchor_mask_key: str = "flow_eval_mask",
+        compute_metric_outputs: bool = True,
     ) -> Dict[str, Tensor]:
         flow_clean_norm_key = {
             "flow_train_mask": "flow_train_clean_norm",
             "flow_eval_mask": "flow_eval_clean_norm",
+        }[anchor_mask_key]
+        flow_clean_metric_norm_key = {
+            "flow_train_mask": "flow_train_clean_metric_norm",
+            "flow_eval_mask": "flow_eval_clean_metric_norm",
         }[anchor_mask_key]
         flow_loss_mask = (
             tokenized_agent["flow_train_loss_mask"]
             if anchor_mask_key == "flow_train_mask"
             else None
         )
+        flow_agent_type_key = {
+            "flow_train_mask": "flow_train_agent_type",
+            "flow_eval_mask": "flow_eval_agent_type",
+        }[anchor_mask_key]
+        flow_agent_length_key = {
+            "flow_train_mask": "flow_train_agent_length",
+            "flow_eval_mask": "flow_eval_agent_length",
+        }[anchor_mask_key]
         return self.agent_encoder(
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
             anchor_mask=tokenized_agent[anchor_mask_key],
             flow_clean_norm=tokenized_agent[flow_clean_norm_key],
+            flow_agent_type=tokenized_agent.get(flow_agent_type_key),
+            flow_agent_length=tokenized_agent.get(flow_agent_length_key),
             flow_loss_mask=flow_loss_mask,
+            flow_clean_metric_norm=(
+                tokenized_agent.get(flow_clean_metric_norm_key)
+                if compute_metric_outputs
+                else None
+            ),
+            compute_metric_outputs=compute_metric_outputs,
         )
 
     def build_anchor_context_from_map_feature(
@@ -109,22 +150,43 @@ class SMARTFlowDecoder(nn.Module):
         map_feature: Dict[str, Tensor],
         tokenized_agent: Dict[str, Tensor],
         anchor_mask_key: str = "flow_eval_mask",
+        compute_metric_outputs: bool = True,
     ) -> Dict[str, Tensor]:
         flow_clean_norm_key = {
             "flow_train_mask": "flow_train_clean_norm",
             "flow_eval_mask": "flow_eval_clean_norm",
+        }[anchor_mask_key]
+        flow_clean_metric_norm_key = {
+            "flow_train_mask": "flow_train_clean_metric_norm",
+            "flow_eval_mask": "flow_eval_clean_metric_norm",
         }[anchor_mask_key]
         flow_loss_mask = (
             tokenized_agent["flow_train_loss_mask"]
             if anchor_mask_key == "flow_train_mask"
             else None
         )
+        flow_agent_type_key = {
+            "flow_train_mask": "flow_train_agent_type",
+            "flow_eval_mask": "flow_eval_agent_type",
+        }[anchor_mask_key]
+        flow_agent_length_key = {
+            "flow_train_mask": "flow_train_agent_length",
+            "flow_eval_mask": "flow_eval_agent_length",
+        }[anchor_mask_key]
         return self.agent_encoder.build_anchor_context(
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
             anchor_mask=tokenized_agent[anchor_mask_key],
             flow_clean_norm=tokenized_agent[flow_clean_norm_key],
+            flow_agent_type=tokenized_agent.get(flow_agent_type_key),
+            flow_agent_length=tokenized_agent.get(flow_agent_length_key),
             flow_loss_mask=flow_loss_mask,
+            flow_clean_metric_norm=(
+                tokenized_agent.get(flow_clean_metric_norm_key)
+                if compute_metric_outputs
+                else None
+            ),
+            compute_metric_outputs=compute_metric_outputs,
         )
 
     def build_anchor_context(
@@ -132,12 +194,14 @@ class SMARTFlowDecoder(nn.Module):
         tokenized_map: Dict[str, Tensor],
         tokenized_agent: Dict[str, Tensor],
         anchor_mask_key: str = "flow_eval_mask",
+        compute_metric_outputs: bool = True,
     ) -> Dict[str, Tensor]:
         map_feature = self.encode_map(tokenized_map)
         return self.build_anchor_context_from_map_feature(
             map_feature=map_feature,
             tokenized_agent=tokenized_agent,
             anchor_mask_key=anchor_mask_key,
+            compute_metric_outputs=compute_metric_outputs,
         )
 
     def forward(
@@ -145,12 +209,14 @@ class SMARTFlowDecoder(nn.Module):
         tokenized_map: Dict[str, Tensor],
         tokenized_agent: Dict[str, Tensor],
         anchor_mask_key: str = "flow_eval_mask",
+        compute_metric_outputs: bool = True,
     ) -> Dict[str, Tensor]:
         map_feature = self.encode_map(tokenized_map)
         return self.forward_from_map_feature(
             map_feature=map_feature,
             tokenized_agent=tokenized_agent,
             anchor_mask_key=anchor_mask_key,
+            compute_metric_outputs=compute_metric_outputs,
         )
 
     def prepare_inference_cache(
@@ -190,6 +256,10 @@ class SMARTFlowDecoder(nn.Module):
         sampling_scheme: DictConfig,
         sampling_seed: int | None = None,
         scenario_sampling_seeds: Tensor | None = None,
+        scenario_sampling_signs: Tensor | None = None,
+        scenario_sampling_strata: Tensor | None = None,
+        scenario_sampling_stratification_seeds: Tensor | None = None,
+        scenario_sampling_num_strata: int | None = None,
         return_flow_2s_preview: bool = False,
         rollout_steps_2hz: int | None = None,
     ) -> Dict[str, Tensor]:
@@ -200,6 +270,10 @@ class SMARTFlowDecoder(nn.Module):
             sampling_scheme=sampling_scheme,
             sampling_seed=sampling_seed,
             scenario_sampling_seeds=scenario_sampling_seeds,
+            scenario_sampling_signs=scenario_sampling_signs,
+            scenario_sampling_strata=scenario_sampling_strata,
+            scenario_sampling_stratification_seeds=scenario_sampling_stratification_seeds,
+            scenario_sampling_num_strata=scenario_sampling_num_strata,
             return_flow_2s_preview=return_flow_2s_preview,
             rollout_steps_2hz=rollout_steps_2hz,
         )
@@ -212,6 +286,10 @@ class SMARTFlowDecoder(nn.Module):
         sampling_scheme: DictConfig,
         sampling_seed: int | None = None,
         scenario_sampling_seeds: Tensor | None = None,
+        scenario_sampling_signs: Tensor | None = None,
+        scenario_sampling_strata: Tensor | None = None,
+        scenario_sampling_stratification_seeds: Tensor | None = None,
+        scenario_sampling_num_strata: int | None = None,
         rollout_steps_2hz: int | None = None,
         self_forced_epoch: int | None = None,
         detach_block_transition: bool = False,
@@ -239,10 +317,14 @@ class SMARTFlowDecoder(nn.Module):
             sampling_scheme=sampling_scheme,
             sampling_seed=sampling_seed,
             scenario_sampling_seeds=scenario_sampling_seeds,
+            scenario_sampling_signs=scenario_sampling_signs,
+            scenario_sampling_strata=scenario_sampling_strata,
+            scenario_sampling_stratification_seeds=scenario_sampling_stratification_seeds,
+            scenario_sampling_num_strata=scenario_sampling_num_strata,
             rollout_steps_2hz=rollout_steps_2hz,
             self_forced_epoch=self_forced_epoch,
             detach_block_transition=detach_block_transition,
-            use_stop_motion=use_stop_motion,
+            use_stop_motion=False,
         )
 
     def path_flow_velocity_for_anchor0(
@@ -286,9 +368,9 @@ class SMARTFlowDecoder(nn.Module):
 
         Args:
             anchor_hidden: 모든 anchor 문맥입니다.
-                shape은 ``[n_agent, 13, hidden_dim]`` 입니다.
+                shape은 ``[n_agent, n_anchor, hidden_dim]`` 입니다.
             anchor_mask: 실제로 평가할 anchor 여부입니다.
-                shape은 ``[n_agent, 13]`` 입니다.
+                shape은 ``[n_agent, n_anchor]`` 입니다.
             sampling_scheme: 샘플링 단계 수, 방법, 잡음 크기 설정입니다.
             sampling_seed: validation마다 같은 샘플을 만들기 위한 고정 seed입니다.
 
@@ -302,6 +384,18 @@ class SMARTFlowDecoder(nn.Module):
             sampling_scheme=sampling_scheme,
             sampling_seed=sampling_seed,
             backprop_last_k=backprop_last_k,
+        )
+
+    def flow_norm_to_pose_metric_norm(
+        self,
+        value: Tensor,
+        agent_type: Tensor | None,
+        agent_length: Tensor | None = None,
+    ) -> Tensor:
+        return self.agent_encoder.flow_norm_to_pose_metric_norm(
+            value=value,
+            agent_type=agent_type,
+            agent_length=agent_length,
         )
 
     def inference(

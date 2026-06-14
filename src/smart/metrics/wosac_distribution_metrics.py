@@ -13,7 +13,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, Optional
+import math
+from typing import Any, Dict, Iterable, Optional, Sequence
 
 import torch
 from torch import Tensor
@@ -279,6 +280,7 @@ class WOSACDistributionMetrics(Metric):
         self,
         prefix: str,
         cpd_reference: Optional[float] = None,
+        type_scale: Optional[Sequence[float]] = None,
         eps: float = _DEFAULT_EPS,
         num_agent_types: int = _AGENT_TYPE_COUNT,
     ) -> None:
@@ -288,6 +290,9 @@ class WOSACDistributionMetrics(Metric):
             prefix: W&B와 Lightning log에서 사용할 앞부분 이름입니다.
             cpd_reference: CPD 보존율을 계산할 기준 CPD입니다. 값이 없으면
                 CPD 보존율은 기록하지 않습니다.
+            type_scale: agent 종류별 CPD/CES 정규화 scale입니다. 값이 있으면
+                validation/test 모두 이 고정 scale을 우선 사용하고, 값이 없을 때만
+                기존처럼 validation GT에서 scale을 계산합니다.
             eps: 0으로 나누는 일을 막기 위한 작은 값입니다.
             num_agent_types: agent 종류 개수입니다. WOMD 전처리 기준 기본값은 3입니다.
         """
@@ -301,6 +306,7 @@ class WOSACDistributionMetrics(Metric):
         self.cpd_reference = None if cpd_reference is None else float(cpd_reference)
         self.eps = float(eps)
         self.num_agent_types = int(num_agent_types)
+        self._fixed_type_scale = self._parse_fixed_type_scale(type_scale)
 
         self.add_state(
             "scale_sq_sum",
@@ -386,7 +392,12 @@ class WOSACDistributionMetrics(Metric):
         if pred_traj.shape[2] == 0:
             return
 
-        if gt_traj is not None and gt_valid_mask is not None and current_pos is not None:
+        if (
+            self._fixed_type_scale is None
+            and gt_traj is not None
+            and gt_valid_mask is not None
+            and current_pos is not None
+        ):
             self._update_type_scale(
                 gt_traj=gt_traj,
                 gt_valid_mask=gt_valid_mask,
@@ -485,6 +496,12 @@ class WOSACDistributionMetrics(Metric):
         Returns:
             Tensor: agent 종류별 scale입니다. shape은 ``[num_agent_types]`` 입니다.
         """
+        if self._fixed_type_scale is not None:
+            return self._fixed_type_scale.to(
+                device=self.scale_sq_sum.device,
+                dtype=torch.float64,
+            ).clamp_min(self.eps)
+
         scale = torch.ones_like(self.scale_sq_sum, dtype=torch.float64)
         valid_type = self.scale_count > 0
         if bool(valid_type.any()):
@@ -492,6 +509,23 @@ class WOSACDistributionMetrics(Metric):
                 self.scale_sq_sum[valid_type] / self.scale_count[valid_type].clamp_min(self.eps)
             )
         return scale.clamp_min(self.eps)
+
+    def _parse_fixed_type_scale(
+        self,
+        type_scale: Optional[Sequence[float]],
+    ) -> Optional[Tensor]:
+        """config에 지정된 agent type scale을 검증하고 텐서로 보관합니다."""
+        if type_scale is None:
+            return None
+        values = [float(value) for value in type_scale]
+        if len(values) != self.num_agent_types:
+            raise ValueError(
+                "type_scale length must match num_agent_types: "
+                f"got {len(values)} values for {self.num_agent_types} types."
+            )
+        if not all(math.isfinite(value) and value > 0.0 for value in values):
+            raise ValueError(f"type_scale values must be finite positive numbers, got {values}.")
+        return torch.tensor(values, dtype=torch.float64)
 
     def compute(self) -> Dict[str, Tensor]:
         """누적된 WOSAC-CPD와 WOSAC-CES를 계산합니다.

@@ -10,7 +10,7 @@ SELF_FORCED_UNFROZEN_RANGES: Tuple[str, ...] = (
     "middle",
     "full_flow_decoder",
 )
-DEFAULT_SELF_FORCED_UNFROZEN_RANGE = "except_map_encoder"
+DEFAULT_SELF_FORCED_UNFROZEN_RANGE = "middle"
 
 
 def _get_config_value(config: object | None, key: str, default: object) -> object:
@@ -47,9 +47,8 @@ def resolve_self_forced_unfrozen_range(config: object | None) -> str:
         str: ``except_map_encoder``, ``middle``, ``full_flow_decoder`` 중 하나입니다.
 
     설명:
-        기본값은 ``except_map_encoder`` 입니다. 이 값은 기존 self-forcing의
-        ``freeze_map_encoder=true`` 와 같은 의도입니다. 즉 지도 처리부는 고정하고,
-        나머지는 학습할 수 있게 둡니다.
+        기본값은 ``middle`` 입니다. 지도 처리부와 대부분의 agent 문맥부는 고정하고,
+        마지막 agent 문맥 블록과 flow decoder만 학습할 수 있게 둡니다.
     """
     raw_range = _get_config_value(
         config=config,
@@ -181,7 +180,6 @@ def _apply_full_flow_decoder_range(model: nn.Module) -> None:
         None
 
     설명:
-        이 범위는 draft fine-tuning의 ``train_full_flow_decoder_only=true`` 와 같은 의도입니다.
         지도 처리부와 agent 문맥부는 그대로 보존하고, ``agent_encoder.flow_decoder`` 만
         자기 rollout 분포 차이를 흡수하게 합니다.
     """

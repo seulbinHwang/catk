@@ -16,9 +16,7 @@ import pickle
 from typing import Dict, Tuple
 
 import torch
-from omegaconf import DictConfig
 from torch import Tensor
-from torch.distributions import Categorical
 from torch_geometric.data import HeteroData
 
 from src.smart.tokens.agent_token_matching import (
@@ -33,23 +31,35 @@ from src.smart.utils import (
 )
 
 
+def _clean_heading_dense_impl(valid: Tensor, heading: Tensor) -> Tensor:
+    valid_pairs = valid[:, :-1] & valid[:, 1:]
+    cleaned_steps = [heading[:, 0]]
+    prev_heading = heading[:, 0]
+    for i in range(heading.shape[1] - 1):
+        raw_next_heading = heading[:, i + 1]
+        heading_diff = torch.abs(wrap_angle(prev_heading - raw_next_heading))
+        change_needed = (heading_diff > 1.5) & valid_pairs[:, i]
+        next_heading = torch.where(change_needed, prev_heading, raw_next_heading)
+        cleaned_steps.append(next_heading)
+        prev_heading = next_heading
+    return torch.stack(cleaned_steps, dim=1)
+
+
 class TokenProcessor(torch.nn.Module):
 
     def __init__(
         self,
         map_token_file: str,
         agent_token_file: str,
-        map_token_sampling: DictConfig,
-        agent_token_sampling: DictConfig,
     ) -> None:
         super(TokenProcessor, self).__init__()
-        self.map_token_sampling = map_token_sampling
-        self.agent_token_sampling = agent_token_sampling
         self.shift = 5
 
         module_dir = os.path.dirname(__file__)
-        self.init_agent_token(os.path.join(module_dir, agent_token_file))
-        self.init_map_token(os.path.join(module_dir, map_token_file))
+        self.agent_token_file_path = os.path.join(module_dir, agent_token_file)
+        self.map_token_file_path = os.path.join(module_dir, map_token_file)
+        self.init_agent_token(self.agent_token_file_path)
+        self.init_map_token(self.map_token_file_path)
         self.n_token_agent = self.agent_token_all_veh.shape[0]
 
     @torch.no_grad()
@@ -99,20 +109,7 @@ class TokenProcessor(torch.nn.Module):
             dim=(-2, -1),
         )  # [n_pl, n_token]
 
-        if self.training and (self.map_token_sampling.num_k > 1):
-            topk_dists, topk_indices = torch.topk(
-                dist,
-                self.map_token_sampling.num_k,
-                dim=-1,
-                largest=False,
-                sorted=False,
-            )  # [n_pl, K]
-
-            topk_logits = (-1e-6 - topk_dists) / self.map_token_sampling.temp
-            _samples = Categorical(logits=topk_logits).sample()  # [n_pl] in K
-            token_idx = topk_indices[torch.arange(len(_samples)), _samples].contiguous()
-        else:
-            token_idx = torch.argmin(dist, dim=-1)
+        token_idx = torch.argmin(dist, dim=-1)
 
         tokenized_map = {
             "position": traj_pos[:, 0].contiguous(),  # [n_pl, 2]
@@ -325,86 +322,77 @@ class TokenProcessor(torch.nn.Module):
                 coarse 간격 기준의 정답 토큰과 샘플 토큰, 그리고 실제 coarse 상태를 담은 사전입니다.
                 모든 항목의 첫 차원은 ``n_agent`` 이고 두 번째 차원은 ``n_step_token`` 입니다.
         """
-        num_k = self.agent_token_sampling.num_k if self.training else 1
-        _, n_step = valid.shape
+        n_agent, n_step = valid.shape
+        device = pos.device
 
-        prev_pos = pos[:, 0].clone()  # [n_agent, 2]
-        prev_head = heading[:, 0].clone()  # [n_agent]
-        prev_pos_sample = prev_pos.clone()
-        prev_head_sample = prev_head.clone()
+        coarse_end_steps = torch.arange(self.shift, n_step, self.shift, device=device)
+        n_token_step = int(coarse_end_steps.numel())
+        if n_token_step == 0:
+            empty_bool = valid.new_zeros((n_agent, 0))
+            empty_idx = torch.zeros((n_agent, 0), device=device, dtype=torch.long)
+            empty_pos = pos.new_zeros((n_agent, 0, 2))
+            empty_heading = heading.new_zeros((n_agent, 0))
+            return {
+                "valid_mask": empty_bool,
+                "gt_idx": empty_idx,
+                "gt_pos": empty_pos,
+                "gt_heading": empty_heading,
+                "sampled_idx": empty_idx,
+                "sampled_pos": empty_pos,
+                "sampled_heading": empty_heading,
+            }
 
-        out_dict = {
-            "valid_mask": [],
-            "gt_idx": [],
-            "gt_pos": [],
-            "gt_heading": [],
-            "sampled_idx": [],
-            "sampled_pos": [],
-            "sampled_heading": [],
-        }
+        coarse_start_steps = coarse_end_steps - self.shift
+        window_offsets = torch.arange(self.shift + 1, device=device)
+        segment_step_index = coarse_start_steps.unsqueeze(1) + window_offsets.unsqueeze(0)
 
-        for i in range(self.shift, n_step, self.shift):
-            segment_valid_mask = valid[:, i - self.shift : i + 1].all(dim=1)
-            invalid_mask = ~segment_valid_mask
-            out_dict["valid_mask"].append(segment_valid_mask)
+        segment_valid_mask = valid[:, segment_step_index].all(dim=-1)
+        invalid_mask = ~segment_valid_mask
 
-            gt_contour_local = self._build_local_contour_sequence(
-                pos_seq=pos[:, i - self.shift : i + 1],
-                heading_seq=heading[:, i - self.shift : i + 1],
-                ref_pos=prev_pos,
-                ref_head=prev_head,
+        token_idx_gt = torch.zeros(
+            (n_agent, n_token_step),
+            device=device,
+            dtype=torch.long,
+        )
+        valid_flat = segment_valid_mask.reshape(-1)
+        if bool(valid_flat.any().item()):
+            gt_contour_local = self._build_local_contour_windows(
+                pos=pos,
+                heading=heading,
                 agent_shape=agent_shape,
+                coarse_start_steps=coarse_start_steps,
+                segment_step_index=segment_step_index,
             )
-            token_idx_gt = self._match_token_idx_from_local_contour(
-                agent_type=agent_type,
-                contour_local=gt_contour_local,
+            flat_agent_type = (
+                agent_type.unsqueeze(1)
+                .expand(-1, n_token_step)
+                .reshape(-1)
+            )
+            token_idx_gt_flat = token_idx_gt.reshape(-1)
+            token_idx_gt_flat[valid_flat] = self._match_token_idx_from_local_contour(
+                agent_type=flat_agent_type[valid_flat],
+                contour_local=gt_contour_local.reshape(
+                    n_agent * n_token_step,
+                    self.shift + 1,
+                    4,
+                    2,
+                )[valid_flat],
                 reduction="sum",
-                num_k=1,
-                sample_topk=False,
-            ).masked_fill(invalid_mask, 0)
-
-            prev_head = heading[:, i].clone()
-            prev_pos = pos[:, i].clone()
-
-            out_dict["gt_idx"].append(token_idx_gt)
-            out_dict["gt_pos"].append(prev_pos.masked_fill(invalid_mask.unsqueeze(1), 0.0))
-            out_dict["gt_heading"].append(prev_head.masked_fill(invalid_mask, 0.0))
-
-            if num_k == 1:
-                out_dict["sampled_idx"].append(out_dict["gt_idx"][-1])
-                out_dict["sampled_pos"].append(out_dict["gt_pos"][-1])
-                out_dict["sampled_heading"].append(out_dict["gt_heading"][-1])
-                prev_pos_sample = pos[:, i].clone()
-                prev_head_sample = heading[:, i].clone()
-                continue
-
-            sampled_contour_local = self._build_local_contour_sequence(
-                pos_seq=pos[:, i - self.shift : i + 1],
-                heading_seq=heading[:, i - self.shift : i + 1],
-                ref_pos=prev_pos_sample,
-                ref_head=prev_head_sample,
-                agent_shape=agent_shape,
             )
-            token_idx_sample = self._match_token_idx_from_local_contour(
-                agent_type=agent_type,
-                contour_local=sampled_contour_local,
-                reduction="mean",
-                num_k=num_k,
-                sample_topk=True,
-            ).masked_fill(invalid_mask, 0)
+            token_idx_gt = token_idx_gt_flat.view(n_agent, n_token_step)
 
-            prev_head_sample = heading[:, i].clone()
-            prev_pos_sample = pos[:, i].clone()
+        gt_pos = pos[:, coarse_end_steps].masked_fill(invalid_mask.unsqueeze(-1), 0.0)
+        gt_heading = heading[:, coarse_end_steps].masked_fill(invalid_mask, 0.0)
 
-            out_dict["sampled_idx"].append(token_idx_sample)
-            out_dict["sampled_pos"].append(
-                prev_pos_sample.masked_fill(invalid_mask.unsqueeze(1), 0.0)
-            )
-            out_dict["sampled_heading"].append(
-                prev_head_sample.masked_fill(invalid_mask, 0.0)
-            )
-
-        return {k: torch.stack(v, dim=1) for k, v in out_dict.items()}
+        return {
+            "valid_mask": segment_valid_mask,
+            "gt_idx": token_idx_gt,
+            "gt_pos": gt_pos,
+            "gt_heading": gt_heading,
+            "sampled_idx": token_idx_gt,
+            "sampled_pos": gt_pos,
+            "sampled_heading": gt_heading,
+        }
 
     def _build_agent_type_masks(self, agent_type: Tensor) -> Dict[str, Tensor]:
         """차종별 마스크를 한 번에 만듭니다.
@@ -482,13 +470,58 @@ class TokenProcessor(torch.nn.Module):
         )
         return contour_local_flat.view(pos_seq.shape[0], pos_seq.shape[1], 4, 2)
 
+    def _build_local_contour_windows(
+        self,
+        pos: Tensor,
+        heading: Tensor,
+        agent_shape: Tensor,
+        coarse_start_steps: Tensor,
+        segment_step_index: Tensor,
+    ) -> Tensor:
+        """모든 coarse segment의 local contour를 한 번에 만듭니다.
+
+        Args:
+            pos: 전체 중심점입니다. shape은 ``[n_agent, n_step, 2]`` 입니다.
+            heading: 전체 방향입니다. shape은 ``[n_agent, n_step]`` 입니다.
+            agent_shape: 토큰화에 쓰는 고정 가로, 세로 크기입니다.
+                shape은 ``[n_agent, 2]`` 입니다.
+            coarse_start_steps: 각 coarse segment의 시작 raw step입니다.
+                shape은 ``[n_token_step]`` 입니다.
+            segment_step_index: 각 coarse segment가 참조하는 raw step index입니다.
+                shape은 ``[n_token_step, shift + 1]`` 입니다.
+
+        Returns:
+            Tensor:
+                local 좌표의 사각형 경로입니다.
+                shape은 ``[n_agent, n_token_step, shift + 1, 4, 2]`` 입니다.
+        """
+        n_agent = pos.shape[0]
+        n_token_step = int(coarse_start_steps.numel())
+        n_seq = int(segment_step_index.shape[1])
+
+        pos_seq = pos[:, segment_step_index]
+        heading_seq = heading[:, segment_step_index]
+        contour_global = cal_polygon_contour(
+            pos=pos_seq,
+            head=heading_seq,
+            width_length=agent_shape[:, None, None],
+        )
+
+        ref_pos = pos[:, coarse_start_steps].reshape(n_agent * n_token_step, 2)
+        ref_head = heading[:, coarse_start_steps].reshape(n_agent * n_token_step)
+        contour_local_flat, _ = transform_to_local(
+            pos_global=contour_global.reshape(n_agent * n_token_step, n_seq * 4, 2),
+            head_global=None,
+            pos_now=ref_pos,
+            head_now=ref_head,
+        )
+        return contour_local_flat.view(n_agent, n_token_step, n_seq, 4, 2)
+
     def _match_token_idx_from_local_contour(
         self,
         agent_type: Tensor,
         contour_local: Tensor,
         reduction: str,
-        num_k: int,
-        sample_topk: bool,
     ) -> Tensor:
         """로컬 좌표에서 바로 토큰 번호를 고릅니다.
 
@@ -498,8 +531,6 @@ class TokenProcessor(torch.nn.Module):
                 기본 shape은 ``[n_agent, 6, 4, 2]`` 이고, 호환을 위해
                 ``[n_agent, 4, 2]`` 도 받을 수 있습니다.
             reduction: 점별 거리를 ``sum`` 또는 ``mean`` 으로 줄이는 방법입니다.
-            num_k: 샘플 후보 개수입니다.
-            sample_topk: True면 top-k 안에서 하나를 뽑고, False면 가장 가까운 하나만 고릅니다.
 
         Returns:
             Tensor:
@@ -512,9 +543,6 @@ class TokenProcessor(torch.nn.Module):
             token_bank_all_ped=self.agent_token_all_ped,
             token_bank_all_cyc=self.agent_token_all_cyc,
             reduction=reduction,
-            num_k=num_k,
-            sample_topk=sample_topk,
-            sampling_temp=float(self.agent_token_sampling.temp),
         )
 
     def _token_pose_from_index(
@@ -563,12 +591,7 @@ class TokenProcessor(torch.nn.Module):
 
     @staticmethod
     def _clean_heading(valid: Tensor, heading: Tensor) -> Tensor:
-        valid_pairs = valid[:, :-1] & valid[:, 1:]
-        for i in range(heading.shape[1] - 1):
-            heading_diff = torch.abs(wrap_angle(heading[:, i] - heading[:, i + 1]))
-            change_needed = (heading_diff > 1.5) & valid_pairs[:, i]
-            heading[:, i + 1][change_needed] = heading[:, i][change_needed]
-        return heading
+        return _clean_heading_dense_impl(valid=valid, heading=heading)
 
     def _extrapolate_agent_to_prev_token_step(
         self,
@@ -579,19 +602,37 @@ class TokenProcessor(torch.nn.Module):
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         # [n_agent], max will give the first True step
         first_valid_step = torch.max(valid, dim=1).indices
+        n_step_to_extrapolate = first_valid_step.remainder(self.shift)
 
-        for i, t in enumerate(first_valid_step):  # extrapolate to previous 5th step.
-            n_step_to_extrapolate = t % self.shift
-            if (t == 10) and (not valid[i, 10 - self.shift]):
-                # such that at least one token is valid in the history.
-                n_step_to_extrapolate = self.shift
+        prev_token_step = 10 - self.shift
+        if 0 <= prev_token_step < valid.shape[1]:
+            needs_history_token = (first_valid_step == 10) & (~valid[:, prev_token_step])
+            n_step_to_extrapolate = torch.where(
+                needs_history_token,
+                torch.full_like(n_step_to_extrapolate, self.shift),
+                n_step_to_extrapolate,
+            )
 
-            if n_step_to_extrapolate > 0:
-                vel[i, t - n_step_to_extrapolate : t] = vel[i, t]
-                valid[i, t - n_step_to_extrapolate : t] = True
-                heading[i, t - n_step_to_extrapolate : t] = heading[i, t]
+        step_index = torch.arange(valid.shape[1], device=valid.device).unsqueeze(0)
+        fill_start = first_valid_step - n_step_to_extrapolate
+        fill_mask = (
+            (n_step_to_extrapolate > 0).unsqueeze(1)
+            & (step_index >= fill_start.unsqueeze(1))
+            & (step_index < first_valid_step.unsqueeze(1))
+        )
+        if not bool(fill_mask.any().item()):
+            return valid, pos, heading, vel
 
-                for j in range(n_step_to_extrapolate):
-                    pos[i, t - j - 1] = pos[i, t - j] - vel[i, t] * 0.1
+        agent_index, step_index_flat = fill_mask.nonzero(as_tuple=True)
+        source_step = first_valid_step[agent_index]
+        source_vel = vel[agent_index, source_step]
+
+        valid[agent_index, step_index_flat] = True
+        vel[agent_index, step_index_flat] = source_vel
+        heading[agent_index, step_index_flat] = heading[agent_index, source_step]
+        delta_step = (source_step - step_index_flat).to(dtype=pos.dtype).unsqueeze(-1)
+        pos[agent_index, step_index_flat] = (
+            pos[agent_index, source_step] - source_vel * (0.1 * delta_step)
+        )
 
         return valid, pos, heading, vel

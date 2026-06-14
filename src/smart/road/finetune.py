@@ -80,6 +80,16 @@ def build_road_runtime_config(cfg: DictConfig) -> RoadRuntimeConfig:
             "This RoaD implementation is configured for the requested default of "
             f"3 rollouts per scenario, got {generation.rollouts_per_scenario}."
         )
+    if generation.generation_batch_size <= 0:
+        raise ValueError(
+            "RoaD generation_batch_size must be positive, "
+            f"got {generation.generation_batch_size}."
+        )
+    if generation.candidate_micro_batch_size <= 0:
+        raise ValueError(
+            "RoaD candidate_micro_batch_size must be positive, "
+            f"got {generation.candidate_micro_batch_size}."
+        )
     if generation.candidates_per_agent != 64:
         raise ValueError(
             "This RoaD implementation follows the requested K=64 candidate setting, "

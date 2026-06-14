@@ -4,16 +4,22 @@ model_config:
   lr_warmup_steps: 2
   lr_total_steps: ${trainer.max_epochs}
   lr_min_ratio: 0.01
-  n_rollout_closed_val: 8
+  n_rollout_closed_val: 32
   # Optional: set this to the flow-pretrain CPD value only when you want DPR.
   # CPD/CES are always evaluated regardless of this value.
   wosac_cpd_reference: null
+  # Fixed WOSAC-CPD/CES normalization scale from the training cache.
+  # Order: vehicle, pedestrian, cyclist. Validation/test metrics use this
+  # value first; if it is null, validation falls back to GT-derived scale.
+  wosac_distribution_type_scale: [22.3461620418, 4.5793447978, 18.5374388830]
   n_batch_sim_agents_metric: 10
   # Positive values auto-set n_batch_sim_agents_metric from world_size and
   # val_batch_size so scorer work is comparable across GPU counts. Set null or
   # 0 to keep the explicit n_batch_sim_agents_metric value.
-  scorer_scene_num: 840
-  sim_agents_metric_workers: 3
+  scorer_scene_num: 1680
+  # Backward-compatible knob. Fast WOSAC runs on the current torch device and
+  # no longer launches the old official-scorer worker pool.
+  sim_agents_metric_workers: 0
   n_vis_batch: 0
   n_vis_scenario: 0
   n_vis_rollout: 0
@@ -22,79 +28,109 @@ model_config:
   delete_local_videos_after_wandb_upload: false
   val_open_loop: true
   val_closed_loop: true
+  # Train ADE/FDE/yaw ADE/yaw FDE are diagnostics only. Disabling them leaves
+  # loss/backward/validation unchanged and skips the train-time pose metric
+  # conversion cost in open-loop pretrain.
+  train_open_loop_metrics: false
+  # Safety guard for rare automatic-optimization batches with no open-loop
+  # targets. Keep this false unless the selected train split has been scanned
+  # and every sample is known to produce at least one train target.
+  skip_empty_open_loop_optimizer_guard: false
   validation_open_seed: 0
-  validation_closed_seed: 0
+  validation_closed_seed: 4
   token_processor:
     map_token_file: "map_traj_token5.pkl"
     agent_token_file: "agent_vocab_555_s2.pkl"
     flow_window_steps: ${model.model_config.decoder.flow_window_steps}
-    map_token_sampling:
-      num_k: 1
-      temp: 1.0
-    agent_token_sampling:
-      num_k: 1
-      temp: 1.0
+    # false: full-window 미래가 모두 유효한 anchor만 학습합니다.
+    # true: 18-token / 16-anchor pretrain에서 tail anchor의 유효 prefix만 loss를 줍니다.
+    use_prefix_valid_future_loss_mask: true
+    # false이면 기존 pose-space Flow Matching을 그대로 사용합니다.
+    # true이면 GT pose에서 control label을 on-the-fly로 만들고,
+    # Flow Matching은 [delta_s, delta_n, delta_yaw] 제어공간에서 학습합니다.
+    use_kinematic_control_flow: true
+    # false: vehicle/cyclist는 non-holonomic, pedestrian은 holonomic.
+    # true: vehicle/cyclist까지 pedestrian과 같은 holonomic model을 적용합니다.
+    use_holonomic_model_only: false
+    # true: decoder-consistent rolling supervision으로 GT control label을 만듭니다.
+    # false: 각 step의 raw GT pose pair만으로 inverse control label을 만듭니다.
+    # use_holonomic_model_only=true일 때는 두 방식이 같은 target을 만듭니다.
+    use_rolling_supervision: true
+    control_pos_scale_m: 1.0
+    # vehicle/cyclist의 non-holonomic no-slip point를 box center 뒤쪽으로
+    # box length * 이 비율만큼 옮깁니다. 값은 전체 SMART cache training split에서 추정했습니다.
+    control_vehicle_no_slip_point_ratio: 0.2289518863
+    control_cyclist_no_slip_point_ratio: 0.0495847873
+    # control-space yaw normalization is agent type-aware and config-managed.
+    control_vehicle_yaw_scale_rad: 0.025
+    control_pedestrian_yaw_scale_rad: 0.20
+    control_cyclist_yaw_scale_rad: 0.06
+    # control-space 학습에서 GT -> control -> pose 복원 위치 오차가 이 값보다 큰 anchor는 학습에서 제외합니다.
+    control_round_trip_max_position_error_m: 0.5
+    # Optional deterministic training sidecar. When enabled, precomputed
+    # tokenized map/agent and flow target tensors are loaded by scenario id.
+    # The sidecar path is additionally namespaced by token vocab + flow config hash.
+    flow_target_sidecar_dir: ""
+    flow_target_sidecar_read: true
+    flow_target_sidecar_write: false
+    flow_target_sidecar_required: true
   validation_rollout_sampling:
-    sample_steps: 32
+    sample_steps: 16
     sample_method: euler
     noise_scale: 1.0
-  draft:
-    enabled: false
-    start_epoch: 0
-    ramp_epochs: 4
-    max_weight: 1.0
-    sampling:
-      sample_steps: 32
-      sample_method: euler
-      noise_scale: 1.0
-      random_terminal_step:
-        enabled: true
-        scope: global_batch
-        # paper_uniform: 실행 denoising step K를 min_executed_steps..sample_steps 범위에서 균등 샘플링합니다.
-        policy: paper_uniform
-        min_executed_steps: 24
-    physics:
-      force_fp32: true
-      dt: 0.1
-      pos_scale_m: 20.0
-      speed_floor_mps: 0.5
-      vehicle_v_max_mps: 35.0
-      vehicle_a_max_mps2: 8.0
-      vehicle_lat_accel_max_mps2: 4.2
-      bicycle_v_max_mps: 22.0
-      bicycle_a_max_mps2: 5.5
-      bicycle_lat_accel_max_mps2: 4.4
-      pedestrian_v_max_mps: 5.0
-      pedestrian_a_max_mps2: 4.7
-      vehicle_wheelbase_scale: 0.60
-      bicycle_wheelbase_scale: 0.85
-      vehicle_steer_max_rad: 0.55
-      bicycle_steer_max_rad: 0.90
-      vehicle_steer_rate_max_radps: 0.8
-      bicycle_steer_rate_max_radps: 1.4
-      soft_weight: 0.25
-      compare_softness_to_gt: false
-      pedestrian_heading_weight: 0.05
-      pedestrian_heading_speed_threshold_mps: 0.5
-      eps: 1.0e-6
+    antithetic_pairs: true
+    stratified_gaussian_noise: false
   self_forced:
     enabled: false
     start_epoch: 0
     weight: 1.0
-    path_step_size: 0.05
     anchor_weight: 0.05
     use_anchor_flow_matching_loss: false
+    # false이면 self-rollout, generated-estimator update, DMD/SID loss, estimator warmup을 모두 생략하고
+    # use_anchor_flow_matching_loss=true일 때의 anchor FM loss만 self-forced optimizer로 학습합니다.
+    use_distribution_matching_loss: true
     distribution_matching_objective: dmd
+    beta: 1.0
+    # 기본 DMD guidance는 self-forced objective와 같은 control-space에서 판단합니다.
+    # true로 override하면 pose-space에서 direction/filter를 계산한 뒤 control-space target으로 되돌립니다.
+    project_dmd_to_pose_space: false
+    # Clean-DMD direction filters. These apply identically to pose-projected
+    # and direct control-space DMD paths.
+    dmd_use_stable_scale_filter: true
+    # Stable scale sharing scope: agent, type, or scene.
+    # agent means each agent keeps its own stable scale.
+    dmd_stable_scale_scope: agent
+    dmd_use_teacher_alignment_filter: false
+    dmd_use_trust_region_filter: false
+    dmd_use_injection_ramp: false
+    clean_dmd_normalizer_eps: 0.05
     sid_alpha: 1.0
     sid_normalizer_eps: 1.0e-3
     detach_block_transition: false
-    # Self-forced training rollout 전용 stop-motion gate입니다. Validation /
-    # test / submission inference는 decoder.use_stop_motion을 따릅니다.
+    # Stop-motion gate는 전 경로에서 사용하지 않습니다. 값은 false로 고정합니다.
     use_stop_motion: false
+    generated_estimator_lr: ${model.model_config.lr}
     estimator_updates_per_step: 5
     estimator_warmup_epochs: 0
+    # Optional generated-estimator warmup bank.
+    # When generated_estimator_init_path points to a bank entry, only the
+    # generated estimator is loaded from that file. Generator, teacher,
+    # optimizer, epoch, and global step still come from ckpt_path/action.
+    generated_estimator_init_path: ""
+    generated_estimator_init_strict: true
+    generated_estimator_skip_warmup_on_load: true
+    # When warmup must actually run, rank 0 can save the warmup-complete
+    # generated estimator here. Launch scripts may upload it to a W&B bank.
+    generated_estimator_bank_snapshot_path: ""
+    generated_estimator_bank_target_warmup_epochs: 0
+    generated_estimator_bank_loaded_warmup_epochs: 0
+    generated_estimator_bank_upload_artifact: ""
+    generated_estimator_bank_upload_on_warmup_end: false
+    # Reuse the frozen map encoder output inside a self-forced train step.
+    # This is enabled only when the decoder map encoder is actually frozen.
+    cache_frozen_map_features: true
     initialize_aux_from_generator_on_fit_start: true
-    unfrozen_range: except_map_encoder
+    unfrozen_range: middle
     ema_weight: 0.99
     ema_start_step: 50
     # Manual gradient clip used inside self-forced training_step / estimator
@@ -103,46 +139,21 @@ model_config:
     # applies clip_gradients() itself.
     gradient_clip_val: 1.0
     sampling:
-      sample_steps: 32
+      sample_steps: 16
       sample_method: euler
       noise_scale: 1.0
+      backprop_last_k: 8
       random_terminal_step:
         enabled: true
         scope: global_batch
         # paper_uniform: 실행 denoising step K를 min_executed_steps..sample_steps 범위에서 균등 샘플링합니다.
         policy: paper_uniform
-        min_executed_steps: 24
-    use_control_space_physics_regularization: false
-    physics_weight: 0.005
-    physics:
-      force_fp32: true
-      dt: 0.1
-      pos_scale_m: 20.0
-      speed_floor_mps: 0.5
-      vehicle_v_max_mps: 35.0
-      vehicle_a_max_mps2: 8.0
-      vehicle_lat_accel_max_mps2: 4.2
-      bicycle_v_max_mps: 22.0
-      bicycle_a_max_mps2: 5.5
-      bicycle_lat_accel_max_mps2: 4.4
-      pedestrian_v_max_mps: 5.0
-      pedestrian_a_max_mps2: 4.7
-      vehicle_wheelbase_scale: 0.60
-      bicycle_wheelbase_scale: 0.85
-      vehicle_steer_max_rad: 0.55
-      bicycle_steer_max_rad: 0.90
-      vehicle_steer_rate_max_radps: 0.8
-      bicycle_steer_rate_max_radps: 1.4
-      soft_weight: 0.25
-      compare_softness_to_gt: false
-      pedestrian_heading_weight: 0.05
-      pedestrian_heading_speed_threshold_mps: 0.5
-      eps: 1.0e-6
+        min_executed_steps: 16
   decoder:
     hidden_dim: 128
-    num_freq_bands: 64
+    num_freq_bands: 32
     num_heads: 8
-    head_dim: 15
+    head_dim: 16
     dropout: 0.1
     hist_drop_prob: 0.1
     num_map_layers: 3
@@ -153,16 +164,30 @@ model_config:
     time_span: 30
     num_historical_steps: 11
     num_future_steps: 80
-    flow_window_steps: 30
+    flow_window_steps: 20
     flow_dim: 96
     flow_num_chunk_heads: 4
     flow_num_chunk_layers: 2
     flow_solver_steps: 32
     flow_solver_method: euler
     flow_solver_eps: 1.0e-3
+    # Training-only metric memory control. It does not change loss/target/model
+    # capacity and only detaches train metric clean reconstruction graphs.
+    detach_train_metric_clean: false
+    # 아래 control-space 공유 설정은 token_processor 값을 단일 기준으로 사용합니다.
+    # decoder 쪽만 다른 값으로 override하면 SMARTFlow 초기화 단계에서 에러를 냅니다.
+    use_kinematic_control_flow: ${model.model_config.token_processor.use_kinematic_control_flow}
+    use_holonomic_model_only: ${model.model_config.token_processor.use_holonomic_model_only}
+    use_rolling_supervision: ${model.model_config.token_processor.use_rolling_supervision}
+    control_pos_scale_m: ${model.model_config.token_processor.control_pos_scale_m}
+    control_vehicle_no_slip_point_ratio: ${model.model_config.token_processor.control_vehicle_no_slip_point_ratio}
+    control_cyclist_no_slip_point_ratio: ${model.model_config.token_processor.control_cyclist_no_slip_point_ratio}
+    control_vehicle_yaw_scale_rad: ${model.model_config.token_processor.control_vehicle_yaw_scale_rad}
+    control_pedestrian_yaw_scale_rad: ${model.model_config.token_processor.control_pedestrian_yaw_scale_rad}
+    control_cyclist_yaw_scale_rad: ${model.model_config.token_processor.control_cyclist_yaw_scale_rad}
     closed_loop_rollout_mode: raw_fm # raw_fm | matched_token_chunk
     use_lqr: false
-    use_stop_motion: true
+    use_stop_motion: false
     lqr_commit:
       dt: 0.1
       history_steps: 6

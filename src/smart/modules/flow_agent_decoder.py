@@ -1,22 +1,27 @@
 from __future__ import annotations
 
-import os
 from typing import Dict
 
 import torch
 from omegaconf import DictConfig
 from torch_cluster import radius_graph
-from torch_geometric.utils import subgraph
 
 from src.smart.layers.fourier_embedding import FourierEmbedding
 from src.smart.modules.agent_encoder import SMARTAgentEncoder
-from src.smart.modules.dynamic_light_time import build_constant_light_time_delta_norm
 from src.smart.modules.flow_local_decoder import (
     ContinuousCommitBridge,
     FlowODE,
     HierarchicalFlowDecoder,
     LQRCommitBridgeConfig,
 )
+from src.smart.modules.kinematic_control import (
+    CONTROL_FLOW_DIM,
+    POSE_FLOW_DIM,
+    control_norm_to_pose_norm,
+    validate_control_no_slip_ratio_config,
+    validate_control_yaw_scale_config,
+)
+from src.smart.modules.dynamic_light_time import build_constant_light_time_delta_norm
 from src.smart.modules.self_forced_rollout_detach import (
     detach_training_rollout_state,
 )
@@ -53,10 +58,20 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         flow_solver_steps: int,
         flow_solver_method: str,
         flow_solver_eps: float,
+        use_kinematic_control_flow: bool = False,
+        use_holonomic_model_only: bool = False,
+        use_rolling_supervision: bool = True,
+        control_pos_scale_m: float = 1.0,
+        control_vehicle_yaw_scale_rad: float | None = None,
+        control_pedestrian_yaw_scale_rad: float | None = None,
+        control_cyclist_yaw_scale_rad: float | None = None,
+        control_vehicle_no_slip_point_ratio: float = 0.0,
+        control_cyclist_no_slip_point_ratio: float = 0.0,
         closed_loop_rollout_mode: str = "raw_fm",
         use_lqr: bool = False,
         use_stop_motion: bool = False,
         lqr_commit: DictConfig | None = None,
+        detach_train_metric_clean: bool = False,
     ) -> None:
         super().__init__(
             hidden_dim=hidden_dim,
@@ -78,8 +93,34 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             commit_steps=self.shift,
             num_future_steps=num_future_steps,
         )
+        self.use_kinematic_control_flow = bool(use_kinematic_control_flow)
+        self.use_holonomic_model_only = bool(use_holonomic_model_only)
+        self.use_rolling_supervision = bool(use_rolling_supervision)
+        self.detach_train_metric_clean = bool(detach_train_metric_clean)
+        self.control_pos_scale_m = float(control_pos_scale_m)
+        self.control_vehicle_yaw_scale_rad = control_vehicle_yaw_scale_rad
+        self.control_pedestrian_yaw_scale_rad = control_pedestrian_yaw_scale_rad
+        self.control_cyclist_yaw_scale_rad = control_cyclist_yaw_scale_rad
+        (
+            self.control_vehicle_no_slip_point_ratio,
+            self.control_cyclist_no_slip_point_ratio,
+        ) = validate_control_no_slip_ratio_config(
+            vehicle_no_slip_point_ratio=control_vehicle_no_slip_point_ratio,
+            cyclist_no_slip_point_ratio=control_cyclist_no_slip_point_ratio,
+        )
+        if self.use_kinematic_control_flow:
+            (
+                self.control_vehicle_yaw_scale_rad,
+                self.control_pedestrian_yaw_scale_rad,
+                self.control_cyclist_yaw_scale_rad,
+            ) = validate_control_yaw_scale_config(
+                vehicle_yaw_scale_rad=self.control_vehicle_yaw_scale_rad,
+                pedestrian_yaw_scale_rad=self.control_pedestrian_yaw_scale_rad,
+                cyclist_yaw_scale_rad=self.control_cyclist_yaw_scale_rad,
+            )
+        self.flow_state_dim = CONTROL_FLOW_DIM if self.use_kinematic_control_flow else POSE_FLOW_DIM
         self.r_a2a_emb = FourierEmbedding(
-            input_dim=6,
+            input_dim=3,
             hidden_dim=hidden_dim,
             num_freq_bands=num_freq_bands,
         )
@@ -90,6 +131,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             num_chunk_heads=flow_num_chunk_heads,
             num_chunk_layers=flow_num_chunk_layers,
             chunk_size=self.shift,
+            flow_state_dim=self.flow_state_dim,
         )
         self.flow_ode = FlowODE(
             eps=flow_solver_eps,
@@ -103,7 +145,10 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             )
         self.closed_loop_rollout_mode = closed_loop_rollout_mode
         self.use_lqr = bool(use_lqr)
-        self.use_stop_motion = bool(use_stop_motion)
+        # Stop-motion gating is intentionally disabled for every experiment in
+        # this branch. Keep the constructor argument for checkpoint/config
+        # compatibility, but never let a Hydra override re-enable it.
+        self.use_stop_motion = False
         lqr_commit_cfg = LQRCommitBridgeConfig(
             dt=float(getattr(lqr_commit, "dt", 0.1)) if lqr_commit is not None else 0.1,
             history_steps=int(getattr(lqr_commit, "history_steps", 6)) if lqr_commit is not None else 6,
@@ -126,9 +171,28 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         self.commit_bridge = ContinuousCommitBridge(
             commit_steps=self.shift,
             use_lqr=self.use_lqr,
-            use_stop_motion=self.use_stop_motion,
+            use_stop_motion=False,
             config=lqr_commit_cfg,
+            use_kinematic_control_flow=self.use_kinematic_control_flow,
+            use_holonomic_model_only=self.use_holonomic_model_only,
+            control_pos_scale_m=self.control_pos_scale_m,
+            control_vehicle_yaw_scale_rad=self.control_vehicle_yaw_scale_rad,
+            control_pedestrian_yaw_scale_rad=self.control_pedestrian_yaw_scale_rad,
+            control_cyclist_yaw_scale_rad=self.control_cyclist_yaw_scale_rad,
+            control_vehicle_no_slip_point_ratio=self.control_vehicle_no_slip_point_ratio,
+            control_cyclist_no_slip_point_ratio=self.control_cyclist_no_slip_point_ratio,
         )
+
+    def _run_attention_layer(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        r: torch.Tensor | None,
+        edge_index: torch.Tensor,
+        layer_idx: int,
+    ) -> torch.Tensor:
+        del layer_idx
+        return layer(x, r, edge_index)
 
     def build_interaction_edge(
         self,
@@ -137,62 +201,33 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         head_vector_a: torch.Tensor,
         batch_s: torch.Tensor,
         mask: torch.Tensor,
-        motion_a: torch.Tensor | None = None,
-        motion_valid_a: torch.Tensor | None = None,
     ):
         mask_flat = mask.transpose(0, 1).reshape(-1)
         pos_s = pos_a.transpose(0, 1).flatten(0, 1)
         head_s = head_a.transpose(0, 1).reshape(-1)
         head_vector_s = head_vector_a.transpose(0, 1).reshape(-1, 2)
 
-        if motion_a is None:
-            motion_a = self._build_motion_vector(pos_a, mask)
-            motion_valid_a = self._build_motion_valid_mask(pos_a, mask)
-        else:
-            if motion_a.shape != pos_a.shape:
-                raise ValueError(
-                    "motion_a shape must match pos_a shape, "
-                    f"got {tuple(motion_a.shape)} and {tuple(pos_a.shape)}"
-                )
-            if motion_valid_a is None:
-                motion_valid_a = torch.ones(
-                    motion_a.shape[:2],
-                    device=motion_a.device,
-                    dtype=torch.bool,
-                )
-            elif tuple(motion_valid_a.shape) != tuple(motion_a.shape[:2]):
-                raise ValueError(
-                    "motion_valid_a shape must match the first two dimensions of motion_a, "
-                    f"got {tuple(motion_valid_a.shape)} and {tuple(motion_a.shape[:2])}"
-                )
-        motion_valid_a = motion_valid_a.bool()
-        motion_s = motion_a.transpose(0, 1).reshape(-1, 2)
-        motion_valid_s = motion_valid_a.transpose(0, 1).reshape(-1)
+        valid_node_idx = torch.nonzero(mask_flat, as_tuple=False).flatten()
+        if valid_node_idx.numel() == 0:
+            edge_index_a2a = torch.empty(2, 0, device=pos_a.device, dtype=torch.long)
+            r_a2a = self.r_a2a_emb(
+                continuous_inputs=pos_a.new_zeros((0, self.r_a2a_emb.input_dim)),
+                categorical_embs=None,
+            )
+            return edge_index_a2a, r_a2a
 
+        pos_valid = pos_s[valid_node_idx]
+        batch_valid = batch_s[valid_node_idx]
         edge_index_a2a = radius_graph(
-            x=pos_s[:, :2],
+            x=pos_valid[:, :2],
             r=self.a2a_radius,
-            batch=batch_s,
+            batch=batch_valid,
             loop=False,
             max_num_neighbors=300,
         )
-        edge_index_a2a = subgraph(subset=mask_flat, edge_index=edge_index_a2a)[0]
+        edge_index_a2a = valid_node_idx[edge_index_a2a]
         rel_pos_a2a = pos_s[edge_index_a2a[0]] - pos_s[edge_index_a2a[1]]
         rel_head_a2a = wrap_angle(head_s[edge_index_a2a[0]] - head_s[edge_index_a2a[1]])
-
-        # Use coarse-step relative displacement instead of raw m/s velocity so the
-        # added relation channels stay on a meter-scale comparable to the existing
-        # distance feature without introducing another global normalization rule.
-        rel_motion = motion_s[edge_index_a2a[0]] - motion_s[edge_index_a2a[1]]
-        recv_head = head_s[edge_index_a2a[1]]
-        recv_cos = recv_head.cos()
-        recv_sin = recv_head.sin()
-        rel_motion_long = rel_motion[:, 0] * recv_cos + rel_motion[:, 1] * recv_sin
-        rel_motion_lat = -rel_motion[:, 0] * recv_sin + rel_motion[:, 1] * recv_cos
-        rel_motion_valid = (
-            motion_valid_s[edge_index_a2a[0]]
-            & motion_valid_s[edge_index_a2a[1]]
-        )
 
         r_a2a = torch.stack(
             [
@@ -202,9 +237,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     nbr_vector=rel_pos_a2a[:, :2],
                 ),
                 rel_head_a2a,
-                rel_motion_long,
-                rel_motion_lat,
-                rel_motion_valid.to(dtype=rel_motion_long.dtype),
             ],
             dim=-1,
         )
@@ -235,70 +267,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             * num_graphs
         )
         return batch.repeat(num_steps) + step_offsets
-
-    def _build_rollout_light_time_delta_norm(
-        self,
-        *,
-        num_agent: int,
-        device: torch.device,
-        dtype: torch.dtype,
-        rollout_step_index: int,
-    ) -> torch.Tensor:
-        """closed-loop rollout에서 현재 신호가 얼마나 오래된 정보인지 만듭니다.
-
-        Args:
-            num_agent: 현재 batch 안 agent 수입니다.
-            device: 반환 tensor를 둘 장치입니다.
-            dtype: 반환 tensor 자료형입니다.
-            rollout_step_index: 0.5초 rollout block 번호입니다. 첫 block은 0입니다.
-
-        Returns:
-            torch.Tensor: 모든 agent에 대한 정규화된 신호 시간 차입니다.
-                shape은 ``[num_agent, 1]`` 입니다.
-        """
-        delta_seconds = float(rollout_step_index) * float(self.shift) * 0.1
-        return build_constant_light_time_delta_norm(
-            num_agents=num_agent,
-            num_steps=1,
-            delta_seconds=delta_seconds,
-            device=device,
-            dtype=dtype,
-        )
-
-    @staticmethod
-    def _build_recent_coarse_motion(
-        pos_window: torch.Tensor,
-        valid_window: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """마지막 두 coarse 상태 차이로 최근 이동량을 만듭니다.
-
-        Args:
-            pos_window: 최근 coarse 중심점 창입니다.
-                shape은 ``[n_agent, n_step, 2]`` 입니다.
-            valid_window: 같은 창의 유효 여부입니다.
-                shape은 ``[n_agent, n_step]`` 입니다.
-
-        Returns:
-            tuple[torch.Tensor, torch.Tensor]:
-                각 agent의 최근 coarse 이동량과 그 유효 여부입니다.
-                shape은 각각 ``[n_agent, 2]`` 와 ``[n_agent]`` 입니다.
-                마지막 두 상태가 모두 유효하지 않으면 이동량은 0, 유효 여부는
-                ``False`` 로 둡니다.
-        """
-        recent_motion = pos_window.new_zeros((pos_window.shape[0], pos_window.shape[-1]))
-        recent_motion_valid = torch.zeros(
-            pos_window.shape[0],
-            device=pos_window.device,
-            dtype=torch.bool,
-        )
-        if pos_window.shape[1] < 2:
-            return recent_motion, recent_motion_valid
-
-        recent_motion_valid = valid_window[:, -1] & valid_window[:, -2]
-        recent_motion[recent_motion_valid] = (
-            pos_window[recent_motion_valid, -1] - pos_window[recent_motion_valid, -2]
-        )
-        return recent_motion, recent_motion_valid
 
     def _build_initial_exec_state_history(
         self,
@@ -423,8 +391,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
 
         Args:
             anchor_hidden: context encoder 출력입니다.
-                shape은 ``[n_agent, 13, hidden_dim]`` 입니다.
-            anchor_mask: 유효 anchor 여부입니다. shape은 ``[n_agent, 13]`` 입니다.
+                shape은 ``[n_agent, n_anchor, hidden_dim]`` 입니다.
+            anchor_mask: 유효 anchor 여부입니다. shape은 ``[n_agent, n_anchor]`` 입니다.
 
         Returns:
             torch.Tensor:
@@ -446,9 +414,27 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         map_feature: Dict[str, torch.Tensor],
         anchor_mask: torch.Tensor,
         flow_clean_norm: torch.Tensor,
+        flow_agent_type: torch.Tensor | None = None,
+        flow_agent_length: torch.Tensor | None = None,
         flow_loss_mask: torch.Tensor | None = None,
+        flow_clean_metric_norm: torch.Tensor | None = None,
+        compute_metric_outputs: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """Open-loop anchor sampling에 필요한 context hidden만 계산합니다."""
+        if not compute_metric_outputs:
+            flow_clean_metric_norm = None
+        if flow_clean_metric_norm is not None:
+            expected_metric_shape = tuple(flow_clean_norm.shape[:2]) + (POSE_FLOW_DIM,)
+            if tuple(flow_clean_metric_norm.shape) != expected_metric_shape:
+                raise ValueError(
+                    "flow_clean_metric_norm must be raw pose-space target with shape "
+                    f"{expected_metric_shape}, got {tuple(flow_clean_metric_norm.shape)}."
+                )
+            flow_clean_metric_norm = flow_clean_metric_norm.to(
+                device=flow_clean_norm.device,
+                dtype=flow_clean_norm.dtype,
+            )
+
         ctx_hidden_pack = self._encode_context(
             agent_token_index=tokenized_agent["ctx_sampled_idx"],
             pos_a=tokenized_agent["ctx_sampled_pos"],
@@ -457,16 +443,72 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
         )
-        anchor_hidden = ctx_hidden_pack[:, 1:, :]
+        num_anchor = int(anchor_mask.shape[1])
+        required_context_steps = num_anchor + 1
+        if ctx_hidden_pack.shape[1] < required_context_steps:
+            raise ValueError(
+                "Flow anchor context requires one leading token plus all anchor tokens: "
+                f"required={required_context_steps}, actual={ctx_hidden_pack.shape[1]}."
+            )
+        anchor_hidden = ctx_hidden_pack[:, 1:required_context_steps, :]
         output = {
             "flow_clean_norm": flow_clean_norm,
             "ctx_hidden_pack": ctx_hidden_pack,
             "anchor_hidden": anchor_hidden,
             "anchor_mask": anchor_mask,
         }
+        if flow_agent_type is not None:
+            output["flow_metric_agent_type"] = flow_agent_type
+        if flow_agent_length is not None:
+            output["flow_metric_agent_length"] = flow_agent_length
         if flow_loss_mask is not None:
             output["flow_loss_mask"] = flow_loss_mask
+        if flow_clean_metric_norm is not None:
+            output["flow_clean_metric_norm"] = flow_clean_metric_norm
         return output
+
+    def _to_pose_metric_norm(
+        self,
+        value: torch.Tensor,
+        agent_type: torch.Tensor | None,
+        agent_length: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if not self.use_kinematic_control_flow or value.shape[-1] != CONTROL_FLOW_DIM:
+            return value
+        if agent_type is None:
+            raise ValueError(
+                "agent_type is required to convert control-space flow output "
+                "to pose-space metric representation."
+            )
+        return control_norm_to_pose_norm(
+            control_norm=value,
+            agent_type=agent_type.to(device=value.device),
+            agent_length=(
+                agent_length.to(device=value.device, dtype=value.dtype)
+                if agent_length is not None
+                else None
+            ),
+            pos_scale_m=self.control_pos_scale_m,
+            vehicle_yaw_scale_rad=self.control_vehicle_yaw_scale_rad,
+            pedestrian_yaw_scale_rad=self.control_pedestrian_yaw_scale_rad,
+            cyclist_yaw_scale_rad=self.control_cyclist_yaw_scale_rad,
+            use_holonomic_model_only=getattr(self, "use_holonomic_model_only", False),
+            vehicle_no_slip_point_ratio=getattr(self, "control_vehicle_no_slip_point_ratio", 0.0),
+            cyclist_no_slip_point_ratio=getattr(self, "control_cyclist_no_slip_point_ratio", 0.0),
+        )
+
+    def flow_norm_to_pose_metric_norm(
+        self,
+        value: torch.Tensor,
+        agent_type: torch.Tensor | None,
+        agent_length: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Metric/시각화 경로가 쓰는 pose-space flow 표현으로 변환합니다."""
+        return self._to_pose_metric_norm(
+            value=value,
+            agent_type=agent_type,
+            agent_length=agent_length,
+        )
 
 
     def _sample_open_loop_future_from_hidden(
@@ -491,7 +533,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
         """
         if anchor_hidden_valid.numel() == 0:
-            return anchor_hidden_valid.new_zeros((0, self.flow_window_steps, 4))
+            return anchor_hidden_valid.new_zeros((0, self.flow_window_steps, self.flow_state_dim))
 
         generator = None
         if sampling_seed is not None:
@@ -501,7 +543,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         x_init_norm = torch.randn(
             anchor_hidden_valid.shape[0],
             self.flow_window_steps,
-            4,
+            self.flow_state_dim,
             device=anchor_hidden_valid.device,
             dtype=anchor_hidden_valid.dtype,
             generator=generator,
@@ -539,9 +581,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
 
         Args:
             anchor_hidden: 모든 anchor 문맥입니다.
-                shape은 ``[n_agent, 13, hidden_dim]`` 입니다.
+                shape은 ``[n_agent, n_anchor, hidden_dim]`` 입니다.
             anchor_mask: 실제로 평가할 anchor 여부입니다.
-                shape은 ``[n_agent, 13]`` 입니다.
+                shape은 ``[n_agent, n_anchor]`` 입니다.
             sampling_scheme: 샘플링 단계 수, 방법, 잡음 크기 설정입니다.
             sampling_seed: validation마다 같은 출발 잡음을 만들기 위한 seed입니다.
             backprop_last_k: 마지막 몇 step만 역전파할지 정합니다.
@@ -569,6 +611,10 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         sampling_scheme: DictConfig,
         sampling_seed: int | None = None,
         scenario_sampling_seeds: torch.Tensor | None = None,
+        scenario_sampling_signs: torch.Tensor | None = None,
+        scenario_sampling_strata: torch.Tensor | None = None,
+        scenario_sampling_stratification_seeds: torch.Tensor | None = None,
+        scenario_sampling_num_strata: int | None = None,
         agent_batch: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """closed-loop 전체에서 재사용할 긴 잡음 테이프를 한 번만 만듭니다.
@@ -582,51 +628,199 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             sampling_seed: batch 전체를 하나의 seed로 만들 때 쓰는 seed입니다.
             scenario_sampling_seeds: 시나리오별 고정 seed입니다.
                 shape은 ``[n_scenario]`` 입니다.
+            scenario_sampling_signs: 시나리오별 noise 부호입니다.
+                shape은 ``[n_scenario]`` 입니다. ``None`` 이면 모두 ``+1`` 입니다.
+            scenario_sampling_strata: stratified Gaussian noise에서 각 scenario-row가
+                담당할 rollout quantile bin offset입니다. shape은 ``[n_scenario]`` 입니다.
+            scenario_sampling_stratification_seeds: quantile bin 순서를 coordinate별로
+                섞을 때 쓰는 scenario seed입니다. shape은 ``[n_scenario]`` 입니다.
+            scenario_sampling_num_strata: stratified Gaussian noise의 bin 개수입니다.
             agent_batch: 각 agent가 어느 시나리오에 속하는지 나타냅니다.
                 shape은 ``[n_agent]`` 입니다.
 
         Returns:
             torch.Tensor:
                 각 agent가 rollout 전체에서 공유할 긴 Gaussian 잡음입니다.
-                shape은 ``[n_agent, tape_steps, 4]`` 입니다.
+                shape은 ``[n_agent, tape_steps, flow_state_dim]`` 입니다.
         """
         noise_scale = float(getattr(sampling_scheme, "noise_scale", 1.0))
+        stratified_gaussian_noise = bool(
+            getattr(sampling_scheme, "stratified_gaussian_noise", False)
+        )
         if num_agent == 0:
-            return torch.zeros((0, tape_steps, 4), device=device, dtype=dtype)
+            return torch.zeros((0, tape_steps, self.flow_state_dim), device=device, dtype=dtype)
+        if stratified_gaussian_noise and scenario_sampling_seeds is None:
+            raise ValueError(
+                "validation_rollout_sampling.stratified_gaussian_noise=true is supported "
+                "only for scenario-seeded closed-loop validation/submission rollout. "
+                "Pass scenario_sampling_seeds, scenario_sampling_strata, and "
+                "scenario_sampling_stratification_seeds."
+            )
 
         if scenario_sampling_seeds is not None:
             if agent_batch is None:
                 raise ValueError("scenario별 잡음 테이프를 만들려면 agent_batch가 필요합니다.")
-            noise_tape = torch.empty((num_agent, tape_steps, 4), device=device, dtype=dtype)
+            if (
+                scenario_sampling_signs is not None
+                and scenario_sampling_signs.shape != scenario_sampling_seeds.shape
+            ):
+                raise ValueError(
+                    "scenario_sampling_signs must match scenario_sampling_seeds shape, "
+                    f"got {tuple(scenario_sampling_signs.shape)} and "
+                    f"{tuple(scenario_sampling_seeds.shape)}."
+                )
+            if stratified_gaussian_noise:
+                if scenario_sampling_strata is None:
+                    raise ValueError(
+                        "validation_rollout_sampling.stratified_gaussian_noise=true "
+                        "requires scenario_sampling_strata."
+                    )
+                if scenario_sampling_stratification_seeds is None:
+                    raise ValueError(
+                        "validation_rollout_sampling.stratified_gaussian_noise=true "
+                        "requires scenario_sampling_stratification_seeds."
+                    )
+                if scenario_sampling_num_strata is None or int(scenario_sampling_num_strata) <= 0:
+                    raise ValueError(
+                        "validation_rollout_sampling.stratified_gaussian_noise=true "
+                        "requires a positive scenario_sampling_num_strata."
+                    )
+                if scenario_sampling_strata.shape != scenario_sampling_seeds.shape:
+                    raise ValueError(
+                        "scenario_sampling_strata must match scenario_sampling_seeds shape, "
+                        f"got {tuple(scenario_sampling_strata.shape)} and "
+                        f"{tuple(scenario_sampling_seeds.shape)}."
+                    )
+                if scenario_sampling_stratification_seeds.shape != scenario_sampling_seeds.shape:
+                    raise ValueError(
+                        "scenario_sampling_stratification_seeds must match "
+                        "scenario_sampling_seeds shape, got "
+                        f"{tuple(scenario_sampling_stratification_seeds.shape)} and "
+                        f"{tuple(scenario_sampling_seeds.shape)}."
+                    )
+            noise_tape = torch.empty((num_agent, tape_steps, self.flow_state_dim), device=device, dtype=dtype)
             scenario_seed_list = scenario_sampling_seeds.detach().cpu().tolist()
+            scenario_sign_list = (
+                scenario_sampling_signs.detach().cpu().tolist()
+                if scenario_sampling_signs is not None
+                else None
+            )
+            scenario_strata_list = (
+                scenario_sampling_strata.detach().cpu().tolist()
+                if scenario_sampling_strata is not None
+                else None
+            )
+            scenario_stratification_seed_list = (
+                scenario_sampling_stratification_seeds.detach().cpu().tolist()
+                if scenario_sampling_stratification_seeds is not None
+                else None
+            )
             for scenario_idx, scenario_seed in enumerate(scenario_seed_list):
                 scenario_mask = agent_batch == scenario_idx
                 if not bool(scenario_mask.any()):
                     continue
+                scenario_sign = (
+                    float(scenario_sign_list[scenario_idx])
+                    if scenario_sign_list is not None
+                    else 1.0
+                )
                 generator = torch.Generator(device=device)
                 generator.manual_seed(int(scenario_seed))
-                noise_tape[scenario_mask] = torch.randn(
-                    int(scenario_mask.sum().item()),
-                    tape_steps,
-                    4,
-                    device=device,
-                    dtype=dtype,
-                    generator=generator,
-                )
-            return noise_tape * noise_scale
+                num_scenario_agents = int(scenario_mask.sum().item())
+                if stratified_gaussian_noise:
+                    stratification_generator = torch.Generator(device=device)
+                    stratification_generator.manual_seed(
+                        int(scenario_stratification_seed_list[scenario_idx])
+                    )
+                    scenario_noise = self._build_stratified_standard_normal_noise(
+                        num_agent=num_scenario_agents,
+                        tape_steps=tape_steps,
+                        device=device,
+                        dtype=dtype,
+                        sample_generator=generator,
+                        stratification_generator=stratification_generator,
+                        stratum=int(scenario_strata_list[scenario_idx]),
+                        num_strata=int(scenario_sampling_num_strata),
+                    )
+                else:
+                    scenario_noise = torch.randn(
+                        num_scenario_agents,
+                        tape_steps,
+                        self.flow_state_dim,
+                        device=device,
+                        dtype=dtype,
+                        generator=generator,
+                    )
+                noise_tape[scenario_mask] = scenario_noise * scenario_sign
+            return self._apply_rollout_noise_scale(
+                noise_tape=noise_tape,
+                noise_scale=noise_scale,
+            )
 
         generator = None
         if sampling_seed is not None:
             generator = torch.Generator(device=device)
             generator.manual_seed(int(sampling_seed))
-        return torch.randn(
+        noise_tape = torch.randn(
             num_agent,
             tape_steps,
-            4,
+            self.flow_state_dim,
             device=device,
             dtype=dtype,
             generator=generator,
-        ) * noise_scale
+        )
+        return self._apply_rollout_noise_scale(
+            noise_tape=noise_tape,
+            noise_scale=noise_scale,
+        )
+
+    def _build_stratified_standard_normal_noise(
+        self,
+        *,
+        num_agent: int,
+        tape_steps: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        sample_generator: torch.Generator,
+        stratification_generator: torch.Generator,
+        stratum: int,
+        num_strata: int,
+    ) -> torch.Tensor:
+        """Build a stratified N(0, 1) noise block for one scenario-rollout row."""
+        if stratum < 0 or stratum >= num_strata:
+            raise ValueError(
+                f"stratum must be in [0, {num_strata}), got {stratum}."
+            )
+        shape = (int(num_agent), int(tape_steps), int(self.flow_state_dim))
+        if num_agent == 0:
+            return torch.zeros(shape, device=device, dtype=dtype)
+
+        bin_offset = torch.randint(
+            low=0,
+            high=int(num_strata),
+            size=shape,
+            device=device,
+            generator=stratification_generator,
+        )
+        bin_index = torch.remainder(bin_offset + int(stratum), int(num_strata))
+        jitter = torch.rand(
+            shape,
+            device=device,
+            dtype=torch.float32,
+            generator=sample_generator,
+        )
+        uniform = (bin_index.to(torch.float32) + jitter) / float(num_strata)
+        uniform = uniform.clamp_(min=1e-6, max=1.0 - 1e-6)
+        normal = torch.erfinv(uniform.mul(2.0).sub(1.0)).mul_(2.0 ** 0.5)
+        return normal.to(dtype=dtype)
+
+    def _apply_rollout_noise_scale(
+        self,
+        noise_tape: torch.Tensor,
+        noise_scale: float,
+    ) -> torch.Tensor:
+        """Apply scalar closed-loop noise scale."""
+        return noise_tape * float(noise_scale)
 
     def _encode_context(
         self,
@@ -685,10 +879,28 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         feat_map = map_feature["pt_token"]
         for i in range(self.num_layers):
             feat_a = feat_a.flatten(0, 1)
-            feat_a = self.t_attn_layers[i](feat_a, r_t, edge_index_t)
+            feat_a = self._run_attention_layer(
+                self.t_attn_layers[i],
+                feat_a,
+                r_t,
+                edge_index_t,
+                layer_idx=i,
+            )
             feat_a = feat_a.view(n_agent, n_step, -1).transpose(0, 1).flatten(0, 1)
-            feat_a = self.pt2a_attn_layers[i]((feat_map, feat_a), r_pl2a, edge_index_pl2a)
-            feat_a = self.a2a_attn_layers[i](feat_a, r_a2a, edge_index_a2a)
+            feat_a = self._run_attention_layer(
+                self.pt2a_attn_layers[i],
+                (feat_map, feat_a),
+                r_pl2a,
+                edge_index_pl2a,
+                layer_idx=i,
+            )
+            feat_a = self._run_attention_layer(
+                self.a2a_attn_layers[i],
+                feat_a,
+                r_a2a,
+                edge_index_a2a,
+                layer_idx=i,
+            )
             feat_a = feat_a.view(n_step, n_agent, -1).transpose(0, 1)
         return feat_a
 
@@ -698,7 +910,11 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         map_feature: Dict[str, torch.Tensor],
         anchor_mask: torch.Tensor,
         flow_clean_norm: torch.Tensor,
+        flow_agent_type: torch.Tensor | None = None,
+        flow_agent_length: torch.Tensor | None = None,
         flow_loss_mask: torch.Tensor | None = None,
+        flow_clean_metric_norm: torch.Tensor | None = None,
+        compute_metric_outputs: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """학습 또는 평가용 anchor를 골라 flow decoder 출력을 만듭니다.
 
@@ -711,11 +927,15 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             flow_loss_mask: loss에 포함할 미래 step입니다.
                 shape은 ``[n_valid_anchor, flow_window_steps]`` 입니다.
                 값이 없으면 전체 step을 사용합니다.
+            flow_clean_metric_norm: open-loop metric/시각화가 정답으로 쓸 raw GT pose-space
+                표현입니다. control-space 학습에서는 clean control target과 분리됩니다.
 
         Returns:
             Dict[str, torch.Tensor]:
                 flow prediction, target, anchor 문맥, 현재 위치/방향, batch 정보를 담은 사전입니다.
         """
+        if not compute_metric_outputs:
+            flow_clean_metric_norm = None
         if flow_loss_mask is not None:
             expected_shape = tuple(flow_clean_norm.shape[:2])
             if tuple(flow_loss_mask.shape) != expected_shape:
@@ -724,20 +944,35 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     f"expected={expected_shape}, actual={tuple(flow_loss_mask.shape)}."
                 )
             flow_loss_mask = flow_loss_mask.to(device=flow_clean_norm.device, dtype=torch.bool)
+        if flow_clean_metric_norm is not None:
+            expected_metric_shape = tuple(flow_clean_norm.shape[:2]) + (POSE_FLOW_DIM,)
+            if tuple(flow_clean_metric_norm.shape) != expected_metric_shape:
+                raise ValueError(
+                    "flow_clean_metric_norm must be raw pose-space target with shape "
+                    f"{expected_metric_shape}, got {tuple(flow_clean_metric_norm.shape)}."
+                )
+            flow_clean_metric_norm = flow_clean_metric_norm.to(
+                device=flow_clean_norm.device,
+                dtype=flow_clean_norm.dtype,
+            )
 
         anchor_context = self.build_anchor_context(
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
             anchor_mask=anchor_mask,
             flow_clean_norm=flow_clean_norm,
+            flow_agent_type=flow_agent_type,
+            flow_agent_length=flow_agent_length,
             flow_loss_mask=flow_loss_mask,
+            flow_clean_metric_norm=flow_clean_metric_norm,
+            compute_metric_outputs=compute_metric_outputs,
         )
         ctx_hidden_pack = anchor_context["ctx_hidden_pack"]
         anchor_hidden = anchor_context["anchor_hidden"]
         anchor_hidden_valid = self._pack_anchor_hidden(anchor_hidden, anchor_mask)
 
         if flow_clean_norm.numel() == 0:
-            empty = flow_clean_norm.new_zeros((0, self.flow_window_steps, 4))
+            empty = flow_clean_norm.new_zeros((0, self.flow_window_steps, self.flow_state_dim))
             output = {
                 "flow_pred_norm": empty,
                 "flow_target_norm": empty,
@@ -747,17 +982,50 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 "anchor_hidden": anchor_hidden,
                 "anchor_mask": anchor_mask,
             }
+            if compute_metric_outputs and flow_agent_type is not None:
+                output["flow_metric_agent_type"] = flow_agent_type
+                if flow_agent_length is not None:
+                    output["flow_metric_agent_length"] = flow_agent_length
+                output["flow_pred_clean_metric_norm"] = self._to_pose_metric_norm(
+                    empty,
+                    flow_agent_type,
+                    flow_agent_length,
+                )
+                output["flow_clean_metric_norm"] = (
+                    flow_clean_metric_norm
+                    if flow_clean_metric_norm is not None
+                    else self._to_pose_metric_norm(empty, flow_agent_type, flow_agent_length)
+                )
+            elif compute_metric_outputs and flow_clean_metric_norm is not None:
+                output["flow_clean_metric_norm"] = flow_clean_metric_norm
             if flow_loss_mask is not None:
                 output["flow_loss_mask"] = flow_loss_mask
             return output
 
         flow_sample = self.flow_ode.sample(flow_clean_norm, target_type="velocity")
-        flow_pred_norm = self.flow_decoder(anchor_hidden_valid, flow_sample.x_t, flow_sample.tau)
-        flow_pred_clean_norm = self.flow_ode.predict_clean_from_velocity(
+        flow_pred_norm = self.flow_decoder(
+            anchor_hidden_valid,
             flow_sample.x_t,
-            flow_pred_norm,
             flow_sample.tau,
+            future_valid_mask=flow_loss_mask,
         )
+        if (
+            bool(getattr(self, "detach_train_metric_clean", False))
+            and self.training
+            and torch.is_grad_enabled()
+        ):
+            with torch.no_grad():
+                flow_pred_clean_norm = self.flow_ode.predict_clean_from_velocity(
+                    flow_sample.x_t.detach(),
+                    flow_pred_norm.detach(),
+                    flow_sample.tau.detach(),
+                )
+        else:
+            flow_pred_clean_norm = self.flow_ode.predict_clean_from_velocity(
+                flow_sample.x_t,
+                flow_pred_norm,
+                flow_sample.tau,
+            )
         output = {
             "flow_pred_norm": flow_pred_norm,
             "flow_target_norm": flow_sample.target,
@@ -767,6 +1035,26 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             "anchor_hidden": anchor_hidden,
             "anchor_mask": anchor_mask,
         }
+        if compute_metric_outputs and flow_agent_type is not None:
+            output["flow_metric_agent_type"] = flow_agent_type
+            if flow_agent_length is not None:
+                output["flow_metric_agent_length"] = flow_agent_length
+            output["flow_pred_clean_metric_norm"] = self._to_pose_metric_norm(
+                flow_pred_clean_norm,
+                flow_agent_type,
+                flow_agent_length,
+            )
+            output["flow_clean_metric_norm"] = (
+                flow_clean_metric_norm
+                if flow_clean_metric_norm is not None
+                else self._to_pose_metric_norm(
+                    flow_clean_norm,
+                    flow_agent_type,
+                    flow_agent_length,
+                )
+            )
+        elif compute_metric_outputs and flow_clean_metric_norm is not None:
+            output["flow_clean_metric_norm"] = flow_clean_metric_norm
         if flow_loss_mask is not None:
             output["flow_loss_mask"] = flow_loss_mask
         return output
@@ -1152,7 +1440,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 f"got {scope!r}."
             )
 
-        min_executed_steps = int(getattr(random_cfg, "min_executed_steps", 24))
+        min_executed_steps = int(getattr(random_cfg, "min_executed_steps", 16))
         if min_executed_steps < 1 or min_executed_steps > sample_steps:
             raise ValueError(
                 "random_terminal_step.min_executed_steps must be in [1, sample_steps], "
@@ -1188,6 +1476,10 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         sampling_scheme: DictConfig,
         sampling_seed: int | None = None,
         scenario_sampling_seeds: torch.Tensor | None = None,
+        scenario_sampling_signs: torch.Tensor | None = None,
+        scenario_sampling_strata: torch.Tensor | None = None,
+        scenario_sampling_stratification_seeds: torch.Tensor | None = None,
+        scenario_sampling_num_strata: int | None = None,
         return_flow_2s_preview: bool = False,
         rollout_steps_2hz: int | None = None,
         self_forced_epoch: int | None = None,
@@ -1204,6 +1496,13 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             sampling_seed: batch 전체를 하나의 seed로 만들 때 쓰는 고정 난수 seed입니다.
             scenario_sampling_seeds: 시나리오별 고정 seed입니다.
                 shape은 ``[n_scenario]`` 입니다.
+            scenario_sampling_signs: 시나리오별 noise 부호입니다.
+                shape은 ``[n_scenario]`` 입니다.
+            scenario_sampling_strata: stratified Gaussian noise에서 각 scenario-row가
+                담당할 quantile bin offset입니다. shape은 ``[n_scenario]`` 입니다.
+            scenario_sampling_stratification_seeds: coordinate별 quantile bin 순서를
+                고정적으로 섞을 때 쓰는 seed입니다. shape은 ``[n_scenario]`` 입니다.
+            scenario_sampling_num_strata: stratified Gaussian noise의 bin 수입니다.
             self_forced_epoch: self-forced 학습 epoch입니다. ``None`` 이면 random terminal
                 denoising step을 쓰지 않는 평가/추론 경로로 봅니다.
 
@@ -1214,11 +1513,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 함께 반환합니다.
         """
         state = self._clone_rollout_cache(rollout_cache)
-        rollout_use_stop_motion = (
-            self.use_stop_motion
-            if use_stop_motion is None
-            else bool(use_stop_motion)
-        )
+        # Always keep stop-motion disabled, including self-forced rollout calls
+        # that pass an explicit use_stop_motion argument.
+        rollout_use_stop_motion = False
 
         n_agent = int(state["n_agent"])
         total_step_future_2hz = int(state["n_step_future_2hz"])
@@ -1295,6 +1592,10 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             sampling_scheme=sampling_scheme,
             sampling_seed=sampling_seed,
             scenario_sampling_seeds=scenario_sampling_seeds,
+            scenario_sampling_signs=scenario_sampling_signs,
+            scenario_sampling_strata=scenario_sampling_strata,
+            scenario_sampling_stratification_seeds=scenario_sampling_stratification_seeds,
+            scenario_sampling_num_strata=scenario_sampling_num_strata,
             agent_batch=tokenized_agent["batch"],
         )
         # Derive scenario count from the always-present `batch` index instead of
@@ -1399,16 +1700,13 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     batch_s=tokenized_agent["batch"],
                     batch_pl=map_feature["batch"],
                     light_type=map_feature.get("light_type"),
-                    light_time_delta_norm=self._build_rollout_light_time_delta_norm(
-                        num_agent=pos_window.shape[0],
+                    light_time_delta_norm=build_constant_light_time_delta_norm(
+                        num_agents=n_agent,
+                        num_steps=1,
+                        delta_seconds=float(t * self.shift) * 0.1,
                         device=pos_window.device,
                         dtype=pos_window.dtype,
-                        rollout_step_index=t,
                     ),
-                )
-                recent_motion, recent_motion_valid = self._build_recent_coarse_motion(
-                    pos_window=pos_window,
-                    valid_window=valid_window,
                 )
                 edge_index_a2a, r_a2a = self.build_interaction_edge(
                     pos_a=pos_window[:, -1:],
@@ -1416,8 +1714,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     head_vector_a=head_vector_window[:, -1:],
                     batch_s=tokenized_agent["batch"],
                     mask=inference_mask[:, -1:],
-                    motion_a=recent_motion.unsqueeze(1),
-                    motion_valid_a=recent_motion_valid.unsqueeze(1),
                 )
 
                 for i in range(self.num_layers):
@@ -1491,8 +1787,14 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 current_pos_act = pos_window[active_mask, -1]
                 current_head_act = head_window[active_mask, -1]
                 active_agent_type = tokenized_agent["type"][active_mask]
+                active_agent_length = tokenized_agent["shape"][active_mask, 0]
                 if return_flow_2s_preview:
-                    preview_pos_local = y_hat_norm[..., :2] * 20.0
+                    y_hat_metric_norm = self._to_pose_metric_norm(
+                        y_hat_norm,
+                        active_agent_type,
+                        active_agent_length,
+                    )
+                    preview_pos_local = y_hat_metric_norm[..., :2] * 20.0
                     preview_pos_global, _ = transform_to_global(
                         pos_local=preview_pos_local,
                         head_local=None,
@@ -1510,6 +1812,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     y_hat_norm=y_hat_norm,
                     current_pos=current_pos_act,
                     current_head=current_head_act,
+                    agent_type=active_agent_type,
+                    agent_length=active_agent_length,
                 )
                 exec_pos_history_act = exec_pos_history_10hz[active_mask].clone()
                 exec_head_history_act = exec_head_history_10hz[active_mask].clone()
@@ -1567,6 +1871,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                         exec_head_history=exec_head_history_act[lqr_mask_act],
                         exec_valid_history=exec_valid_history_act[lqr_mask_act],
                         agent_type=active_agent_type[lqr_mask_act],
+                        agent_length=active_agent_length[lqr_mask_act],
                     )
                     commit_pos_act[lqr_mask_act] = lqr_commit_pos_act
                     commit_head_act[lqr_mask_act] = lqr_commit_head_act
@@ -1733,6 +2038,10 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         sampling_scheme: DictConfig,
         sampling_seed: int | None = None,
         scenario_sampling_seeds: torch.Tensor | None = None,
+        scenario_sampling_signs: torch.Tensor | None = None,
+        scenario_sampling_strata: torch.Tensor | None = None,
+        scenario_sampling_stratification_seeds: torch.Tensor | None = None,
+        scenario_sampling_num_strata: int | None = None,
         return_flow_2s_preview: bool = False,
         rollout_steps_2hz: int | None = None,
     ) -> Dict[str, torch.Tensor]:
@@ -1745,6 +2054,11 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             sampling_scheme: flow sampling 설정입니다.
             sampling_seed: batch 공통 seed입니다.
             scenario_sampling_seeds: scenario별 seed입니다. shape은 ``[n_scenario]`` 입니다.
+            scenario_sampling_signs: scenario별 noise 부호입니다. shape은 ``[n_scenario]`` 입니다.
+            scenario_sampling_strata: stratified Gaussian noise의 scenario별 bin offset입니다.
+            scenario_sampling_stratification_seeds: stratified Gaussian noise의 scenario별
+                coordinate permutation seed입니다.
+            scenario_sampling_num_strata: stratified Gaussian noise의 bin 수입니다.
             return_flow_2s_preview: preview 저장 여부입니다.
             rollout_steps_2hz: 실행할 0.5초 block 수입니다. ``None`` 이면 전체 8초를 실행합니다.
 
@@ -1758,6 +2072,10 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             sampling_scheme=sampling_scheme,
             sampling_seed=sampling_seed,
             scenario_sampling_seeds=scenario_sampling_seeds,
+            scenario_sampling_signs=scenario_sampling_signs,
+            scenario_sampling_strata=scenario_sampling_strata,
+            scenario_sampling_stratification_seeds=scenario_sampling_stratification_seeds,
+            scenario_sampling_num_strata=scenario_sampling_num_strata,
             return_flow_2s_preview=return_flow_2s_preview,
             rollout_steps_2hz=rollout_steps_2hz,
         )
@@ -1770,6 +2088,10 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         sampling_scheme: DictConfig,
         sampling_seed: int | None = None,
         scenario_sampling_seeds: torch.Tensor | None = None,
+        scenario_sampling_signs: torch.Tensor | None = None,
+        scenario_sampling_strata: torch.Tensor | None = None,
+        scenario_sampling_stratification_seeds: torch.Tensor | None = None,
+        scenario_sampling_num_strata: int | None = None,
         rollout_steps_2hz: int | None = None,
         self_forced_epoch: int | None = None,
         detach_block_transition: bool = False,
@@ -1784,6 +2106,11 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             sampling_scheme: flow sampling 설정입니다.
             sampling_seed: batch 공통 seed입니다.
             scenario_sampling_seeds: scenario별 seed입니다. shape은 ``[n_scenario]`` 입니다.
+            scenario_sampling_signs: scenario별 noise 부호입니다. shape은 ``[n_scenario]`` 입니다.
+            scenario_sampling_strata: stratified Gaussian noise의 scenario별 bin offset입니다.
+            scenario_sampling_stratification_seeds: stratified Gaussian noise의 scenario별
+                coordinate permutation seed입니다.
+            scenario_sampling_num_strata: stratified Gaussian noise의 bin 수입니다.
             rollout_steps_2hz: 실행할 0.5초 block 수입니다. 기본 self-forced 학습은
                 ``flow_window_steps / 5`` 를 넘깁니다.
             self_forced_epoch: 현재 self-forced epoch입니다. ``None`` 이면 training
@@ -1801,6 +2128,10 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             sampling_scheme=sampling_scheme,
             sampling_seed=sampling_seed,
             scenario_sampling_seeds=scenario_sampling_seeds,
+            scenario_sampling_signs=scenario_sampling_signs,
+            scenario_sampling_strata=scenario_sampling_strata,
+            scenario_sampling_stratification_seeds=scenario_sampling_stratification_seeds,
+            scenario_sampling_num_strata=scenario_sampling_num_strata,
             return_flow_2s_preview=False,
             rollout_steps_2hz=rollout_steps_2hz,
             self_forced_epoch=self_forced_epoch,
@@ -1821,20 +2152,22 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         Args:
             tokenized_agent: 평가 모드 기준 토큰 사전입니다.
             map_feature: 이 decoder가 직접 만든 지도 특징입니다.
-            path_noisy_norm: noisy N초 path입니다. shape은 ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
+            path_noisy_norm: noisy N초 flow state입니다.
+                pose-space에서는 ``[n_valid_agent, flow_window_steps, 4]`` 이고,
+                control-space에서는 ``[n_valid_agent, flow_window_steps, 3]`` 입니다.
             tau: flow interpolation time입니다. shape은 ``[n_valid_agent]`` 입니다.
             anchor_mask: 첫 anchor에서 사용할 agent 마스크입니다. shape은 ``[n_agent]`` 입니다.
 
         Returns:
             Dict[str, torch.Tensor]: ``velocity`` 와 ``clean`` 을 담은 사전입니다. 두 텐서 shape은
-            ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
+            ``[n_valid_agent, flow_window_steps, flow_state_dim]`` 입니다.
         """
         if path_noisy_norm.numel() == 0:
-            empty = path_noisy_norm.new_zeros((0, self.flow_window_steps, 4))
+            empty = path_noisy_norm.new_zeros((0, self.flow_window_steps, self.flow_state_dim))
             return {"velocity": empty, "clean": empty}
-        if path_noisy_norm.shape[1:] != (self.flow_window_steps, 4):
+        if path_noisy_norm.shape[1:] != (self.flow_window_steps, self.flow_state_dim):
             raise ValueError(
-                "path_noisy_norm must have shape [n_valid_agent, flow_window_steps, 4], "
+                "path_noisy_norm must have shape [n_valid_agent, flow_window_steps, flow_state_dim], "
                 f"got {tuple(path_noisy_norm.shape)}."
             )
         if int(anchor_mask.sum().item()) != int(path_noisy_norm.shape[0]):
@@ -1843,13 +2176,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 f"got {int(anchor_mask.sum().item())} and {path_noisy_norm.shape[0]}."
             )
 
-        single_anchor_mask = torch.zeros(
-            anchor_mask.shape[0],
-            13,
-            device=anchor_mask.device,
-            dtype=torch.bool,
-        )
-        single_anchor_mask[:, 0] = anchor_mask.bool()
         ctx_hidden_pack = self._encode_context(
             agent_token_index=tokenized_agent["ctx_sampled_idx"],
             pos_a=tokenized_agent["ctx_sampled_pos"],
@@ -1858,7 +2184,13 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
         )
-        anchor_hidden = ctx_hidden_pack[:, 1:, :]
+        if ctx_hidden_pack.shape[1] < 2:
+            raise ValueError(
+                "path_flow_velocity_for_anchor0 requires at least one leading context "
+                "token and one anchor token."
+            )
+        anchor_hidden = ctx_hidden_pack[:, 1:2, :]
+        single_anchor_mask = anchor_mask.bool().view(-1, 1)
         anchor_hidden_valid = self._pack_anchor_hidden(anchor_hidden, single_anchor_mask)
         velocity = self.flow_decoder(anchor_hidden_valid, path_noisy_norm, tau)
         clean = self.flow_ode.predict_clean_from_velocity(path_noisy_norm, velocity, tau)

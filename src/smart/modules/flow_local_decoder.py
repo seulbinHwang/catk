@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -20,7 +19,12 @@ from src.smart.utils import (
     transform_to_local,
     wrap_angle,
 )
-from src.smart.modules.draft_physics import DEFAULT_LIMITS
+from src.smart.modules.dynamic_limits import DEFAULT_LIMITS
+from src.smart.modules.kinematic_control import (
+    control_norm_to_pose_norm,
+    validate_control_no_slip_ratio_config,
+    validate_control_yaw_scale_config,
+)
 
 
 @dataclass(frozen=True)
@@ -68,8 +72,8 @@ class LQRCommitBridgeConfig:
 
 
 # On sm_80 (A100) the flash / memory-efficient SDPA kernels inside
-# `nn.MultiheadAttention` can exceed their grid-dim limit on pathological
-# DRaFT batches with many agents, causing
+# `nn.MultiheadAttention` can exceed their grid-dim limit on large
+# batches with many agents, causing
 # `RuntimeError: CUDA error: invalid configuration argument` even when VRAM
 # is not close to full. `ChunkStepRefiner` only attends over seq_len=5, so
 # forcing the math SDPA kernel here is cheap and avoids that failure mode.
@@ -399,7 +403,7 @@ class AnchorContextProjector(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
-            nn.SiLU(),
+            nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
 
@@ -408,14 +412,21 @@ class AnchorContextProjector(nn.Module):
 
 
 class NormalizedNoisyFutureEncoder(nn.Module):
-    def __init__(self, flow_dim: int, num_chunks: int = 4, chunk_size: int = 5) -> None:
+    def __init__(
+        self,
+        flow_dim: int,
+        num_chunks: int = 4,
+        chunk_size: int = 5,
+        flow_state_dim: int = 4,
+    ) -> None:
         super().__init__()
         self.flow_dim = flow_dim
         self.num_chunks = num_chunks
         self.chunk_size = chunk_size
         self.num_steps = num_chunks * chunk_size
+        self.flow_state_dim = int(flow_state_dim)
 
-        self.step_proj = nn.Linear(4, flow_dim)
+        self.step_proj = nn.Linear(self.flow_state_dim, flow_dim)
         self.step_embed = nn.Embedding(self.num_steps, flow_dim)
         self.tau_mlp = nn.Sequential(
             nn.Linear(1, flow_dim),
@@ -432,12 +443,24 @@ class NormalizedNoisyFutureEncoder(nn.Module):
         self,
         x_t_norm: torch.Tensor,
         tau: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        future_valid_mask: torch.Tensor | None = None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
         batch_size = x_t_norm.shape[0]
         if x_t_norm.shape[1] != self.num_steps:
             raise ValueError(
                 "NormalizedNoisyFutureEncoder expected "
                 f"{self.num_steps} future steps, got {x_t_norm.shape[1]}."
+            )
+        if x_t_norm.shape[-1] != self.flow_state_dim:
+            raise ValueError(
+                "NormalizedNoisyFutureEncoder expected last dim "
+                f"{self.flow_state_dim}, got {x_t_norm.shape[-1]}."
             )
 
         tau_emb = self.tau_mlp(tau.unsqueeze(-1))
@@ -446,14 +469,33 @@ class NormalizedNoisyFutureEncoder(nn.Module):
         step_tokens = step_tokens + self.step_embed(step_ids).unsqueeze(0)
         step_tokens = step_tokens + tau_emb.unsqueeze(1)
 
+        if future_valid_mask is not None:
+            if tuple(future_valid_mask.shape) != tuple(x_t_norm.shape[:2]):
+                raise ValueError(
+                    "future_valid_mask shape must match x_t_norm first two dimensions: "
+                    f"expected={tuple(x_t_norm.shape[:2])}, actual={tuple(future_valid_mask.shape)}."
+                )
+            future_valid_mask = future_valid_mask.to(device=x_t_norm.device, dtype=torch.bool)
+
         step_tokens = step_tokens.view(
             batch_size,
             self.num_chunks,
             self.chunk_size,
             self.flow_dim,
         )
-        chunk_tokens = self.chunk_pool(step_tokens.mean(dim=2))
-        return step_tokens, chunk_tokens, tau_emb
+        if future_valid_mask is None:
+            chunk_tokens = self.chunk_pool(step_tokens.mean(dim=2))
+            return step_tokens, chunk_tokens, tau_emb, None, None
+
+        step_valid_mask = future_valid_mask.view(batch_size, self.num_chunks, self.chunk_size)
+        step_valid_float = step_valid_mask.to(dtype=step_tokens.dtype).unsqueeze(-1)
+        step_tokens = step_tokens * step_valid_float
+
+        valid_count = step_valid_float.sum(dim=2).clamp_min(1.0)
+        chunk_tokens = self.chunk_pool(step_tokens.sum(dim=2) / valid_count)
+        chunk_valid_mask = step_valid_mask.any(dim=2)
+        chunk_tokens = chunk_tokens * chunk_valid_mask.to(dtype=chunk_tokens.dtype).unsqueeze(-1)
+        return step_tokens, chunk_tokens, tau_emb, future_valid_mask, chunk_valid_mask
 
 
 class HalfSecondChunkMixerBlock(nn.Module):
@@ -485,11 +527,18 @@ class HalfSecondChunkMixerBlock(nn.Module):
             x * (1.0 + scale.unsqueeze(1)) + bias.unsqueeze(1)
         )
 
+    def _build_safe_key_padding_mask(self, chunk_valid_mask: torch.Tensor) -> torch.Tensor:
+        key_padding_mask = ~chunk_valid_mask.bool()
+        all_masked = key_padding_mask.all(dim=1)
+        key_padding_mask = key_padding_mask & ~all_masked.unsqueeze(1)
+        return key_padding_mask
+
     def forward(
         self,
         chunk_tokens: torch.Tensor,
         context: torch.Tensor,
         tau_emb: torch.Tensor,
+        chunk_valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         attn_in = self.attn_norm(chunk_tokens)
         # Force math SDPA kernel: H100's flash/mem-efficient kernels save
@@ -497,12 +546,25 @@ class HalfSecondChunkMixerBlock(nn.Module):
         # NaN and propagates into encoder weight gradients (silently corrupting
         # training). ChunkStepRefiner uses the same guard for the same reason.
         with sdpa_kernel(_SDPA_SAFE_BACKENDS):
-            attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
+            if chunk_valid_mask is None:
+                attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
+            else:
+                attn_out, _ = self.attn(
+                    attn_in,
+                    attn_in,
+                    attn_in,
+                    key_padding_mask=self._build_safe_key_padding_mask(chunk_valid_mask),
+                    need_weights=False,
+                )
         chunk_tokens = chunk_tokens + attn_out
+        if chunk_valid_mask is not None:
+            chunk_tokens = chunk_tokens * chunk_valid_mask.to(dtype=chunk_tokens.dtype).unsqueeze(-1)
 
         cond = self.cond_mlp(torch.cat([context, tau_emb], dim=-1))
         mlp_in = self._modulate(self.mlp_norm(chunk_tokens), cond)
         chunk_tokens = chunk_tokens + self.mlp(mlp_in)
+        if chunk_valid_mask is not None:
+            chunk_tokens = chunk_tokens * chunk_valid_mask.to(dtype=chunk_tokens.dtype).unsqueeze(-1)
         return chunk_tokens
 
 
@@ -526,11 +588,33 @@ class ChunkStepRefiner(nn.Module):
             nn.Linear(flow_dim * 2, flow_dim),
         )
 
+    def _build_safe_step_key_padding_mask(
+        self,
+        step_valid_mask: torch.Tensor,
+        batch_size: int,
+        num_chunks: int,
+        chunk_size: int,
+    ) -> torch.Tensor:
+        expected_shape = (batch_size, num_chunks * chunk_size)
+        if tuple(step_valid_mask.shape) != expected_shape:
+            raise ValueError(
+                "step_valid_mask shape must match flattened future steps: "
+                f"expected={expected_shape}, actual={tuple(step_valid_mask.shape)}."
+            )
+        key_padding_mask = ~step_valid_mask.view(batch_size, num_chunks, chunk_size).reshape(
+            batch_size * num_chunks,
+            chunk_size,
+        ).bool()
+        all_masked = key_padding_mask.all(dim=1)
+        key_padding_mask = key_padding_mask & ~all_masked.unsqueeze(1)
+        return key_padding_mask
+
     def forward(
         self,
         step_tokens: torch.Tensor,
         chunk_tokens: torch.Tensor,
         context: torch.Tensor,
+        step_valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size, num_chunks, chunk_size, dim = step_tokens.shape
 
@@ -541,20 +625,37 @@ class ChunkStepRefiner(nn.Module):
         step_tokens = step_tokens.view(batch_size * num_chunks, chunk_size, dim)
         attn_in = self.attn_norm(step_tokens)
         with sdpa_kernel(_SDPA_SAFE_BACKENDS):
-            attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
+            if step_valid_mask is None:
+                attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
+            else:
+                attn_out, _ = self.attn(
+                    attn_in,
+                    attn_in,
+                    attn_in,
+                    key_padding_mask=self._build_safe_step_key_padding_mask(
+                        step_valid_mask=step_valid_mask,
+                        batch_size=batch_size,
+                        num_chunks=num_chunks,
+                        chunk_size=chunk_size,
+                    ),
+                    need_weights=False,
+                )
         step_tokens = step_tokens + attn_out
         step_tokens = step_tokens + self.mlp(self.mlp_norm(step_tokens))
         step_tokens = step_tokens.view(batch_size, num_chunks * chunk_size, dim)
+        if step_valid_mask is not None:
+            step_tokens = step_tokens * step_valid_mask.to(dtype=step_tokens.dtype).unsqueeze(-1)
         return step_tokens
 
 
 class FlowVelocityHead(nn.Module):
-    def __init__(self, flow_dim: int) -> None:
+    def __init__(self, flow_dim: int, flow_state_dim: int = 4) -> None:
         super().__init__()
+        self.flow_state_dim = int(flow_state_dim)
         self.net = nn.Sequential(
             nn.Linear(flow_dim, flow_dim),
             nn.SiLU(),
-            nn.Linear(flow_dim, 4),
+            nn.Linear(flow_dim, self.flow_state_dim),
         )
 
     def forward(self, step_tokens: torch.Tensor) -> torch.Tensor:
@@ -570,6 +671,7 @@ class HierarchicalFlowDecoder(nn.Module):
         num_chunk_heads: int = 4,
         num_chunk_layers: int = 2,
         chunk_size: int = 5,
+        flow_state_dim: int = 4,
     ) -> None:
         super().__init__()
         if int(num_future_steps) <= 0:
@@ -583,10 +685,12 @@ class HierarchicalFlowDecoder(nn.Module):
             )
         num_chunks = int(num_future_steps) // int(chunk_size)
         self.context_projector = AnchorContextProjector(context_dim, flow_dim)
+        self.flow_state_dim = int(flow_state_dim)
         self.noisy_future_encoder = NormalizedNoisyFutureEncoder(
             flow_dim=flow_dim,
             num_chunks=num_chunks,
             chunk_size=int(chunk_size),
+            flow_state_dim=self.flow_state_dim,
         )
         self.chunk_mixers = nn.ModuleList(
             [
@@ -598,16 +702,46 @@ class HierarchicalFlowDecoder(nn.Module):
             flow_dim=flow_dim,
             num_heads=num_chunk_heads,
         )
-        self.velocity_head = FlowVelocityHead(flow_dim=flow_dim)
+        self.velocity_head = FlowVelocityHead(flow_dim=flow_dim, flow_state_dim=self.flow_state_dim)
+
+    def _run_chunk_mixer(
+        self,
+        block: HalfSecondChunkMixerBlock,
+        chunk_tokens: torch.Tensor,
+        context: torch.Tensor,
+        tau_emb: torch.Tensor,
+        chunk_valid_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        return block(
+            chunk_tokens=chunk_tokens,
+            context=context,
+            tau_emb=tau_emb,
+            chunk_valid_mask=chunk_valid_mask,
+        )
+
+    def _run_step_refiner(
+        self,
+        step_tokens: torch.Tensor,
+        chunk_tokens: torch.Tensor,
+        context: torch.Tensor,
+        step_valid_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        return self.step_refiner(
+            step_tokens=step_tokens,
+            chunk_tokens=chunk_tokens,
+            context=context,
+            step_valid_mask=step_valid_mask,
+        )
 
     def forward(
         self,
         anchor_hidden: torch.Tensor,
         x_t_norm: torch.Tensor,
         tau: torch.Tensor,
+        future_valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
-        anchor_hidden : (A, 13, H) -> (N=A*13, H) -> context : (N, D)
+        anchor_hidden : (N, H) -> context : (N, D)
         """
         context = self.context_projector(anchor_hidden)
         """
@@ -622,7 +756,17 @@ class HierarchicalFlowDecoder(nn.Module):
             step_tokens = step_tokens.view(B, 4, 5, D) [B, 20, D] -> [B, 4, 5, D]
             chunk_tokens : [B, 4, D]
         """
-        step_tokens, chunk_tokens, tau_emb = self.noisy_future_encoder(x_t_norm, tau)
+        (
+            step_tokens,
+            chunk_tokens,
+            tau_emb,
+            step_valid_mask,
+            chunk_valid_mask,
+        ) = self.noisy_future_encoder(
+            x_t_norm=x_t_norm,
+            tau=tau,
+            future_valid_mask=future_valid_mask,
+        )
         """
         4개 half-second chunk ( chunk_tokens ) 끼리 서로 정보 교환
         
@@ -637,7 +781,13 @@ class HierarchicalFlowDecoder(nn.Module):
             
         """
         for block in self.chunk_mixers:
-            chunk_tokens = block(chunk_tokens, context, tau_emb)
+            chunk_tokens = self._run_chunk_mixer(
+                block=block,
+                chunk_tokens=chunk_tokens,
+                context=context,
+                tau_emb=tau_emb,
+                chunk_valid_mask=chunk_valid_mask,
+            )
         """
         input
             step_tokens : (B, 20, D)
@@ -652,7 +802,12 @@ class HierarchicalFlowDecoder(nn.Module):
         output
             step_tokens : (b, 20, D)
         """
-        step_tokens = self.step_refiner(step_tokens, chunk_tokens, context)
+        step_tokens = self._run_step_refiner(
+            step_tokens=step_tokens,
+            chunk_tokens=chunk_tokens,
+            context=context,
+            step_valid_mask=step_valid_mask,
+        )
         """
         output : (B, 20, 4)
         """
@@ -676,11 +831,44 @@ class ContinuousCommitBridge:
         use_lqr: bool = False,
         use_stop_motion: bool = False,
         config: LQRCommitBridgeConfig | None = None,
+        use_kinematic_control_flow: bool = False,
+        use_holonomic_model_only: bool = False,
+        control_pos_scale_m: float = 1.0,
+        control_vehicle_no_slip_point_ratio: float = 0.0,
+        control_cyclist_no_slip_point_ratio: float = 0.0,
+        control_vehicle_yaw_scale_rad: float | None = None,
+        control_pedestrian_yaw_scale_rad: float | None = None,
+        control_cyclist_yaw_scale_rad: float | None = None,
     ) -> None:
         self.commit_steps = int(commit_steps)
         self.pos_scale_m = float(pos_scale_m)
         self.use_lqr = bool(use_lqr)
-        self.use_stop_motion = bool(use_stop_motion)
+        # Stop-motion gating is disabled branch-wide. The argument remains only
+        # for config/checkpoint compatibility.
+        self.use_stop_motion = False
+        self.use_kinematic_control_flow = bool(use_kinematic_control_flow)
+        self.use_holonomic_model_only = bool(use_holonomic_model_only)
+        self.control_pos_scale_m = float(control_pos_scale_m)
+        (
+            self.control_vehicle_no_slip_point_ratio,
+            self.control_cyclist_no_slip_point_ratio,
+        ) = validate_control_no_slip_ratio_config(
+            vehicle_no_slip_point_ratio=control_vehicle_no_slip_point_ratio,
+            cyclist_no_slip_point_ratio=control_cyclist_no_slip_point_ratio,
+        )
+        self.control_vehicle_yaw_scale_rad = control_vehicle_yaw_scale_rad
+        self.control_pedestrian_yaw_scale_rad = control_pedestrian_yaw_scale_rad
+        self.control_cyclist_yaw_scale_rad = control_cyclist_yaw_scale_rad
+        if self.use_kinematic_control_flow:
+            (
+                self.control_vehicle_yaw_scale_rad,
+                self.control_pedestrian_yaw_scale_rad,
+                self.control_cyclist_yaw_scale_rad,
+            ) = validate_control_yaw_scale_config(
+                vehicle_yaw_scale_rad=self.control_vehicle_yaw_scale_rad,
+                pedestrian_yaw_scale_rad=self.control_pedestrian_yaw_scale_rad,
+                cyclist_yaw_scale_rad=self.control_cyclist_yaw_scale_rad,
+            )
         self.config = config if config is not None else LQRCommitBridgeConfig()
         self._difference_gram_cache: dict[tuple[int, str, str], torch.Tensor] = {}
 
@@ -719,7 +907,14 @@ class ContinuousCommitBridge:
         y_hat_norm: torch.Tensor,
         current_pos: torch.Tensor,
         current_head: torch.Tensor,
+        agent_type: torch.Tensor | None = None,
+        agent_length: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        y_hat_norm = self._flow_output_to_pose_norm(
+            y_hat_norm=y_hat_norm,
+            agent_type=agent_type,
+            agent_length=agent_length,
+        )
         first_chunk = y_hat_norm[:, : self.commit_steps].clone()
         first_chunk[..., :2] = first_chunk[..., :2] * self.pos_scale_m
 
@@ -736,6 +931,30 @@ class ContinuousCommitBridge:
         next_pos = commit_pos[:, -1]
         next_head = commit_head[:, -1]
         return commit_pos, commit_head, next_pos, next_head
+
+    def _flow_output_to_pose_norm(
+        self,
+        y_hat_norm: torch.Tensor,
+        agent_type: torch.Tensor | None = None,
+        agent_length: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Closed-loop commit paths consume the common pose-space flow view."""
+        if not self.use_kinematic_control_flow:
+            return y_hat_norm
+        if agent_type is None:
+            raise ValueError("agent_type is required when use_kinematic_control_flow=True.")
+        return control_norm_to_pose_norm(
+            control_norm=y_hat_norm,
+            agent_type=agent_type,
+            agent_length=agent_length,
+            pos_scale_m=self.control_pos_scale_m,
+            vehicle_yaw_scale_rad=self.control_vehicle_yaw_scale_rad,
+            pedestrian_yaw_scale_rad=self.control_pedestrian_yaw_scale_rad,
+            cyclist_yaw_scale_rad=self.control_cyclist_yaw_scale_rad,
+            use_holonomic_model_only=self.use_holonomic_model_only,
+            vehicle_no_slip_point_ratio=self.control_vehicle_no_slip_point_ratio,
+            cyclist_no_slip_point_ratio=self.control_cyclist_no_slip_point_ratio,
+        )
 
     def _build_full_future_from_flow(
         self,
@@ -857,8 +1076,6 @@ class ContinuousCommitBridge:
             token_bank_all_ped=token_bank_all_ped,
             token_bank_all_cyc=token_bank_all_cyc,
             reduction="sum",
-            num_k=1,
-            sample_topk=False,
         )
 
     def restore_token_state(
@@ -1002,8 +1219,6 @@ class ContinuousCommitBridge:
             token_bank_all_ped=token_bank_all_ped,
             token_bank_all_cyc=token_bank_all_cyc,
             reduction="sum",
-            num_k=1,
-            sample_topk=False,
         )
         return raw_token_idx, raw_token_idx == stop_token_idx
 
@@ -1289,17 +1504,20 @@ class ContinuousCommitBridge:
         exec_head_history: torch.Tensor,
         exec_valid_history: torch.Tensor,
         agent_type: torch.Tensor,
+        agent_length: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """vehicle / bicycle의 다음 0.5초를 0.1초 receding-horizon LQR로 실행합니다.
 
         Args:
-            y_hat_norm: raw FM 2초 미래입니다. shape은 ``[n_agent, 20, 4]`` 입니다.
+            y_hat_norm: raw FM 2초 미래입니다. pose-space에서는 ``[n_agent, 20, 4]``,
+                control-space에서는 ``[n_agent, 20, 3]`` 입니다.
             current_pos: 현재 중심점입니다. shape은 ``[n_agent, 2]`` 입니다.
             current_head: 현재 방향입니다. shape은 ``[n_agent]`` 입니다.
             exec_pos_history: 최근 실제 fine history 입니다. shape은 ``[n_agent, 6, 2]`` 입니다.
             exec_head_history: 최근 실제 fine heading 입니다. shape은 ``[n_agent, 6]`` 입니다.
             exec_valid_history: 최근 실제 fine valid 입니다. shape은 ``[n_agent, 6]`` 입니다.
             agent_type: 차종 번호입니다. shape은 ``[n_agent]`` 입니다.
+            agent_length: WOMD box length입니다. shape은 ``[n_agent]`` 입니다.
 
         Returns:
             tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1313,8 +1531,13 @@ class ContinuousCommitBridge:
             empty_head = current_head.new_zeros((0, 5))
             return empty_pos, empty_head, current_pos.clone(), current_head.clone()
 
-        future_pos, future_head = self._build_full_future_from_flow(
+        y_hat_pose_norm = self._flow_output_to_pose_norm(
             y_hat_norm=y_hat_norm,
+            agent_type=agent_type,
+            agent_length=agent_length,
+        )
+        future_pos, future_head = self._build_full_future_from_flow(
+            y_hat_norm=y_hat_pose_norm,
             current_pos=current_pos,
             current_head=current_head,
         )

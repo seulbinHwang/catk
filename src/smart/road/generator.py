@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import copy
+import logging
 import math
 import pickle
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -14,6 +15,9 @@ from torch_geometric.data import Batch
 
 from src.smart.road.cache import build_road_cache_sample, safe_scenario_id, write_pickle
 from src.smart.road.geometry import corner_distance_score, wrap_angle
+
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -28,12 +32,24 @@ class RoadGenerationConfig:
     temperature: float = 0.8
     sample_steps: int = 16
     sample_method: str = "euler"
-    generation_batch_size: int = 1
-    candidate_micro_batch_size: int = 4
+    generation_batch_size: int = 8
+    candidate_micro_batch_size: int = 8
     seed: int = 817
     source_count_hint: int = 486_995
     road_data_use_ratio: float = 0.1
     overwrite_cache: bool = False
+
+
+def _is_cuda_oom(error: BaseException) -> bool:
+    """CUDA OOM인지 보수적으로 판별합니다."""
+    if isinstance(error, torch.cuda.OutOfMemoryError):
+        return True
+    return "CUDA out of memory" in str(error)
+
+
+def _clear_cuda_cache(device: torch.device) -> None:
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def build_sampling_scheme(config: RoadGenerationConfig) -> SimpleNamespace:
@@ -232,6 +248,29 @@ def _to_repeated_batch(
     return _move_batch_to_device(Batch.from_data_list(data_list), device)
 
 
+def _to_repeated_batch_for_samples(
+    samples: Sequence[Mapping[str, Any]],
+    repeat_count: int,
+    transform: Callable[[Any], Any],
+    device: torch.device,
+) -> Batch:
+    """여러 scenario를 각각 후보 개수만큼 복제해 하나의 PyG batch로 만듭니다.
+
+    Args:
+        samples: 현재 시점 기준 scenario cache 목록입니다.
+        repeat_count: scenario마다 만들 후보 개수입니다.
+        transform: validation/추론 기준 HeteroData transform입니다.
+        device: batch를 올릴 장치입니다.
+
+    Returns:
+        Batch: ``len(samples) * repeat_count``개 graph를 가진 모델 입력입니다.
+    """
+    data_list = []
+    for sample in samples:
+        data_list.extend(transform(copy.deepcopy(sample)) for _ in range(int(repeat_count)))
+    return _move_batch_to_device(Batch.from_data_list(data_list), device)
+
+
 def extract_rollout_prediction(prediction: Mapping[str, Tensor]) -> tuple[Tensor, Tensor, Tensor]:
     """기존 closed-loop inference 출력에서 10Hz rollout을 꺼냅니다.
 
@@ -297,6 +336,52 @@ def extract_rollout_prediction(prediction: Mapping[str, Tensor]) -> tuple[Tensor
     return xy, heading, valid.bool()
 
 
+def _split_repeated_rollout_by_sample(
+    xy: Tensor,
+    heading: Tensor,
+    valid: Tensor,
+    agent_counts: Sequence[int],
+    repeat_count: int,
+) -> list[tuple[Tensor, Tensor, Tensor]]:
+    """batch로 생성한 rollout을 scenario별 ``[K, A, T]`` 형태로 다시 나눕니다.
+
+    Args:
+        xy: 전체 graph의 agent rollout 위치입니다. shape은 ``[sum(K*A), T, 2]`` 입니다.
+        heading: 전체 graph의 heading입니다. shape은 ``[sum(K*A), T]`` 입니다.
+        valid: 전체 graph의 valid mask입니다. shape은 ``[sum(K*A), T]`` 입니다.
+        agent_counts: scenario별 agent 수입니다.
+        repeat_count: scenario마다 반복한 후보 graph 수입니다.
+
+    Returns:
+        list[tuple[Tensor, Tensor, Tensor]]: scenario별 후보 rollout입니다.
+    """
+    outputs: list[tuple[Tensor, Tensor, Tensor]] = []
+    offset = 0
+    repeat_count = int(repeat_count)
+    for agent_count in agent_counts:
+        agent_count = int(agent_count)
+        end = offset + repeat_count * agent_count
+        if end > xy.shape[0]:
+            raise ValueError(
+                "batched rollout has fewer agents than expected: "
+                f"offset={offset}, end={end}, total={xy.shape[0]}"
+            )
+        outputs.append(
+            (
+                xy[offset:end].reshape(repeat_count, agent_count, xy.shape[1], 2),
+                heading[offset:end].reshape(repeat_count, agent_count, heading.shape[1]),
+                valid[offset:end].reshape(repeat_count, agent_count, valid.shape[1]),
+            )
+        )
+        offset = end
+    if offset != xy.shape[0]:
+        raise ValueError(
+            "batched rollout has extra agents after splitting: "
+            f"consumed={offset}, total={xy.shape[0]}"
+        )
+    return outputs
+
+
 @torch.no_grad()
 def sample_candidate_micro_batch(
     model: Any,
@@ -355,6 +440,69 @@ def sample_candidate_micro_batch(
     )
 
 
+@torch.no_grad()
+def sample_candidate_micro_batch_for_samples(
+    model: Any,
+    current_samples: Sequence[Mapping[str, Any]],
+    transform: Callable[[Any], Any],
+    config: RoadGenerationConfig,
+    device: torch.device,
+    repeat_count: int,
+    seed: int,
+) -> list[tuple[Tensor, Tensor, Tensor]]:
+    """여러 scene의 후보 rollout micro-batch를 한 번의 GPU inference로 생성합니다.
+
+    Args:
+        model: RoaD 생성에 사용할 Lightning model입니다.
+        current_samples: 현재 시점 기준 scenario cache 목록입니다.
+        transform: validation/추론 기준 transform입니다.
+        config: RoaD 생성 설정입니다.
+        device: model과 batch가 올라갈 장치입니다.
+        repeat_count: 각 scenario에서 이번 호출로 만들 후보 수입니다.
+        seed: sampling seed입니다.
+
+    Returns:
+        list[tuple[Tensor, Tensor, Tensor]]: scenario별 후보 위치/방향/valid입니다.
+            각 shape은 ``[M, A, 20, 2]``, ``[M, A, 20]``, ``[M, A, 20]`` 입니다.
+    """
+    if len(current_samples) == 0:
+        return []
+    was_training = bool(model.training)
+    model.eval()
+    model.token_processor.eval()
+    batch = _to_repeated_batch_for_samples(current_samples, repeat_count, transform, device)
+    tokenized_map, tokenized_agent = model.token_processor(batch)
+    map_feature = model.encoder.encode_map(tokenized_map)
+    rollout_cache = model.encoder.prepare_inference_cache(tokenized_agent, map_feature)
+    prediction = model.encoder.rollout_from_cache(
+        rollout_cache=rollout_cache,
+        tokenized_agent=tokenized_agent,
+        map_feature=map_feature,
+        sampling_scheme=build_sampling_scheme(config),
+        sampling_seed=int(seed),
+        rollout_steps_2hz=math.ceil(config.selection_horizon_steps / config.commit_steps),
+    )
+    xy, heading, valid = extract_rollout_prediction(prediction)
+    horizon = int(config.selection_horizon_steps)
+    agent_counts = [int(sample["agent"]["position"].shape[0]) for sample in current_samples]
+    expected_agent_count = int(repeat_count) * sum(agent_counts)
+    if xy.shape[0] != expected_agent_count:
+        raise ValueError(
+            "batched candidate rollout agent count mismatch: "
+            f"expected={expected_agent_count}, actual={xy.shape[0]}"
+        )
+    outputs = _split_repeated_rollout_by_sample(
+        xy=xy[:, :horizon].detach().cpu(),
+        heading=wrap_angle(heading[:, :horizon]).detach().cpu(),
+        valid=valid[:, :horizon].detach().cpu(),
+        agent_counts=agent_counts,
+        repeat_count=repeat_count,
+    )
+    if was_training:
+        model.train()
+    return outputs
+
+
 def sample_candidate_rollouts_for_block(
     model: Any,
     current_sample: Mapping[str, Any],
@@ -398,6 +546,60 @@ def sample_candidate_rollouts_for_block(
         valid_chunks.append(valid)
         made_count += repeat_count
     return torch.cat(xy_chunks, dim=0), torch.cat(heading_chunks, dim=0), torch.cat(valid_chunks, dim=0)
+
+
+def sample_candidate_rollouts_for_block_batch(
+    model: Any,
+    current_samples: Sequence[Mapping[str, Any]],
+    transform: Callable[[Any], Any],
+    config: RoadGenerationConfig,
+    device: torch.device,
+    seed_base: int,
+) -> list[tuple[Tensor, Tensor, Tensor]]:
+    """여러 scene의 현재 0.5초 block에서 K개 후보를 batch 병렬 생성합니다.
+
+    Args:
+        model: RoaD 생성에 사용할 Lightning model입니다.
+        current_samples: 현재 시점 기준 scenario cache 목록입니다.
+        transform: validation/추론 기준 transform입니다.
+        config: RoaD 생성 설정입니다.
+        device: model과 batch가 올라갈 장치입니다.
+        seed_base: 후보별 seed 기준값입니다.
+
+    Returns:
+        list[tuple[Tensor, Tensor, Tensor]]: scenario별 후보 위치/방향/valid입니다.
+    """
+    if len(current_samples) == 0:
+        return []
+    per_sample_xy: list[list[Tensor]] = [[] for _ in current_samples]
+    per_sample_heading: list[list[Tensor]] = [[] for _ in current_samples]
+    per_sample_valid: list[list[Tensor]] = [[] for _ in current_samples]
+    made_count = 0
+    micro_batch = max(1, int(config.candidate_micro_batch_size))
+    while made_count < int(config.candidates_per_agent):
+        repeat_count = min(micro_batch, int(config.candidates_per_agent) - made_count)
+        outputs = sample_candidate_micro_batch_for_samples(
+            model=model,
+            current_samples=current_samples,
+            transform=transform,
+            config=config,
+            device=device,
+            repeat_count=repeat_count,
+            seed=int(seed_base) + made_count * 104729,
+        )
+        for sample_idx, (xy, heading, valid) in enumerate(outputs):
+            per_sample_xy[sample_idx].append(xy)
+            per_sample_heading[sample_idx].append(heading)
+            per_sample_valid[sample_idx].append(valid)
+        made_count += repeat_count
+    return [
+        (
+            torch.cat(per_sample_xy[sample_idx], dim=0),
+            torch.cat(per_sample_heading[sample_idx], dim=0),
+            torch.cat(per_sample_valid[sample_idx], dim=0),
+        )
+        for sample_idx in range(len(current_samples))
+    ]
 
 
 def _pad_future_window(value: Tensor, target_steps: int) -> Tensor:
@@ -595,6 +797,192 @@ def generate_single_road_rollout(
     return future_xy, wrap_angle(future_heading), future_valid
 
 
+@torch.no_grad()
+def generate_road_rollout_batch(
+    model: Any,
+    source_samples: Sequence[Mapping[str, Any]],
+    transform: Callable[[Any], Any],
+    config: RoadGenerationConfig,
+    epoch_idx: int,
+    rollout_idx: int,
+    device: torch.device,
+) -> list[tuple[Tensor, Tensor, Tensor]]:
+    """여러 scenario에서 RoaD closed-loop future를 batch 병렬로 만듭니다.
+
+    Args:
+        model: 현재 Flow Matching model입니다.
+        source_samples: 원본 scenario cache 목록입니다.
+        transform: validation/추론 기준 transform입니다.
+        config: RoaD 생성 설정입니다.
+        epoch_idx: 현재 RoaD fine-tuning epoch 번호입니다.
+        rollout_idx: 같은 scenario 안 rollout 번호입니다.
+        device: model과 batch가 올라갈 장치입니다.
+
+    Returns:
+        list[tuple[Tensor, Tensor, Tensor]]: scenario별 RoaD future 위치/방향/valid입니다.
+    """
+    if len(source_samples) == 0:
+        return []
+    rollout_states = [initialize_rollout_state(sample) for sample in source_samples]
+    future_xy_list = [_copy_tensor(sample["agent"]["position"][:, 11:91, :2]) for sample in source_samples]
+    future_heading_list = [_copy_tensor(sample["agent"]["heading"][:, 11:91]) for sample in source_samples]
+    future_valid_list = [_copy_tensor(sample["agent"]["valid_mask"][:, 11:91]).bool() for sample in source_samples]
+    gt_xy_full_list = [_copy_tensor(sample["agent"]["position"][:, 11:91, :2]) for sample in source_samples]
+    gt_heading_full_list = [_copy_tensor(sample["agent"]["heading"][:, 11:91]) for sample in source_samples]
+    gt_valid_full_list = [_copy_tensor(sample["agent"]["valid_mask"][:, 11:91]).bool() for sample in source_samples]
+    shape_lwh_list = [_copy_tensor(sample["agent"]["shape"]) for sample in source_samples]
+
+    num_blocks = math.ceil(int(config.rollout_steps) / int(config.commit_steps))
+    for block_idx in range(num_blocks):
+        current_abs_step = 10 + block_idx * int(config.commit_steps)
+        current_samples = [
+            build_shifted_sample(source_sample, rollout_state, current_abs_step=current_abs_step)
+            for source_sample, rollout_state in zip(source_samples, rollout_states)
+        ]
+        seed_base = (
+            int(config.seed)
+            + int(epoch_idx) * 1_000_003
+            + int(rollout_idx) * 100_003
+            + int(block_idx) * 10_007
+        )
+        candidate_outputs = sample_candidate_rollouts_for_block_batch(
+            model=model,
+            current_samples=current_samples,
+            transform=transform,
+            config=config,
+            device=device,
+            seed_base=seed_base,
+        )
+        future_start = block_idx * int(config.commit_steps)
+        future_end = future_start + int(config.selection_horizon_steps)
+        for sample_idx, (candidate_xy, candidate_heading, _) in enumerate(candidate_outputs):
+            gt_xy = _pad_future_window(
+                gt_xy_full_list[sample_idx][:, future_start:future_end],
+                int(config.selection_horizon_steps),
+            )
+            gt_heading = _pad_future_window(
+                gt_heading_full_list[sample_idx][:, future_start:future_end],
+                int(config.selection_horizon_steps),
+            )
+            gt_valid = _pad_future_window(
+                gt_valid_full_list[sample_idx][:, future_start:future_end],
+                int(config.selection_horizon_steps),
+            ).bool()
+            selected_xy, selected_heading, selected_valid = select_one_block_by_corner_distance(
+                candidate_xy=candidate_xy,
+                candidate_heading=candidate_heading,
+                gt_xy=gt_xy,
+                gt_heading=gt_heading,
+                gt_valid=gt_valid,
+                shape_lwh=shape_lwh_list[sample_idx],
+                config=config,
+            )
+            commit_block_to_rollout_state(
+                rollout_state=rollout_states[sample_idx],
+                selected_xy=selected_xy,
+                selected_heading=selected_heading,
+                selected_valid=selected_valid,
+                future_xy=future_xy_list[sample_idx],
+                future_heading=future_heading_list[sample_idx],
+                future_valid=future_valid_list[sample_idx],
+                block_idx=block_idx,
+                config=config,
+            )
+    return [
+        (future_xy, wrap_angle(future_heading), future_valid)
+        for future_xy, future_heading, future_valid in zip(
+            future_xy_list,
+            future_heading_list,
+            future_valid_list,
+        )
+    ]
+
+
+def generate_road_rollout_batch_with_oom_fallback(
+    model: Any,
+    source_samples: Sequence[Mapping[str, Any]],
+    transform: Callable[[Any], Any],
+    config: RoadGenerationConfig,
+    epoch_idx: int,
+    rollout_idx: int,
+    device: torch.device,
+) -> list[tuple[Tensor, Tensor, Tensor]]:
+    """큰 RoaD cache 생성 batch를 우선 시도하고 OOM 때만 보수적으로 쪼갭니다.
+
+    RoaD cache 생성은 학습 전 병목입니다. 기본값은 A100 80GB에서 GPU를 더 쓰도록
+    크게 잡되, agent가 많은 scene 조합에서 OOM이 나면 현재 rank의 해당 batch만
+    나눠 재시도합니다. 먼저 scene batch를 반으로 줄이고, 단일 scene도 OOM이면
+    candidate micro-batch를 반으로 줄입니다.
+    """
+    try:
+        return generate_road_rollout_batch(
+            model=model,
+            source_samples=source_samples,
+            transform=transform,
+            config=config,
+            epoch_idx=epoch_idx,
+            rollout_idx=rollout_idx,
+            device=device,
+        )
+    except RuntimeError as error:
+        if not _is_cuda_oom(error):
+            raise
+        _clear_cuda_cache(device)
+        if len(source_samples) > 1:
+            mid = max(1, len(source_samples) // 2)
+            log.warning(
+                "RoaD cache generation CUDA OOM; splitting scene batch "
+                "epoch=%s rollout=%s scenes=%s -> %s + %s candidate_micro_batch_size=%s",
+                epoch_idx,
+                rollout_idx,
+                len(source_samples),
+                mid,
+                len(source_samples) - mid,
+                config.candidate_micro_batch_size,
+            )
+            first = generate_road_rollout_batch_with_oom_fallback(
+                model=model,
+                source_samples=source_samples[:mid],
+                transform=transform,
+                config=config,
+                epoch_idx=epoch_idx,
+                rollout_idx=rollout_idx,
+                device=device,
+            )
+            second = generate_road_rollout_batch_with_oom_fallback(
+                model=model,
+                source_samples=source_samples[mid:],
+                transform=transform,
+                config=config,
+                epoch_idx=epoch_idx,
+                rollout_idx=rollout_idx,
+                device=device,
+            )
+            return first + second
+
+        micro_batch_size = int(config.candidate_micro_batch_size)
+        if micro_batch_size > 1:
+            next_micro_batch_size = max(1, micro_batch_size // 2)
+            log.warning(
+                "RoaD cache generation CUDA OOM for one scene; reducing "
+                "candidate_micro_batch_size epoch=%s rollout=%s %s -> %s",
+                epoch_idx,
+                rollout_idx,
+                micro_batch_size,
+                next_micro_batch_size,
+            )
+            return generate_road_rollout_batch_with_oom_fallback(
+                model=model,
+                source_samples=source_samples,
+                transform=transform,
+                config=replace(config, candidate_micro_batch_size=next_micro_batch_size),
+                epoch_idx=epoch_idx,
+                rollout_idx=rollout_idx,
+                device=device,
+            )
+        raise
+
+
 def _variant_output_path(variant_dir: Path, source_path: Path) -> Path:
     """variant cache 파일 경로를 정합니다.
 
@@ -654,32 +1042,47 @@ def generate_road_epoch_cache(
     generated = 0
     was_training = bool(model.training)
     model.eval()
-    for source_path in rank_paths:
-        source_sample = load_source_sample(source_path)
+    generation_batch_size = max(1, int(config.generation_batch_size))
+    for source_path_batch in chunked_paths(rank_paths, generation_batch_size):
+        source_samples = [load_source_sample(source_path) for source_path in source_path_batch]
         for rollout_idx, variant_dir in enumerate(variant_dirs):
-            output_path = _variant_output_path(variant_dir, source_path)
-            if output_path.exists() and not config.overwrite_cache:
+            pending_items = [
+                (source_path, source_sample, _variant_output_path(variant_dir, source_path))
+                for source_path, source_sample in zip(source_path_batch, source_samples)
+                if config.overwrite_cache or not _variant_output_path(variant_dir, source_path).exists()
+            ]
+            if not pending_items:
                 continue
-            selected_xy, selected_heading, selected_valid = generate_single_road_rollout(
+            pending_paths = [item[0] for item in pending_items]
+            pending_samples = [item[1] for item in pending_items]
+            pending_output_paths = [item[2] for item in pending_items]
+            rollout_outputs = generate_road_rollout_batch_with_oom_fallback(
                 model=model,
-                source_sample=source_sample,
+                source_samples=pending_samples,
                 transform=transform,
                 config=config,
                 epoch_idx=epoch_idx,
                 rollout_idx=rollout_idx,
                 device=device,
             )
-            road_sample = build_road_cache_sample(
-                source_sample=source_sample,
-                rollout_xy=selected_xy,
-                rollout_heading=selected_heading,
-                rollout_valid=selected_valid,
-                rollout_index=rollout_idx,
-                source_path=source_path,
-            )
-            road_sample["source_scenario_id"] = safe_scenario_id(source_sample, source_path)
-            write_pickle(road_sample, output_path)
-            generated += 1
+            for source_path, source_sample, output_path, rollout_output in zip(
+                pending_paths,
+                pending_samples,
+                pending_output_paths,
+                rollout_outputs,
+            ):
+                selected_xy, selected_heading, selected_valid = rollout_output
+                road_sample = build_road_cache_sample(
+                    source_sample=source_sample,
+                    rollout_xy=selected_xy,
+                    rollout_heading=selected_heading,
+                    rollout_valid=selected_valid,
+                    rollout_index=rollout_idx,
+                    source_path=source_path,
+                )
+                road_sample["source_scenario_id"] = safe_scenario_id(source_sample, source_path)
+                write_pickle(road_sample, output_path)
+                generated += 1
     if was_training:
         model.train()
     return generated

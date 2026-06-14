@@ -1886,7 +1886,7 @@ H100 preset은 `experiment=self_forced_npfm_sid_h100_4` 또는
 | 항목 | 값 |
 |---|---:|
 | action | `road_finetune` |
-| 시작 checkpoint | Flow Matching pretrained checkpoint |
+| 시작 checkpoint | `epoch-last-x5f9g0ce:v57` Flow Matching pretrained checkpoint |
 | fine-tuning epoch | 10 |
 | max learning rate | `5e-5` |
 | 원본 WOMD training scenario 수 | 486,995 |
@@ -1896,6 +1896,9 @@ H100 preset은 `experiment=self_forced_npfm_sid_h100_4` 또는
 | epoch마다 생성되는 RoaD cache 수 | 약 146,100 |
 | RoaD 1 epoch에서 실제 학습 sample 수 | 약 146,100 |
 | candidate 수 | 64 |
+| cache 생성 scene batch | `generation_batch_size=8` |
+| candidate micro-batch | `candidate_micro_batch_size=8` |
+| checkpoint-compatible flow schema | control-space, `flow_window_steps=20`, `num_freq_bands=64`, `head_dim=15` |
 | candidate 생성 diffusion step | 16 |
 | sampling temperature | 0.8 |
 | closed-loop commit 단위 | 0.5초, 즉 5 step |
@@ -1939,6 +1942,23 @@ python src/run.py \
   road.source_train_raw_dir=/data/womd_cache/training
 ```
 
+testas A100 7장 고정 파드에서 실행하려면 로컬에서 다음 launcher를 사용합니다.
+
+```bash
+python scripts/launch_road_flow_testas_a100x7.py
+```
+
+이 launcher는 기본적으로 W&B artifact
+`jksg01019-naver-labs/SMART-FLOW/epoch-last-x5f9g0ce:v57`를
+`/workspace/flow_control_space_pretrain_x5f9g0ce/v57` 아래에 내려받아
+RoaD fine-tuning 시작 checkpoint로 사용합니다.
+
+빠른 pipeline smoke 검증은 다음처럼 실행합니다.
+
+```bash
+python scripts/launch_road_flow_testas_a100x7.py --smoke --replace
+```
+
 ### 동작 순서
 
 1. epoch 0 시작 전, 현재 모델로 원본 WOMD training cache를 순회합니다.
@@ -1971,4 +1991,6 @@ road_cache/
 
 `trainer.reload_dataloaders_every_n_epochs=1`이 필요합니다. 새 epoch마다 selected cache 폴더가 바뀌기 때문입니다. `road_flow` 실험 설정에는 이 값이 이미 들어 있습니다.
 
-`road.candidate_micro_batch_size`는 기본 4입니다. K=64 후보를 한 번에 모두 만들지 않고 작은 묶음으로 나누어 생성하므로, GPU 메모리가 부족하면 1 또는 2로 낮추면 됩니다.
+`road.generation_batch_size`는 rank마다 여러 scenario를 묶어 cache 생성 inference를 수행하는 단위입니다. 기본 8이며, testas A100에서 GPU 사용량을 더 키우도록 설정되어 있습니다. agent 수가 많은 batch에서 CUDA OOM이 나면 해당 rank의 scene batch를 자동으로 쪼개 재시도합니다.
+
+`road.candidate_micro_batch_size`는 기본 8입니다. K=64 후보를 작은 묶음으로 나누어 생성하되, 단일 scene에서도 CUDA OOM이 나면 micro-batch를 자동으로 반씩 줄여 재시도합니다.
