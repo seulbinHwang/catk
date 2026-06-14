@@ -145,6 +145,7 @@ main() {
     data.train_use_eval_agent_selection="${TRAIN_USE_EVAL_AGENT_SELECTION:-false}"
     model.model_config.decoder.num_freq_bands="${NUM_FREQ_BANDS:-88}"
     model.model_config.scorer_scene_num="${SCORER_SCENE_NUM:-1680}"
+    trainer.check_val_every_n_epoch="${CHECK_VAL_EVERY_N_EPOCH:-2}"
     logger.wandb.group="${WANDB_GROUP:-smart_clsft_testas_a100x7}"
     logger.wandb.job_type=catk_finetune
   )

@@ -59,8 +59,10 @@ def render_env_file(*, args: argparse.Namespace, task_name: str, run_id: str) ->
         export_line("VAL_BATCH_SIZE", args.val_batch_size),
         export_line("TEST_BATCH_SIZE", args.test_batch_size),
         export_line("MAX_EPOCHS", args.max_epochs),
+        export_line("CHECK_VAL_EVERY_N_EPOCH", args.check_val_every_n_epoch),
         export_line("CATK_LR", args.learning_rate),
         export_line("TRAIN_USE_EVAL_AGENT_SELECTION", args.train_use_eval_agent_selection),
+        export_line("SCORER_SCENE_NUM", args.scorer_scene_num),
         export_line("CATK_CKPT_PATH", args.ckpt_path),
         export_line("CATK_CKPT_ARTIFACT", args.ckpt_artifact),
         export_line("CATK_CKPT_DOWNLOAD_DIR", args.ckpt_download_dir),
@@ -294,12 +296,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit-val-batches", default=os.environ.get("LIMIT_VAL_BATCHES", ""))
     parser.add_argument("--limit-test-batches", default=os.environ.get("LIMIT_TEST_BATCHES", ""))
     parser.add_argument("--max-epochs", default=os.environ.get("MAX_EPOCHS", "10"))
+    parser.add_argument("--check-val-every-n-epoch", default=os.environ.get("CHECK_VAL_EVERY_N_EPOCH", "2"))
     parser.add_argument("--learning-rate", default=os.environ.get("LEARNING_RATE", "5e-5"))
     parser.add_argument(
         "--train-use-eval-agent-selection",
         default=os.environ.get("TRAIN_USE_EVAL_AGENT_SELECTION", "false"),
         choices=["true", "false"],
     )
+    parser.add_argument("--scorer-scene-num", default=os.environ.get("SCORER_SCENE_NUM", "1680"))
     parser.add_argument("--num-freq-bands", default=os.environ.get("NUM_FREQ_BANDS", "88"))
     parser.add_argument("--graph-attn-fp32", default=os.environ.get("CATK_ATTENTION_GRAPH_FP32", "1"), choices=["0", "1"])
     parser.add_argument("--wandb-group", default=os.environ.get("WANDB_GROUP", "smart_clsft_testas_a100x7"))
@@ -319,6 +323,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--ckpt-path/CKPT_PATH or --ckpt-artifact/CKPT_ARTIFACT is required")
     if not args.nproc_per_node.isdigit() or int(args.nproc_per_node) != 7:
         parser.error("--nproc-per-node must be 7 for the testas A100x7 preset")
+    if not args.check_val_every_n_epoch.isdigit() or int(args.check_val_every_n_epoch) < 1:
+        parser.error("--check-val-every-n-epoch must be a positive integer")
+    if not args.scorer_scene_num.isdigit() or int(args.scorer_scene_num) < 1:
+        parser.error("--scorer-scene-num must be a positive integer")
     if args.monitor_interval < 1:
         parser.error("--monitor-interval must be >= 1")
     if args.extra_hydra_overrides:
