@@ -4,6 +4,7 @@ import gc
 import logging
 import math
 import pickle
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -70,6 +71,13 @@ def build_sampling_scheme(config: RoadGenerationConfig) -> SimpleNamespace:
         noise_scale=float(config.temperature),
         temperature=float(config.temperature),
     )
+
+
+def _autocast_context(device: torch.device):
+    """RoaD 생성 inference를 학습 precision과 맞춰 실행합니다."""
+    if device.type == "cuda":
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    return nullcontext()
 
 
 def chunked_paths(paths: Sequence[Path], chunk_size: int) -> Iterable[list[Path]]:
@@ -445,7 +453,7 @@ def sample_candidate_micro_batch(
 
 
 @torch.no_grad()
-def sample_candidate_micro_batch_for_samples(
+def sample_candidate_micro_batch_for_samples_on_device(
     model: Any,
     current_samples: Sequence[Mapping[str, Any]],
     transform: Callable[[Any], Any],
@@ -454,7 +462,7 @@ def sample_candidate_micro_batch_for_samples(
     repeat_count: int,
     seed: int,
 ) -> list[tuple[Tensor, Tensor, Tensor]]:
-    """여러 scene의 후보 rollout micro-batch를 한 번의 GPU inference로 생성합니다.
+    """여러 scene의 후보 rollout micro-batch를 GPU 위에 유지한 채 생성합니다.
 
     Args:
         model: RoaD 생성에 사용할 Lightning model입니다.
@@ -467,44 +475,70 @@ def sample_candidate_micro_batch_for_samples(
 
     Returns:
         list[tuple[Tensor, Tensor, Tensor]]: scenario별 후보 위치/방향/valid입니다.
-            각 shape은 ``[M, A, 20, 2]``, ``[M, A, 20]``, ``[M, A, 20]`` 입니다.
+            각 shape은 ``[M, A, 20, 2]``, ``[M, A, 20]``, ``[M, A, 20]`` 이며
+            tensor는 ``device`` 위에 있습니다.
     """
     if len(current_samples) == 0:
         return []
     was_training = bool(model.training)
-    model.eval()
-    model.token_processor.eval()
-    batch = _to_repeated_batch_for_samples(current_samples, repeat_count, transform, device)
-    tokenized_map, tokenized_agent = model.token_processor(batch)
-    map_feature = model.encoder.encode_map(tokenized_map)
-    rollout_cache = model.encoder.prepare_inference_cache(tokenized_agent, map_feature)
-    prediction = model.encoder.rollout_from_cache(
-        rollout_cache=rollout_cache,
-        tokenized_agent=tokenized_agent,
-        map_feature=map_feature,
-        sampling_scheme=build_sampling_scheme(config),
-        sampling_seed=int(seed),
-        rollout_steps_2hz=math.ceil(config.selection_horizon_steps / config.commit_steps),
-    )
-    xy, heading, valid = extract_rollout_prediction(prediction)
-    horizon = int(config.selection_horizon_steps)
-    agent_counts = [int(sample["agent"]["position"].shape[0]) for sample in current_samples]
-    expected_agent_count = int(repeat_count) * sum(agent_counts)
-    if xy.shape[0] != expected_agent_count:
-        raise ValueError(
-            "batched candidate rollout agent count mismatch: "
-            f"expected={expected_agent_count}, actual={xy.shape[0]}"
+    try:
+        model.eval()
+        model.token_processor.eval()
+        batch = _to_repeated_batch_for_samples(current_samples, repeat_count, transform, device)
+        with _autocast_context(device):
+            tokenized_map, tokenized_agent = model.token_processor(batch)
+            map_feature = model.encoder.encode_map(tokenized_map)
+            rollout_cache = model.encoder.prepare_inference_cache(tokenized_agent, map_feature)
+            prediction = model.encoder.rollout_from_cache(
+                rollout_cache=rollout_cache,
+                tokenized_agent=tokenized_agent,
+                map_feature=map_feature,
+                sampling_scheme=build_sampling_scheme(config),
+                sampling_seed=int(seed),
+                rollout_steps_2hz=math.ceil(config.selection_horizon_steps / config.commit_steps),
+            )
+        xy, heading, valid = extract_rollout_prediction(prediction)
+        horizon = int(config.selection_horizon_steps)
+        agent_counts = [int(sample["agent"]["position"].shape[0]) for sample in current_samples]
+        expected_agent_count = int(repeat_count) * sum(agent_counts)
+        if xy.shape[0] != expected_agent_count:
+            raise ValueError(
+                "batched candidate rollout agent count mismatch: "
+                f"expected={expected_agent_count}, actual={xy.shape[0]}"
+            )
+        return _split_repeated_rollout_by_sample(
+            xy=xy[:, :horizon].detach(),
+            heading=wrap_angle(heading[:, :horizon]).detach(),
+            valid=valid[:, :horizon].detach(),
+            agent_counts=agent_counts,
+            repeat_count=repeat_count,
         )
-    outputs = _split_repeated_rollout_by_sample(
-        xy=xy[:, :horizon].detach().cpu(),
-        heading=wrap_angle(heading[:, :horizon]).detach().cpu(),
-        valid=valid[:, :horizon].detach().cpu(),
-        agent_counts=agent_counts,
+    finally:
+        if was_training:
+            model.train()
+
+
+@torch.no_grad()
+def sample_candidate_micro_batch_for_samples(
+    model: Any,
+    current_samples: Sequence[Mapping[str, Any]],
+    transform: Callable[[Any], Any],
+    config: RoadGenerationConfig,
+    device: torch.device,
+    repeat_count: int,
+    seed: int,
+) -> list[tuple[Tensor, Tensor, Tensor]]:
+    """여러 scene의 후보 rollout micro-batch를 한 번의 GPU inference로 생성합니다."""
+    outputs = sample_candidate_micro_batch_for_samples_on_device(
+        model=model,
+        current_samples=current_samples,
+        transform=transform,
+        config=config,
+        device=device,
         repeat_count=repeat_count,
+        seed=seed,
     )
-    if was_training:
-        model.train()
-    return outputs
+    return [(xy.cpu(), heading.cpu(), valid.cpu()) for xy, heading, valid in outputs]
 
 
 def sample_candidate_rollouts_for_block(
@@ -666,6 +700,121 @@ def select_one_block_by_corner_distance(
     return selected_xy, wrap_angle(selected_heading), selected_valid
 
 
+def _select_best_from_micro_batch(
+    candidate_xy: Tensor,
+    candidate_heading: Tensor,
+    gt_xy: Tensor,
+    gt_heading: Tensor,
+    gt_valid: Tensor,
+    shape_lwh: Tensor,
+    config: RoadGenerationConfig,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """후보 micro-batch에서 agent별 best 후보와 점수를 고릅니다."""
+    score = corner_distance_score(
+        pred_xy=candidate_xy.float(),
+        pred_heading=candidate_heading.float(),
+        gt_xy=gt_xy.float(),
+        gt_heading=gt_heading.float(),
+        shape_lwh=shape_lwh.float(),
+        valid_mask=gt_valid,
+    )
+    best_score, best_candidate = score.min(dim=0)
+    agent_index = torch.arange(candidate_xy.shape[1], device=candidate_xy.device)
+    commit_steps = int(config.commit_steps)
+    selected_xy = candidate_xy[best_candidate, agent_index, :commit_steps].float()
+    selected_heading = candidate_heading[best_candidate, agent_index, :commit_steps].float()
+    selected_valid = gt_valid[:, :commit_steps].bool()
+    return best_score, selected_xy, wrap_angle(selected_heading), selected_valid
+
+
+@torch.no_grad()
+def select_block_by_corner_distance_streaming_batch(
+    model: Any,
+    current_samples: Sequence[Mapping[str, Any]],
+    transform: Callable[[Any], Any],
+    config: RoadGenerationConfig,
+    device: torch.device,
+    seed_base: int,
+    gt_xy_list: Sequence[Tensor],
+    gt_heading_list: Sequence[Tensor],
+    gt_valid_list: Sequence[Tensor],
+    shape_lwh_list: Sequence[Tensor],
+) -> list[tuple[Tensor, Tensor, Tensor]]:
+    """K개 후보 전체를 저장하지 않고 GPU에서 streaming best-selection을 수행합니다."""
+    if len(current_samples) == 0:
+        return []
+    if not (
+        len(current_samples)
+        == len(gt_xy_list)
+        == len(gt_heading_list)
+        == len(gt_valid_list)
+        == len(shape_lwh_list)
+    ):
+        raise ValueError("current_samples and GT/shape lists must have the same length.")
+
+    best_scores: list[Tensor | None] = [None for _ in current_samples]
+    best_xy: list[Tensor | None] = [None for _ in current_samples]
+    best_heading: list[Tensor | None] = [None for _ in current_samples]
+    selected_valids: list[Tensor | None] = [None for _ in current_samples]
+
+    gt_xy_device = [gt_xy.to(device=device, non_blocking=True) for gt_xy in gt_xy_list]
+    gt_heading_device = [gt_heading.to(device=device, non_blocking=True) for gt_heading in gt_heading_list]
+    gt_valid_device = [gt_valid.to(device=device, non_blocking=True).bool() for gt_valid in gt_valid_list]
+    shape_lwh_device = [shape_lwh.to(device=device, non_blocking=True) for shape_lwh in shape_lwh_list]
+
+    made_count = 0
+    micro_batch = max(1, int(config.candidate_micro_batch_size))
+    while made_count < int(config.candidates_per_agent):
+        repeat_count = min(micro_batch, int(config.candidates_per_agent) - made_count)
+        outputs = sample_candidate_micro_batch_for_samples_on_device(
+            model=model,
+            current_samples=current_samples,
+            transform=transform,
+            config=config,
+            device=device,
+            repeat_count=repeat_count,
+            seed=int(seed_base) + made_count * 104729,
+        )
+        for sample_idx, (candidate_xy, candidate_heading, _) in enumerate(outputs):
+            micro_score, micro_xy, micro_heading, micro_valid = _select_best_from_micro_batch(
+                candidate_xy=candidate_xy,
+                candidate_heading=candidate_heading,
+                gt_xy=gt_xy_device[sample_idx],
+                gt_heading=gt_heading_device[sample_idx],
+                gt_valid=gt_valid_device[sample_idx],
+                shape_lwh=shape_lwh_device[sample_idx],
+                config=config,
+            )
+            if best_scores[sample_idx] is None:
+                best_scores[sample_idx] = micro_score
+                best_xy[sample_idx] = micro_xy
+                best_heading[sample_idx] = micro_heading
+                selected_valids[sample_idx] = micro_valid
+                continue
+            update_mask = micro_score < best_scores[sample_idx]
+            best_scores[sample_idx] = torch.where(update_mask, micro_score, best_scores[sample_idx])
+            best_xy[sample_idx] = torch.where(update_mask.view(-1, 1, 1), micro_xy, best_xy[sample_idx])
+            best_heading[sample_idx] = torch.where(
+                update_mask.view(-1, 1),
+                micro_heading,
+                best_heading[sample_idx],
+            )
+        made_count += repeat_count
+
+    selected_outputs: list[tuple[Tensor, Tensor, Tensor]] = []
+    for sample_idx in range(len(current_samples)):
+        if best_xy[sample_idx] is None or best_heading[sample_idx] is None or selected_valids[sample_idx] is None:
+            raise RuntimeError(f"No RoaD candidate was generated for sample index {sample_idx}.")
+        selected_outputs.append(
+            (
+                best_xy[sample_idx].detach().cpu(),
+                best_heading[sample_idx].detach().cpu(),
+                selected_valids[sample_idx].detach().cpu(),
+            )
+        )
+    return selected_outputs
+
+
 def commit_block_to_rollout_state(
     rollout_state: dict[str, Tensor],
     selected_xy: Tensor,
@@ -713,11 +862,15 @@ def commit_block_to_rollout_state(
     rollout_state["heading"][:, absolute_start:absolute_end] = commit_heading
     rollout_state["valid_mask"][:, absolute_start:absolute_end] = commit_valid
 
-    velocity = torch.zeros_like(rollout_state["velocity"])
-    valid_pair = rollout_state["valid_mask"][:, 1:] & rollout_state["valid_mask"][:, :-1]
-    velocity[:, 1:] = (rollout_state["position"][:, 1:, :2] - rollout_state["position"][:, :-1, :2]) / 0.1
-    velocity[:, 1:] = velocity[:, 1:].masked_fill(~valid_pair.unsqueeze(-1), 0.0)
-    rollout_state["velocity"] = velocity
+    previous_xy = rollout_state["position"][:, absolute_start - 1 : absolute_end - 1, :2]
+    current_xy = rollout_state["position"][:, absolute_start:absolute_end, :2]
+    valid_pair = (
+        rollout_state["valid_mask"][:, absolute_start:absolute_end]
+        & rollout_state["valid_mask"][:, absolute_start - 1 : absolute_end - 1]
+    )
+    local_velocity = (current_xy - previous_xy) / 0.1
+    local_velocity = local_velocity.masked_fill(~valid_pair.unsqueeze(-1), 0.0)
+    rollout_state["velocity"][:, absolute_start:absolute_end] = local_velocity
 
 
 @torch.no_grad()
@@ -849,38 +1002,33 @@ def generate_road_rollout_batch(
             + int(rollout_idx) * 100_003
             + int(block_idx) * 10_007
         )
-        candidate_outputs = sample_candidate_rollouts_for_block_batch(
+        future_start = block_idx * int(config.commit_steps)
+        future_end = future_start + int(config.selection_horizon_steps)
+        gt_xy_windows = [
+            _pad_future_window(gt_xy_full[:, future_start:future_end], int(config.selection_horizon_steps))
+            for gt_xy_full in gt_xy_full_list
+        ]
+        gt_heading_windows = [
+            _pad_future_window(gt_heading_full[:, future_start:future_end], int(config.selection_horizon_steps))
+            for gt_heading_full in gt_heading_full_list
+        ]
+        gt_valid_windows = [
+            _pad_future_window(gt_valid_full[:, future_start:future_end], int(config.selection_horizon_steps)).bool()
+            for gt_valid_full in gt_valid_full_list
+        ]
+        selected_outputs = select_block_by_corner_distance_streaming_batch(
             model=model,
             current_samples=current_samples,
             transform=transform,
             config=config,
             device=device,
             seed_base=seed_base,
+            gt_xy_list=gt_xy_windows,
+            gt_heading_list=gt_heading_windows,
+            gt_valid_list=gt_valid_windows,
+            shape_lwh_list=shape_lwh_list,
         )
-        future_start = block_idx * int(config.commit_steps)
-        future_end = future_start + int(config.selection_horizon_steps)
-        for sample_idx, (candidate_xy, candidate_heading, _) in enumerate(candidate_outputs):
-            gt_xy = _pad_future_window(
-                gt_xy_full_list[sample_idx][:, future_start:future_end],
-                int(config.selection_horizon_steps),
-            )
-            gt_heading = _pad_future_window(
-                gt_heading_full_list[sample_idx][:, future_start:future_end],
-                int(config.selection_horizon_steps),
-            )
-            gt_valid = _pad_future_window(
-                gt_valid_full_list[sample_idx][:, future_start:future_end],
-                int(config.selection_horizon_steps),
-            ).bool()
-            selected_xy, selected_heading, selected_valid = select_one_block_by_corner_distance(
-                candidate_xy=candidate_xy,
-                candidate_heading=candidate_heading,
-                gt_xy=gt_xy,
-                gt_heading=gt_heading,
-                gt_valid=gt_valid,
-                shape_lwh=shape_lwh_list[sample_idx],
-                config=config,
-            )
+        for sample_idx, (selected_xy, selected_heading, selected_valid) in enumerate(selected_outputs):
             commit_block_to_rollout_state(
                 rollout_state=rollout_states[sample_idx],
                 selected_xy=selected_xy,
@@ -932,26 +1080,6 @@ def generate_road_rollout_batch_with_oom_fallback(
         if not _is_cuda_oom(error):
             raise
         _clear_cuda_cache(device)
-        micro_batch_size = int(config.candidate_micro_batch_size)
-        if micro_batch_size > 1:
-            next_micro_batch_size = max(1, micro_batch_size // 2)
-            log.warning(
-                "RoaD cache generation CUDA OOM for one scene; reducing "
-                "candidate_micro_batch_size epoch=%s rollout=%s %s -> %s",
-                epoch_idx,
-                rollout_idx,
-                micro_batch_size,
-                next_micro_batch_size,
-            )
-            return generate_road_rollout_batch_with_oom_fallback(
-                model=model,
-                source_samples=source_samples,
-                transform=transform,
-                config=replace(config, candidate_micro_batch_size=next_micro_batch_size),
-                epoch_idx=epoch_idx,
-                rollout_idx=rollout_idx,
-                device=device,
-            )
         if len(source_samples) > 1:
             mid = max(1, len(source_samples) // 2)
             log.warning(
@@ -983,6 +1111,26 @@ def generate_road_rollout_batch_with_oom_fallback(
                 device=device,
             )
             return first + second
+        micro_batch_size = int(config.candidate_micro_batch_size)
+        if micro_batch_size > 1:
+            next_micro_batch_size = max(1, micro_batch_size // 2)
+            log.warning(
+                "RoaD cache generation CUDA OOM for one scene; reducing "
+                "candidate_micro_batch_size epoch=%s rollout=%s %s -> %s",
+                epoch_idx,
+                rollout_idx,
+                micro_batch_size,
+                next_micro_batch_size,
+            )
+            return generate_road_rollout_batch_with_oom_fallback(
+                model=model,
+                source_samples=source_samples,
+                transform=transform,
+                config=replace(config, candidate_micro_batch_size=next_micro_batch_size),
+                epoch_idx=epoch_idx,
+                rollout_idx=rollout_idx,
+                device=device,
+            )
         raise
 
 

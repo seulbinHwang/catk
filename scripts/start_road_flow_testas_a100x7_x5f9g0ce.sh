@@ -97,7 +97,7 @@ main() {
   local road_work_dir="${ROAD_WORK_DIR:-/workspace/road_cache/${task_name}}"
   local road_data_use_ratio="${ROAD_DATA_USE_RATIO:-0.1}"
   local road_rollouts="${ROAD_ROLLOUTS_PER_SCENARIO:-3}"
-  local road_generation_batch_size="${ROAD_GENERATION_BATCH_SIZE:-8}"
+  local road_generation_batch_size="${ROAD_GENERATION_BATCH_SIZE:-16}"
   local road_candidate_micro_batch_size="${ROAD_CANDIDATE_MICRO_BATCH_SIZE:-16}"
   local ckpt_artifact="${CKPT_ARTIFACT:-jksg01019-naver-labs/SMART-FLOW/epoch-last-x5f9g0ce:v57}"
   local ckpt_download_dir="${CKPT_DOWNLOAD_DIR:-/workspace/flow_control_space_pretrain_x5f9g0ce/v57}"

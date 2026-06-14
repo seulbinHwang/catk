@@ -19,7 +19,7 @@ road:
   rollout_steps: 80
   commit_steps: 5
   selection_horizon_steps: 20
-  generation_batch_size: 8
+  generation_batch_size: 16
   candidate_micro_batch_size: 16
   selected_variant_seed: ${seed}
   cleanup_used_cache: true
@@ -54,7 +54,7 @@ model:
 trainer:
   max_epochs: 10
   reload_dataloaders_every_n_epochs: 1
-  check_val_every_n_epoch: 1
+  check_val_every_n_epoch: 2
   limit_train_batches: 1.0
   limit_val_batches: 0.1
   precision: bf16-mixed

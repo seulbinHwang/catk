@@ -69,7 +69,7 @@ def start_tmux(
         "CKPT_ARTIFACT": "jksg01019-naver-labs/SMART-FLOW/epoch-last-x5f9g0ce:v57",
         "CKPT_DOWNLOAD_DIR": "/workspace/flow_control_space_pretrain_x5f9g0ce/v57",
         "ROAD_WORK_DIR": f"/workspace/road_cache/{task_name}",
-        "ROAD_GENERATION_BATCH_SIZE": "8",
+        "ROAD_GENERATION_BATCH_SIZE": "16",
         "ROAD_CANDIDATE_MICRO_BATCH_SIZE": "16",
     }
     if smoke:
